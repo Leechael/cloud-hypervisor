@@ -1028,15 +1028,11 @@ fn common_cpuid_tdx_configuration(
         let xcr0_mask: u64 = 0x82ff;
         let xss_mask: u64 = !xcr0_mask;
         if entry.index == 0 {
-            entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
-            entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
+            entry.eax &= (caps.supported_xfam as u32) & (xcr0_mask as u32);
+            entry.edx &= ((caps.supported_xfam & xcr0_mask) >> 32) as u32;
         } else if entry.index == 1 {
-            entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
-            entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
+            entry.ecx &= (caps.supported_xfam as u32) & (xss_mask as u32);
+            entry.edx &= ((caps.supported_xfam & xss_mask) >> 32) as u32;
         }
     }
 
@@ -1053,6 +1049,7 @@ pub fn configure_vcpu(
     cpu_vendor: CpuVendor,
     topology: (u16, u16, u16, u16),
     nested: bool,
+    #[cfg(feature = "tdx")] tdx_enabled: bool,
     setup_registers: bool,
 ) -> super::Result<()> {
     let x2apic_id = get_x2apic_id(id, Some(topology));
@@ -1139,6 +1136,11 @@ pub fn configure_vcpu(
         }
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
     }
+    #[cfg(feature = "tdx")]
+    if !tdx_enabled {
+        interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
+    }
+    #[cfg(not(feature = "tdx"))]
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
 }
