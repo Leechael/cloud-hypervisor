@@ -14,7 +14,7 @@ use std::any::Any;
 use std::collections::HashMap;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::mem::offset_of;
-#[cfg(feature = "sev_snp")]
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
@@ -29,10 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::anyhow;
-#[cfg(feature = "sev_snp")]
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
-#[cfg(feature = "sev_snp")]
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use log::debug;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
@@ -121,7 +121,7 @@ use kvm_bindings::{
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
 #[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_X86_SW_PROTECTED_VM, KVMIO, kvm_run__bindgen_ty_1};
+use kvm_bindings::{KVM_X86_TDX_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
@@ -144,10 +144,10 @@ ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
 
 #[cfg(feature = "sev_snp")]
 use igvm_defs::PAGE_SIZE_4K;
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
 #[cfg(feature = "sev_snp")]
-use kvm_bindings::{
-    KVM_MEMORY_ATTRIBUTE_PRIVATE, KVM_X86_SNP_VM, kvm_memory_attributes, kvm_segment as Segment,
-};
+use kvm_bindings::{KVM_X86_SNP_VM, kvm_segment as Segment};
 use vm_memory::GuestAddress;
 #[cfg(feature = "sev_snp")]
 use x86_64::sev;
@@ -222,6 +222,7 @@ enum TdxCommand {
     InitVcpu,
     InitMemRegion,
     Finalize,
+    GetCpuid,
 }
 
 #[cfg(feature = "tdx")]
@@ -237,31 +238,51 @@ pub enum TdxExitStatus {
 }
 
 #[cfg(feature = "tdx")]
-const TDX_MAX_NR_CPUID_CONFIGS: usize = 6;
+const TDX_MAX_NR_CPUID_CONFIGS: usize = 256;
 
 #[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct TdxCpuidConfig {
-    pub leaf: u32,
-    pub sub_leaf: u32,
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
+fn tdx_init_cpuid_entry(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
+    match entry.function {
+        0x1 | 0x8000_0008 => entry.index == 0,
+        0x4 => entry.index <= 3,
+        0x7 => entry.index <= 2,
+        0x1f => true,
+        _ => false,
+    }
 }
 
 #[cfg(feature = "tdx")]
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TdxCapabilities {
-    pub attrs_fixed0: u64,
-    pub attrs_fixed1: u64,
-    pub xfam_fixed0: u64,
-    pub xfam_fixed1: u64,
-    pub nr_cpuid_configs: u32,
-    pub padding: u32,
-    pub cpuid_configs: [TdxCpuidConfig; TDX_MAX_NR_CPUID_CONFIGS],
+    pub supported_attrs: u64,
+    pub supported_xfam: u64,
+    pub kernel_tdvmcallinfo_1_r11: u64,
+    pub user_tdvmcallinfo_1_r11: u64,
+    pub kernel_tdvmcallinfo_1_r12: u64,
+    pub user_tdvmcallinfo_1_r12: u64,
+    pub reserved: [u64; 250],
+    pub cpuid_nent: u32,
+    pub cpuid_padding: u32,
+    pub cpuid_configs: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
+}
+
+#[cfg(feature = "tdx")]
+impl Default for TdxCapabilities {
+    fn default() -> Self {
+        Self {
+            supported_attrs: 0,
+            supported_xfam: 0,
+            kernel_tdvmcallinfo_1_r11: 0,
+            user_tdvmcallinfo_1_r11: 0,
+            kernel_tdvmcallinfo_1_r12: 0,
+            user_tdvmcallinfo_1_r12: 0,
+            reserved: [0; 250],
+            cpuid_nent: 0,
+            cpuid_padding: 0,
+            cpuid_configs: [kvm_bindings::kvm_cpuid_entry2::default(); TDX_MAX_NR_CPUID_CONFIGS],
+        }
+    }
 }
 
 #[cfg(feature = "tdx")]
@@ -829,7 +850,7 @@ impl vm::Vm for KvmVm {
             hyperv_synic: AtomicBool::new(false),
             #[cfg(target_arch = "x86_64")]
             xsave_size,
-            #[cfg(feature = "sev_snp")]
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             vm_fd: self.fd.clone(),
         };
         Ok(Box::new(vcpu))
@@ -1003,7 +1024,6 @@ impl vm::Vm for KvmVm {
 
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
-        #[cfg(feature = "sev_snp")]
         let guest_memfd = if let Some(memfds) = &self.guest_memfds {
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             let fd = unsafe {
@@ -1022,8 +1042,6 @@ impl vm::Vm for KvmVm {
         } else {
             0
         };
-        #[cfg(not(feature = "sev_snp"))]
-        let guest_memfd = 0;
 
         let mut region = kvm_userspace_memory_region2 {
             slot,
@@ -1069,7 +1087,6 @@ impl vm::Vm for KvmVm {
                 .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
         }
 
-        #[cfg(feature = "sev_snp")]
         if self.guest_memfds.is_some() {
             self.fd
                 .set_memory_attributes(kvm_memory_attributes {
@@ -1283,35 +1300,69 @@ impl vm::Vm for KvmVm {
     /// Initialize TDX for this VM
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_init(&self, cpuid: &[CpuIdEntry], max_vcpus: u32) -> vm::Result<()> {
+    fn tdx_init(&self, cpuid: &[CpuIdEntry], _max_vcpus: u32) -> vm::Result<()> {
         const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
 
-        let mut cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+        let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
-        cpuid.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
+
+        let mut caps = TdxCapabilities {
+            cpuid_nent: TDX_MAX_NR_CPUID_CONFIGS as u32,
+            ..Default::default()
+        };
+        tdx_command(
+            &self.fd.as_raw_fd(),
+            TdxCommand::Capabilities,
+            0,
+            &mut caps as *mut _ as *const _,
+        )
+        .map_err(vm::HypervisorVmError::InitializeTdx)?;
+
+        let xfam = caps.supported_xfam;
+
+        let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
+            .into_iter()
+            .filter(tdx_init_cpuid_entry)
+            .collect();
+        for entry in &mut tdx_cpuid {
+            if let Some(mask) = caps.cpuid_configs[..caps.cpuid_nent as usize]
+                .iter()
+                .find(|mask| mask.function == entry.function && mask.index == entry.index)
+            {
+                entry.eax &= mask.eax;
+                entry.ebx &= mask.ebx;
+                entry.ecx &= mask.ecx;
+                entry.edx &= mask.edx;
+            }
+        }
+        let cpuid_nent = tdx_cpuid.len();
+        tdx_cpuid.resize(
+            TDX_MAX_NR_CPUID_CONFIGS,
+            kvm_bindings::kvm_cpuid_entry2::default(),
+        );
 
         #[repr(C)]
         struct TdxInitVm {
             attributes: u64,
-            max_vcpus: u32,
-            padding: u32,
+            xfam: u64,
             mrconfigid: [u64; 6],
             mrowner: [u64; 6],
             mrownerconfig: [u64; 6],
+            reserved: [u64; 12],
             cpuid_nent: u32,
             cpuid_padding: u32,
-            cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; 256],
+            cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
         let data = TdxInitVm {
             attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
-            max_vcpus,
-            padding: 0,
+            xfam,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
             mrownerconfig: [0; 6],
-            cpuid_nent: cpuid.len() as u32,
+            reserved: [0; 12],
+            cpuid_nent: cpuid_nent as u32,
             cpuid_padding: 0,
-            cpuid_entries: cpuid.as_slice().try_into().unwrap(),
+            cpuid_entries: tdx_cpuid.as_slice().try_into().unwrap(),
         };
 
         tdx_command(
@@ -1386,32 +1437,36 @@ fn tdx_command(
 ) -> std::result::Result<(), std::io::Error> {
     #[repr(C)]
     struct TdxIoctlCmd {
-        command: TdxCommand,
+        id: u32,
         flags: u32,
         data: u64,
         error: u64,
-        unused: u64,
     }
     let cmd = TdxIoctlCmd {
-        command,
+        id: command as u32,
         flags,
         data: data as _,
         error: 0,
-        unused: 0,
     };
-    // SAFETY: FFI call. All input parameters are valid.
-    let ret = unsafe {
-        ioctl_with_val(
-            fd,
-            KVM_MEMORY_ENCRYPT_OP(),
-            &cmd as *const TdxIoctlCmd as std::os::raw::c_ulong,
-        )
-    };
+    loop {
+        // SAFETY: FFI call. All input parameters are valid.
+        let ret = unsafe {
+            ioctl_with_val(
+                fd,
+                KVM_MEMORY_ENCRYPT_OP(),
+                &cmd as *const TdxIoctlCmd as std::os::raw::c_ulong,
+            )
+        };
 
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(());
     }
-    Ok(())
 }
 
 /// Wrapper over KVM system ioctls.
@@ -1535,7 +1590,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[cfg(feature = "tdx")]
             if _config.tdx_enabled {
-                vm_type = KVM_X86_SW_PROTECTED_VM.into();
+                vm_type = KVM_X86_TDX_VM.into();
             }
         }
 
@@ -1572,8 +1627,19 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[allow(unused_mut)]
             let mut guest_memfds = None;
-            #[cfg(feature = "sev_snp")]
-            if _config.sev_snp_enabled && fd.check_extension(Cap::GuestMemfd) {
+            if (_config.tdx_enabled
+                || {
+                    #[cfg(feature = "sev_snp")]
+                    {
+                        _config.sev_snp_enabled
+                    }
+                    #[cfg(not(feature = "sev_snp"))]
+                    {
+                        false
+                    }
+                })
+                && fd.check_extension(Cap::GuestMemfd)
+            {
                 guest_memfds = Some(RwLock::new(HashMap::new()));
             }
 
@@ -1653,16 +1719,21 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_capabilities(&self) -> hypervisor::Result<TdxCapabilities> {
-        let data = TdxCapabilities {
-            nr_cpuid_configs: TDX_MAX_NR_CPUID_CONFIGS as u32,
+        let vm_fd = self
+            .kvm
+            .create_vm_with_type(KVM_X86_TDX_VM.into())
+            .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
+
+        let mut data = TdxCapabilities {
+            cpuid_nent: TDX_MAX_NR_CPUID_CONFIGS as u32,
             ..Default::default()
         };
 
         tdx_command(
-            &self.kvm.as_raw_fd(),
+            &vm_fd.as_raw_fd(),
             TdxCommand::Capabilities,
             0,
-            &data as *const _ as *const _,
+            &mut data as *mut _ as *const _,
         )
         .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
 
@@ -1700,7 +1771,7 @@ pub struct KvmVcpu {
     hyperv_synic: AtomicBool,
     #[cfg(target_arch = "x86_64")]
     xsave_size: i32,
-    #[cfg(feature = "sev_snp")]
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     vm_fd: Arc<VmFd>,
 }
 
@@ -2405,7 +2476,7 @@ impl cpu::Vcpu for KvmVcpu {
                     }
                 }
 
-                #[cfg(feature = "sev_snp")]
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::MemoryFault { flags, gpa, size } => {
                     debug!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
 
@@ -2421,8 +2492,6 @@ impl cpu::Vcpu for KvmVcpu {
                     let attributes = if flags & KVM_MEMORY_EXIT_FLAG_PRIVATE != 0 {
                         KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
                     } else {
-                        // the only attribute available is private, o/w 0
-                        // https://docs.kernel.org/virt/kvm/api.html#kvm-set-memory-attributes
                         0u64
                     };
 
@@ -3123,6 +3192,35 @@ impl cpu::Vcpu for KvmVcpu {
 
         tdx_command(&self.fd.as_raw_fd(), TdxCommand::InitVcpu, 0, hob_address)
             .map_err(cpu::HypervisorCpuError::InitializeTdx)
+    }
+
+    #[cfg(feature = "tdx")]
+    unsafe fn tdx_init_memory_region(
+        &self,
+        host_address: *mut u8,
+        guest_address: u64,
+        size: usize,
+        measure: bool,
+    ) -> cpu::Result<()> {
+        #[repr(C)]
+        struct TdxInitMemRegion {
+            host_address: u64,
+            guest_address: u64,
+            pages: u64,
+        }
+        let data = TdxInitMemRegion {
+            host_address: host_address as _,
+            guest_address,
+            pages: (size / 4096).try_into().unwrap(),
+        };
+
+        tdx_command(
+            &self.fd.as_raw_fd(),
+            TdxCommand::InitMemRegion,
+            u32::from(measure),
+            &data as *const _ as *const _,
+        )
+        .map_err(cpu::HypervisorCpuError::InitializeTdx)
     }
 
     ///

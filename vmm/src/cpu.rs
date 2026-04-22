@@ -549,6 +549,7 @@ impl Vcpu {
         #[cfg(target_arch = "x86_64")] kvm_hyperv: bool,
         #[cfg(target_arch = "x86_64")] topology: (u16, u16, u16, u16),
         #[cfg(target_arch = "x86_64")] nested: bool,
+        #[cfg(feature = "tdx")] tdx_enabled: bool,
         #[cfg(feature = "igvm")] igvm_enabled: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
@@ -584,6 +585,8 @@ impl Vcpu {
                 self.vendor,
                 topology,
                 nested,
+                #[cfg(feature = "tdx")]
+                tdx_enabled,
                 setup_registers,
             )
             .map_err(Error::VcpuConfiguration)?;
@@ -719,6 +722,8 @@ pub struct CpuManager {
     affinity: BTreeMap<u32, Vec<usize>>,
     dynamic: bool,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    #[cfg(feature = "tdx")]
+    tdx_enabled: bool,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
     // State of the core scheduling group leader election (VM mode).
@@ -926,6 +931,8 @@ impl CpuManager {
             affinity,
             dynamic,
             hypervisor,
+            #[cfg(feature = "tdx")]
+            tdx_enabled,
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
             core_scheduling_group_leader: Arc::new(AtomicI32::new(
@@ -1055,6 +1062,8 @@ impl CpuManager {
             self.config.kvm_hyperv,
             topology,
             self.config.nested,
+            #[cfg(feature = "tdx")]
+            self.tdx_enabled,
             #[cfg(feature = "igvm")]
             self.igvm_enabled,
         )?;
@@ -1623,13 +1632,35 @@ impl CpuManager {
     #[cfg(feature = "tdx")]
     pub fn initialize_tdx(&self, hob_address: u64) -> Result<()> {
         for vcpu in &self.vcpus {
-            vcpu.lock()
-                .unwrap()
-                .vcpu
+            let vcpu = vcpu.lock().unwrap();
+            vcpu.vcpu
                 .tdx_init(hob_address)
+                .map_err(Error::InitializeTdx)?;
+            vcpu.vcpu
+                .set_cpuid2(&self.cpuid)
                 .map_err(Error::InitializeTdx)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    pub unsafe fn tdx_init_memory_region(
+        &self,
+        host_address: *mut u8,
+        guest_address: u64,
+        size: usize,
+        measure: bool,
+    ) -> Result<()> {
+        unsafe {
+            self.vcpus
+                .first()
+                .expect("TDX memory initialization requires at least one vCPU")
+                .lock()
+                .unwrap()
+                .vcpu
+                .tdx_init_memory_region(host_address, guest_address, size, measure)
+        }
+        .map_err(Error::InitializeTdx)
     }
 
     pub fn boot_vcpus(&self) -> u32 {
