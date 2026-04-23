@@ -31,6 +31,8 @@ use arch::PciSpaceInfo;
 use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 #[cfg(not(target_arch = "x86_64"))]
 use arch::uefi;
+#[cfg(feature = "tdx")]
+use arch::x86_64::tdx::{InitramfsInfo, TdvfSection, TdvfSectionType};
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits, layout};
 use devices::AcpiNotificationFlags;
 #[cfg(target_arch = "aarch64")]
@@ -1490,6 +1492,59 @@ impl Vm {
         Ok(arch::InitramfsConfig { address, size })
     }
 
+    #[cfg(feature = "tdx")]
+    fn load_tdx_initramfs(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        sections: &[TdvfSection],
+    ) -> Result<arch::InitramfsConfig> {
+        let initramfs = self.initramfs.as_mut().unwrap();
+        let size: usize = initramfs
+            .seek(SeekFrom::End(0))
+            .map_err(Error::InitramfsLoad)?
+            .try_into()
+            .unwrap();
+        initramfs.rewind().map_err(Error::InitramfsLoad)?;
+
+        let mut sorted_sections = sections.to_vec();
+        sorted_sections.retain(|section| matches!(section.r#type, TdvfSectionType::TempMem));
+
+        let max_initramfs_addr = Vm::hob_memory_resources(sorted_sections, guest_mem)
+            .into_iter()
+            .filter(|(_, _, ram)| *ram)
+            .filter_map(|(start, region_size, _)| {
+                if start >= u32::MAX as u64 + 1 {
+                    return None;
+                }
+
+                let end = start.saturating_add(region_size).min(u32::MAX as u64 + 1);
+                if end <= start {
+                    return None;
+                }
+
+                Some((start, end))
+            })
+            .rev()
+            .find_map(|(start, end)| {
+                let available = end.saturating_sub(start);
+                (available >= size as u64).then_some(end)
+            })
+            .ok_or(Error::InitramfsAddress(arch::Error::InitramfsAddress))?;
+
+        let address = max_initramfs_addr
+            .checked_sub(size as u64)
+            .map(|addr| addr & !0xfffu64)
+            .ok_or(Error::InitramfsAddress(arch::Error::InitramfsAddress))?;
+        let address = GuestAddress(address);
+
+        guest_mem
+            .read_volatile_from(address, initramfs, size)
+            .map_err(Error::InitramfsRead)?;
+
+        info!("TDX initramfs loaded: address = 0x{:x}", address.0);
+        Ok(arch::InitramfsConfig { address, size })
+    }
+
     pub fn generate_cmdline(
         payload: &PayloadConfig,
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))] device_manager: &Arc<
@@ -1734,7 +1789,8 @@ impl Vm {
             }
         }
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), None)
+            | (Some(firmware), Some(_)) if payload.fw_cfg_config.is_some() => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_kernel(firmware, None, memory_manager)
             }
@@ -1756,7 +1812,8 @@ impl Vm {
         memory_manager: Arc<Mutex<MemoryManager>>,
     ) -> Result<EntryPoint> {
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), None)
+            | (Some(firmware), Some(_)) if payload.fw_cfg_config.is_some() => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_firmware(&firmware, memory_manager)
             }
@@ -2543,6 +2600,7 @@ impl Vm {
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
         let mut payload_info = None;
+        let mut initramfs_info = None;
         let mut hob_offset = None;
         for section in sections {
             info!("Populating TDVF Section: {section:x?}");
@@ -2600,6 +2658,7 @@ impl Vm {
                         // the HOB.
                         payload_info = Some(PayloadInfo {
                             image_type: PayloadImageType::BzImage,
+                            reserved: 0,
                             entry_point: section.address,
                         });
                     }
@@ -2617,6 +2676,14 @@ impl Vm {
                 }
                 _ => {}
             }
+        }
+
+        if self.initramfs.is_some() {
+            let initramfs_config = self.load_tdx_initramfs(&boot_guest_memory, sections)?;
+            initramfs_info = Some(InitramfsInfo {
+                address: initramfs_config.address.0,
+                size: initramfs_config.size as u64,
+            });
         }
 
         // Generate HOB
@@ -2674,6 +2741,11 @@ impl Vm {
         // If a payload info has been created, let's insert it into the HOB.
         if let Some(payload_info) = payload_info {
             hob.add_payload(&mem, payload_info)
+                .map_err(Error::PopulateHob)?;
+        }
+
+        if let Some(initramfs_info) = initramfs_info {
+            hob.add_initramfs(&mem, initramfs_info)
                 .map_err(Error::PopulateHob)?;
         }
 

@@ -1073,15 +1073,23 @@ impl PayloadConfig {
             }
         }
         match (&self.firmware, &self.kernel) {
-            (Some(_firmware), Some(_kernel)) => Err(PayloadConfigError::FirmwarePlusOtherPayloads),
-            (Some(_firmware), None) => {
-                if self.cmdline.is_some() {
-                    warn!("Ignoring cmdline parameter as firmware is provided as the payload");
-                    self.cmdline = None;
+            (Some(_firmware), Some(_kernel)) => {
+                if self.fw_cfg_config.is_some() {
+                    Ok(())
+                } else {
+                    Err(PayloadConfigError::FirmwarePlusOtherPayloads)
                 }
-                if self.initramfs.is_some() {
-                    warn!("Ignoring initramfs parameter as firmware is provided as the payload");
-                    self.initramfs = None;
+            }
+            (Some(_firmware), None) => {
+                if self.fw_cfg_config.is_none() {
+                    if self.cmdline.is_some() {
+                        warn!("Ignoring cmdline parameter as firmware is provided as the payload");
+                        self.cmdline = None;
+                    }
+                    if self.initramfs.is_some() {
+                        warn!("Ignoring initramfs parameter as firmware is provided as the payload");
+                        self.initramfs = None;
+                    }
                 }
                 Ok(())
             }
