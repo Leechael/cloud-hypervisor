@@ -271,6 +271,7 @@ pub enum PayloadImageType {
 #[derive(Copy, Clone, Default, Debug)]
 pub struct PayloadInfo {
     pub image_type: PayloadImageType,
+    pub reserved: u32,
     pub entry_point: u64,
 }
 
@@ -279,6 +280,20 @@ pub struct PayloadInfo {
 struct TdPayload {
     guid_type: HobGuidType,
     payload_info: PayloadInfo,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct InitramfsInfo {
+    pub address: u64,
+    pub size: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+struct TdInitramfs {
+    guid_type: HobGuidType,
+    initramfs_info: InitramfsInfo,
 }
 
 // SAFETY: data structure only contain a series of integers
@@ -293,6 +308,10 @@ unsafe impl ByteValued for HobGuidType {}
 unsafe impl ByteValued for PayloadInfo {}
 // SAFETY: data structure only contain a series of integers
 unsafe impl ByteValued for TdPayload {}
+// SAFETY: data structure only contain a series of integers
+unsafe impl ByteValued for InitramfsInfo {}
+// SAFETY: data structure only contain a series of integers
+unsafe impl ByteValued for TdInitramfs {}
 
 pub struct TdHob {
     start_offset: u64,
@@ -514,6 +533,40 @@ impl TdHob {
         mem.write_obj(payload, GuestAddress(self.current_offset))
             .map_err(TdvfError::GuestMemoryWriteHob)?;
         self.update_offset::<TdPayload>();
+
+        Ok(())
+    }
+
+    pub fn add_initramfs(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        initramfs_info: InitramfsInfo,
+    ) -> Result<(), TdvfError> {
+        let initramfs = TdInitramfs {
+            guid_type: HobGuidType {
+                header: HobHeader {
+                    r#type: HobType::GuidExtension,
+                    length: std::mem::size_of::<TdInitramfs>() as u16,
+                    reserved: 0,
+                },
+                // CH_TD_INITRAMFS_INFO_GUID
+                // 0x27c0a33f, 0xa9f5, 0x4fcb, {0x8b, 0xe4, 0xa2, 0x7c, 0x63, 0x4b, 0x16, 0x77}
+                name: EfiGuid {
+                    data1: 0x27c0_a33f,
+                    data2: 0xa9f5,
+                    data3: 0x4fcb,
+                    data4: [0x8b, 0xe4, 0xa2, 0x7c, 0x63, 0x4b, 0x16, 0x77],
+                },
+            },
+            initramfs_info,
+        };
+        info!(
+            "Writing HOB TD_INITRAMFS {:x} {:x?}",
+            self.current_offset, initramfs
+        );
+        mem.write_obj(initramfs, GuestAddress(self.current_offset))
+            .map_err(TdvfError::GuestMemoryWriteHob)?;
+        self.update_offset::<TdInitramfs>();
 
         Ok(())
     }
