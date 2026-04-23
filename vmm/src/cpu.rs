@@ -1221,6 +1221,9 @@ impl CpuManager {
         let hypervisor_type = self.hypervisor.hypervisor_type();
         #[cfg(feature = "guest_debug")]
         let vm_debug_evt = self.vm_debug_evt.try_clone().map_err(Error::EventFdClone)?;
+        #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+        let tdx_shared_gpa_mask = 1u64
+            << u32::from(physical_bits(self.hypervisor.as_ref(), self.config.max_phys_bits));
         let panic_exit_evt = self.exit_evt.try_clone().map_err(Error::EventFdClone)?;
         let vcpus_kill_signalled = self.vcpus_kill_signalled.clone();
         let vcpus_pause_signalled = self.vcpus_pause_signalled.clone();
@@ -1481,14 +1484,35 @@ impl CpuManager {
                                     VmExit::Tdx => {
                                             match vcpu.vcpu.get_tdx_exit_details() {
                                                 Ok(details) => match details {
-                                                    TdxExitDetails::GetQuote => warn!("TDG_VP_VMCALL_GET_QUOTE not supported"),
+                                                    TdxExitDetails::MapGpa => {
+                                                        match vcpu.vcpu.handle_tdx_map_gpa(tdx_shared_gpa_mask) {
+                                                            Ok(()) => {
+                                                                warn!("TDG_VP_VMCALL_MAP_GPA handled");
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                                continue;
+                                                            }
+                                                            Err(e) => {
+                                                                error!("TDG_VP_VMCALL_MAP_GPA failed: {e}");
+                                                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                                                exit_evt.write(1).unwrap();
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    TdxExitDetails::GetQuote => {
+                                                        warn!("TDG_VP_VMCALL_GET_QUOTE not supported");
+                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                    }
                                                     TdxExitDetails::SetupEventNotifyInterrupt => {
                                                         warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
+                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                                     }
                                                 },
-                                                Err(e) => error!("Unexpected TDX VMCALL: {e}"),
+                                                Err(e) => {
+                                                    error!("Unexpected TDX VMCALL: {e}");
+                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                }
                                             }
-                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                     }
                                 },
 
