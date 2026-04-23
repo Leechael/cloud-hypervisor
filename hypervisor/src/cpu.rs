@@ -564,6 +564,13 @@ pub trait Vcpu: Send + Sync {
     }
     #[cfg(feature = "tdx")]
     ///
+    /// Handle a TDX MAP_GPA request using the hypervisor-specific memory conversion path.
+    ///
+    fn handle_tdx_map_gpa(&mut self, _shared_gpa_mask: u64) -> Result<()> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    ///
     /// Set the status code for TDX exit
     ///
     fn set_tdx_status(&mut self, _status: TdxExitStatus) {

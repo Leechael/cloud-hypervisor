@@ -203,6 +203,8 @@ fn make_segment(sev_selector: igvm::snp_defs::SevSelector) -> Segment {
 #[cfg(feature = "tdx")]
 const KVM_EXIT_TDX: u32 = 50;
 #[cfg(feature = "tdx")]
+const TDG_VP_VMCALL_MAP_GPA: u64 = 0x10001;
+#[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_GET_QUOTE: u64 = 0x10002;
 #[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT: u64 = 0x10004;
@@ -227,6 +229,7 @@ enum TdxCommand {
 
 #[cfg(feature = "tdx")]
 pub enum TdxExitDetails {
+    MapGpa,
     GetQuote,
     SetupEventNotifyInterrupt,
 }
@@ -577,6 +580,16 @@ struct KvmDirtyLogSlot {
     guest_memfd: u32,
 }
 
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+#[derive(Clone, Copy)]
+struct KvmGuestMemSlot {
+    slot: u32,
+    guest_phys_addr: u64,
+    memory_size: u64,
+    guest_memfd_offset: u64,
+    guest_memfd: u32,
+}
+
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
     fd: Arc<VmFd>,
@@ -585,7 +598,9 @@ pub struct KvmVm {
     #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
     sev_fd: Option<x86_64::sev::SevFd>,
     dirty_log_slots: RwLock<HashMap<u32, KvmDirtyLogSlot>>,
-    guest_memfds: Option<RwLock<HashMap<u32, OwnedFd>>>,
+    guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
 }
 
 impl KvmVm {
@@ -852,6 +867,10 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             vm_fd: self.fd.clone(),
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            guest_memfds: self.guest_memfds.clone(),
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            guest_mem_slots: self.guest_mem_slots.clone(),
         };
         Ok(Box::new(vcpu))
     }
@@ -1088,6 +1107,20 @@ impl vm::Vm for KvmVm {
         }
 
         if self.guest_memfds.is_some() {
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            if let Some(guest_mem_slots) = &self.guest_mem_slots {
+                guest_mem_slots.write().unwrap().insert(
+                    region.slot,
+                    KvmGuestMemSlot {
+                        slot: region.slot,
+                        guest_phys_addr: region.guest_phys_addr,
+                        memory_size: region.memory_size,
+                        guest_memfd_offset: region.guest_memfd_offset,
+                        guest_memfd: region.guest_memfd,
+                    },
+                );
+            }
+
             self.fd
                 .set_memory_attributes(kvm_memory_attributes {
                     address: region.guest_phys_addr,
@@ -1148,6 +1181,10 @@ impl vm::Vm for KvmVm {
         // Close the per-region guest_memfd if one was created for this slot
         if let Some(memfds) = &self.guest_memfds {
             memfds.write().unwrap().remove(&slot);
+        }
+        #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+        if let Some(guest_mem_slots) = &self.guest_mem_slots {
+            guest_mem_slots.write().unwrap().remove(&slot);
         }
 
         Ok(())
@@ -1301,7 +1338,6 @@ impl vm::Vm for KvmVm {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_init(&self, cpuid: &[CpuIdEntry], _max_vcpus: u32) -> vm::Result<()> {
-        const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
 
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
@@ -1353,6 +1389,8 @@ impl vm::Vm for KvmVm {
             cpuid_padding: u32,
             cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
+        const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
+
         let data = TdxInitVm {
             attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
             xfam,
@@ -1627,6 +1665,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[allow(unused_mut)]
             let mut guest_memfds = None;
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            let mut guest_mem_slots = None;
             if (_config.tdx_enabled
                 || {
                     #[cfg(feature = "sev_snp")]
@@ -1640,21 +1680,38 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 })
                 && fd.check_extension(Cap::GuestMemfd)
             {
-                guest_memfds = Some(RwLock::new(HashMap::new()));
+                guest_memfds = Some(Arc::new(RwLock::new(HashMap::new())));
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+                {
+                    guest_mem_slots = Some(Arc::new(RwLock::new(HashMap::new())));
+                }
+            }
+
+            let exit_hypercall_cap_mask = self.kvm.check_extension_int(crate::kvm::Cap::ExitHypercall);
+            if {
+                #[cfg(feature = "sev_snp")]
+                {
+                    _config.sev_snp_enabled
+                }
+                #[cfg(not(feature = "sev_snp"))]
+                {
+                    false
+                }
+            } && exit_hypercall_cap_mask > 0
+            {
+                let cap = kvm_bindings::kvm_enable_cap {
+                    cap: kvm_bindings::KVM_CAP_EXIT_HYPERCALL,
+                    args: [exit_hypercall_cap_mask as _, 0, 0, 0],
+                    ..Default::default()
+                };
+                fd.enable_cap(&cap)
+                    .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
             }
 
             #[cfg(feature = "sev_snp")]
             let sev_fd = {
                 let sev_snp_enabled = vm_type == KVM_X86_SNP_VM as u64;
                 if sev_snp_enabled {
-                    let mask = self.kvm.check_extension_int(crate::kvm::Cap::ExitHypercall);
-                    let cap = kvm_bindings::kvm_enable_cap {
-                        cap: kvm_bindings::KVM_CAP_EXIT_HYPERCALL,
-                        args: [mask as _, 0, 0, 0],
-                        ..Default::default()
-                    };
-                    fd.enable_cap(&cap)
-                        .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
                     let sev_dev = x86_64::sev::SevFd::new("/dev/sev")
                         .map_err(|e| hypervisor::HypervisorError::SevSnpCapabilities(e.into()))?;
                     sev_dev
@@ -1673,6 +1730,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 #[cfg(feature = "sev_snp")]
                 sev_fd,
                 guest_memfds,
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+                guest_mem_slots,
             }))
         }
 
@@ -1682,6 +1741,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 fd: Arc::new(fd),
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 guest_memfds: None,
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+                guest_mem_slots: None,
             }))
         }
     }
@@ -1773,6 +1834,10 @@ pub struct KvmVcpu {
     xsave_size: i32,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     vm_fd: Arc<VmFd>,
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
 }
 
 /// Implementation of Vcpu trait for KVM
@@ -2432,10 +2497,17 @@ impl cpu::Vcpu for KvmVcpu {
                 #[cfg(feature = "tdx")]
                 VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
                 VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
-                #[cfg(feature = "sev_snp")]
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::Hypercall(hypercall) => {
                     // https://docs.kernel.org/virt/kvm/x86/hypercalls.html#kvm-hc-map-gpa-range
                     const KVM_HC_MAP_GPA_RANGE: u64 = 12;
+                    warn!(
+                        "VcpuExit::Hypercall nr={} args=[{:#x}, {:#x}, {:#x}]",
+                        hypercall.nr,
+                        hypercall.args[0],
+                        hypercall.args[1],
+                        hypercall.args[2]
+                    );
                     // 4th bit of attributes argument is encrypted page bit
                     match hypercall.nr {
                         KVM_HC_MAP_GPA_RANGE => {
@@ -2448,29 +2520,17 @@ impl cpu::Vcpu for KvmVcpu {
                             // bits[5-63] = zero
                             let attributes = hypercall.args[2];
                             // TODO: Add 2mb page support
+                            const PAGE_SIZE_4K: u64 = 4096;
                             let size = num_pages * PAGE_SIZE_4K;
                             // bit 4 = private attribute encoding
                             const PRIVATE_ENCODING_BITMASK: u64 = 0b10000;
                             debug!(
                                 "KVM_HC_MAP_GPA_RANGE: address={address:#x}, pages={num_pages}, attributes={attributes:#x}"
                             );
-                            let set_private_attr = if attributes & PRIVATE_ENCODING_BITMASK > 0 {
-                                KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
-                            } else {
-                                // the only attribute available is private, o/w 0
-                                // https://docs.kernel.org/virt/kvm/api.html#kvm-set-memory-attributes
-                                0u64
-                            };
-                            let mem_attributes = kvm_memory_attributes {
-                                address,
-                                size,
-                                attributes: set_private_attr,
-                                ..Default::default()
-                            };
-                            self.vm_fd
-                                .set_memory_attributes(mem_attributes)
-                                .map(|_| cpu::VmExit::Ignore)
-                                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
+                            let private = attributes & PRIVATE_ENCODING_BITMASK > 0;
+                            self.convert_guest_memory_region(address, size, private)?;
+
+                            Ok(cpu::VmExit::Ignore)
                         }
                         _ => Ok(cpu::VmExit::Ignore),
                     }
@@ -2478,7 +2538,7 @@ impl cpu::Vcpu for KvmVcpu {
 
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::MemoryFault { flags, gpa, size } => {
-                    debug!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
+                    warn!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
 
                     const KVM_MEMORY_EXIT_FLAG_PRIVATE: u64 =
                         kvm_bindings::KVM_MEMORY_EXIT_FLAG_PRIVATE as u64;
@@ -2495,15 +2555,27 @@ impl cpu::Vcpu for KvmVcpu {
                         0u64
                     };
 
-                    self.vm_fd
-                        .set_memory_attributes(kvm_memory_attributes {
-                            address: gpa,
-                            size,
-                            attributes,
-                            flags: 0,
-                        })
-                        .map(|_| cpu::VmExit::Ignore)
-                        .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
+                    const KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE: u64 = 4096;
+
+                    let mut offset = 0u64;
+                    while offset < size {
+                        let chunk_size = std::cmp::min(KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE, size - offset);
+                        self.vm_fd
+                            .set_memory_attributes(kvm_memory_attributes {
+                                address: gpa + offset,
+                                size: chunk_size,
+                                attributes,
+                                flags: 0,
+                            })
+                            .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+                        offset += chunk_size;
+                    }
+
+                    if attributes == 0 {
+                        self.punch_hole_guest_memfd(gpa, size)?;
+                    }
+
+                    Ok(cpu::VmExit::Ignore)
                 }
 
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
@@ -3251,6 +3323,18 @@ impl cpu::Vcpu for KvmVcpu {
         }
 
         match tdx_vmcall.subfunction {
+            TDG_VP_VMCALL_MAP_GPA => {
+                warn!(
+                    "TDX VMCALL MAP_GPA: r12={:#x} r13={:#x} r14={:#x} r15={:#x} rbx={:#x} rdx={:#x}",
+                    tdx_vmcall.in_r12,
+                    tdx_vmcall.in_r13,
+                    tdx_vmcall.in_r14,
+                    tdx_vmcall.in_r15,
+                    tdx_vmcall.in_rbx,
+                    tdx_vmcall.in_rdx,
+                );
+                Ok(TdxExitDetails::MapGpa)
+            }
             TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote),
             TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
                 Ok(TdxExitDetails::SetupEventNotifyInterrupt)
@@ -3262,6 +3346,48 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     /// Set the status code for TDX exit
     ///
+    #[cfg(feature = "tdx")]
+    fn handle_tdx_map_gpa(&mut self, shared_gpa_mask: u64) -> cpu::Result<()> {
+        let kvm_run = self.fd.get_kvm_run();
+        // SAFETY: accessing a union field in a valid structure
+        let tdx_vmcall = unsafe {
+            &mut (*((&mut kvm_run.__bindgen_anon_1) as *mut kvm_run__bindgen_ty_1
+                as *mut KvmTdxExit))
+                .u
+                .vmcall
+        };
+
+        if tdx_vmcall.type_ != 0 || tdx_vmcall.subfunction != TDG_VP_VMCALL_MAP_GPA {
+            return Err(cpu::HypervisorCpuError::UnknownTdxVmCall);
+        }
+
+        let raw_address = tdx_vmcall.in_r12;
+        let size = tdx_vmcall.in_r13;
+        let private = raw_address & shared_gpa_mask == 0;
+        let address = raw_address & !shared_gpa_mask;
+
+        debug!(
+            "TDX MAP_GPA: raw_address={raw_address:#x}, address={address:#x}, size={size:#x}, private={private}"
+        );
+
+        if size == 0 {
+            return Ok(());
+        }
+
+        if address & 0xfff != 0 || size & 0xfff != 0 {
+            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                "TDX MAP_GPA range is not 4K aligned: address={address:#x}, size={size:#x}"
+            )));
+        }
+
+        // Linux TDX guests issue TDG.VP.VMCALL<MapGPA> with:
+        //   r12 = start GPA (shared bit encoded in the GPA for private->shared)
+        //   r13 = range length in bytes
+        // The host must update KVM memory attributes and punch holes in guest_memfd
+        // for shared ranges so the mapping actually becomes visible to the VMM.
+        self.convert_guest_memory_region(address, size, private)
+    }
+
     #[cfg(feature = "tdx")]
     fn set_tdx_status(&mut self, status: TdxExitStatus) {
         let kvm_run = self.fd.get_kvm_run();
@@ -3465,6 +3591,94 @@ impl cpu::Vcpu for KvmVcpu {
 }
 
 impl KvmVcpu {
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn convert_guest_memory_region(&self, address: u64, size: u64, private: bool) -> cpu::Result<()> {
+        let attributes = if private {
+            KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+        } else {
+            0u64
+        };
+
+        self.vm_fd
+            .set_memory_attributes(kvm_memory_attributes {
+                address,
+                size,
+                attributes,
+                flags: 0,
+            })
+            .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+        if !private {
+            self.punch_hole_guest_memfd(address, size)?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn punch_hole_guest_memfd(&self, address: u64, size: u64) -> cpu::Result<()> {
+        let Some(guest_memfds) = &self.guest_memfds else {
+            return Ok(());
+        };
+        let Some(guest_mem_slots) = &self.guest_mem_slots else {
+            return Ok(());
+        };
+
+        let end = address
+            .checked_add(size)
+            .ok_or_else(|| cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow")))?;
+
+        let slots: Vec<KvmGuestMemSlot> = guest_mem_slots
+            .read()
+            .unwrap()
+            .values()
+            .copied()
+            .collect();
+        let memfds = guest_memfds.read().unwrap();
+
+        for slot in slots {
+            let slot_start = slot.guest_phys_addr;
+            let slot_end = slot
+                .guest_phys_addr
+                .checked_add(slot.memory_size)
+                .ok_or_else(|| {
+                    cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd slot overflow"))
+                })?;
+
+            let punch_start = std::cmp::max(address, slot_start);
+            let punch_end = std::cmp::min(end, slot_end);
+            if punch_start >= punch_end {
+                continue;
+            }
+
+            let fd = memfds.get(&slot.slot).ok_or_else(|| {
+                cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "missing guest_memfd for slot {}",
+                    slot.slot
+                ))
+            })?;
+
+            let offset = slot.guest_memfd_offset + (punch_start - slot_start);
+            let length = punch_end - punch_start;
+            let ret = unsafe {
+                libc::fallocate64(
+                    fd.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off64_t,
+                    length as libc::off64_t,
+                )
+            };
+            if ret != 0 {
+                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "guest_memfd punch hole failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call that returns the vcpu's current "xsave struct".
