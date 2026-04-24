@@ -632,6 +632,13 @@ pub trait Vcpu: Send + Sync {
     }
     #[cfg(feature = "tdx")]
     ///
+    /// Convert a guest memory region between private and shared.
+    ///
+    fn convert_guest_memory_region(&self, _address: u64, _size: u64, _private: bool) -> Result<()> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    ///
     /// Set the status code for TDX exit
     ///
     fn set_tdx_status(&mut self, _status: TdxExitStatus) {

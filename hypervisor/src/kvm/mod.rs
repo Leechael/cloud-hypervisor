@@ -289,7 +289,6 @@ enum TdxCommand {
     InitVcpu,
     InitMemRegion,
     Finalize,
-    GetCpuid,
 }
 
 #[cfg(feature = "tdx")]
@@ -1285,10 +1284,6 @@ impl vm::Vm for KvmVm {
         if let Some(slots) = &self.memory_slots {
             slots.write().unwrap().remove(&slot);
         }
-        #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-        if let Some(guest_mem_slots) = &self.guest_mem_slots {
-            guest_mem_slots.write().unwrap().remove(&slot);
-        }
 
         Ok(())
     }
@@ -1523,7 +1518,6 @@ impl vm::Vm for KvmVm {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_init(&self, cpuid: &[CpuIdEntry], _max_vcpus: u32) -> vm::Result<()> {
-
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
 
@@ -1541,10 +1535,8 @@ impl vm::Vm for KvmVm {
 
         let xfam = caps.supported_xfam;
 
-        let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
-            .into_iter()
-            .filter(tdx_init_cpuid_entry)
-            .collect();
+        let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+            cpuid.into_iter().filter(tdx_init_cpuid_entry).collect();
         for entry in &mut tdx_cpuid {
             if let Some(mask) = caps.cpuid_configs[..caps.cpuid_nent as usize]
                 .iter()
@@ -1574,10 +1566,8 @@ impl vm::Vm for KvmVm {
             cpuid_padding: u32,
             cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
-        const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
-
         let data = TdxInitVm {
-            attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
+            attributes: 0,
             xfam,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
@@ -1841,7 +1831,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             #[allow(unused_mut)]
             let mut memory_slots = None;
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-            if ({
+            let guest_memfd_enabled = {
                 #[cfg(feature = "sev_snp")]
                 {
                     _config.sev_snp_enabled
@@ -1859,24 +1849,24 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 {
                     false
                 }
-            }) && fd.check_extension(Cap::GuestMemfd)
-            {
+            };
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            if guest_memfd_enabled && fd.check_extension(Cap::GuestMemfd) {
                 memory_slots = Some(Arc::new(RwLock::new(HashMap::new())));
             }
 
-            #[cfg(feature = "sev_snp")]
-            if _config.sev_snp_enabled {
-                let exit_hypercall_cap_mask =
-                    self.kvm.check_extension_int(crate::kvm::Cap::ExitHypercall);
-                if exit_hypercall_cap_mask > 0 {
-                    let cap = kvm_bindings::kvm_enable_cap {
-                        cap: kvm_bindings::KVM_CAP_EXIT_HYPERCALL,
-                        args: [exit_hypercall_cap_mask as _, 0, 0, 0],
-                        ..Default::default()
-                    };
-                    fd.enable_cap(&cap)
-                        .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
-                }
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            if guest_memfd_enabled {
+                // KVM_HC_MAP_GPA_RANGE (hypercall 12) is routed to userspace
+                // so the VMM can handle private/shared conversions.
+                const KVM_HC_MAP_GPA_RANGE: u64 = 12;
+                let cap = kvm_bindings::kvm_enable_cap {
+                    cap: kvm_bindings::KVM_CAP_EXIT_HYPERCALL,
+                    args: [1u64 << KVM_HC_MAP_GPA_RANGE, 0, 0, 0],
+                    ..Default::default()
+                };
+                fd.enable_cap(&cap)
+                    .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
             }
 
             #[cfg(feature = "sev_snp")]
@@ -2058,9 +2048,9 @@ impl KvmVcpu {
         let Some(memory_slots) = &self.memory_slots else {
             return Ok(());
         };
-        let end = address
-            .checked_add(size)
-            .ok_or_else(|| cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow")))?;
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow"))
+        })?;
         let slots = memory_slots.read().unwrap();
 
         for slot in slots.values() {
@@ -2742,24 +2732,25 @@ impl cpu::Vcpu for KvmVcpu {
                 VcpuExit::Hypercall(hypercall) => {
                     // https://docs.kernel.org/virt/kvm/x86/hypercalls.html#kvm-hc-map-gpa-range
                     const KVM_HC_MAP_GPA_RANGE: u64 = 12;
-                    warn!(
+                    let (nr, args, ret_ptr) = {
+                        let ret_ptr = hypercall.ret as *mut u64;
+                        (hypercall.nr, hypercall.args, ret_ptr)
+                    };
+                    debug!(
                         "VcpuExit::Hypercall nr={} args=[{:#x}, {:#x}, {:#x}]",
-                        hypercall.nr,
-                        hypercall.args[0],
-                        hypercall.args[1],
-                        hypercall.args[2]
+                        nr, args[0], args[1], args[2]
                     );
                     // 4th bit of attributes argument is encrypted page bit
-                    match hypercall.nr {
+                    match nr {
                         KVM_HC_MAP_GPA_RANGE => {
                             // guest physical address of start page
-                            let address = hypercall.args[0];
+                            let address = args[0];
                             // num pages to map from start address
-                            let num_pages = hypercall.args[1];
+                            let num_pages = args[1];
                             // bits[0-3]  = page size encoding
                             // bits[4]   = 1 if private, 0 if shared
                             // bits[5-63] = zero
-                            let attributes = hypercall.args[2];
+                            let attributes = args[2];
                             // TODO: Add 2mb page support
                             const PAGE_SIZE_4K: u64 = 4096;
                             let size = num_pages * PAGE_SIZE_4K;
@@ -2770,16 +2761,28 @@ impl cpu::Vcpu for KvmVcpu {
                             );
                             let private = attributes & PRIVATE_ENCODING_BITMASK > 0;
                             self.convert_guest_memory_region(address, size, private)?;
+                            // SAFETY: ret_ptr points to the ret field in the
+                            // valid, kernel-mapped kvm_run structure.
+                            unsafe {
+                                *ret_ptr = 0;
+                            }
 
                             Ok(cpu::VmExit::Ignore)
                         }
-                        _ => Ok(cpu::VmExit::Ignore),
+                        _ => {
+                            // SAFETY: ret_ptr points to the ret field in the
+                            // valid, kernel-mapped kvm_run structure.
+                            unsafe {
+                                *ret_ptr = u64::MAX;
+                            }
+                            Ok(cpu::VmExit::Ignore)
+                        }
                     }
                 }
 
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::MemoryFault { flags, gpa, size } => {
-                    warn!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
+                    debug!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
 
                     const KVM_MEMORY_EXIT_FLAG_PRIVATE: u64 =
                         kvm_bindings::KVM_MEMORY_EXIT_FLAG_PRIVATE as u64;
@@ -2796,11 +2799,18 @@ impl cpu::Vcpu for KvmVcpu {
                         0u64
                     };
 
+                    // Match QEMU order: fallocate first, then set_memory_attributes
+                    if attributes == 0 {
+                        self.punch_hole_guest_memfd(gpa, size)?;
+                    } else {
+                        self.allocate_guest_memfd(gpa, size)?;
+                    }
+
                     const KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE: u64 = 4096;
 
                     let mut offset = 0u64;
                     while offset < size {
-                        let chunk_size = std::cmp::min(KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE, size - offset);
+                        let chunk_size = KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE.min(size - offset);
                         self.vm_fd
                             .set_memory_attributes(kvm_memory_attributes {
                                 address: gpa + offset,
@@ -2812,16 +2822,15 @@ impl cpu::Vcpu for KvmVcpu {
                         offset += chunk_size;
                     }
 
-                    if attributes == 0 {
-                        self.punch_hole_guest_memfd(gpa, size)?;
-                    }
-
                     Ok(cpu::VmExit::Ignore)
                 }
 
-                r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                    "Unexpected exit reason on vcpu run: {r:?}"
-                ))),
+                r => {
+                    warn!("KVM_RUN unexpected exit reason: {r:?}");
+                    Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "Unexpected exit reason on vcpu run: {r:?}"
+                    )))
+                }
             },
 
             Err(ref e) => match e.errno() {
@@ -3662,7 +3671,7 @@ impl cpu::Vcpu for KvmVcpu {
 
         match tdx_vmcall.subfunction {
             TDG_VP_VMCALL_MAP_GPA => {
-                warn!(
+                debug!(
                     "TDX VMCALL MAP_GPA: r12={:#x} r13={:#x} r14={:#x} r15={:#x} rbx={:#x} rdx={:#x}",
                     tdx_vmcall.in_r12,
                     tdx_vmcall.in_r13,
@@ -3724,6 +3733,16 @@ impl cpu::Vcpu for KvmVcpu {
         // The host must update KVM memory attributes and punch holes in guest_memfd
         // for shared ranges so the mapping actually becomes visible to the VMM.
         self.convert_guest_memory_region(address, size, private)
+    }
+
+    #[cfg(feature = "tdx")]
+    fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> cpu::Result<()> {
+        KvmVcpu::convert_guest_memory_region(self, address, size, private)
     }
 
     #[cfg(feature = "tdx")]
@@ -4043,25 +4062,160 @@ impl KvmVcpu {
 }
 
 impl KvmVcpu {
+    /// Convert a guest memory range between private and shared.
+    ///
+    /// Mirrors QEMU kvm_convert_memory(): updates KVM memory attributes and,
+    /// when converting to shared, punches holes in the backing guest_memfd so
+    /// the host can access the pages.
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-    fn convert_guest_memory_region(&self, address: u64, size: u64, private: bool) -> cpu::Result<()> {
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> cpu::Result<()> {
         let attributes = if private {
             KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
         } else {
             0u64
         };
 
-        self.vm_fd
-            .set_memory_attributes(kvm_memory_attributes {
-                address,
-                size,
-                attributes,
-                flags: 0,
-            })
-            .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("guest memory conversion range overflow"))
+        })?;
 
-        if !private {
-            self.punch_hole_guest_memfd(address, size)?;
+        let Some(memory_slots) = &self.memory_slots else {
+            self.vm_fd
+                .set_memory_attributes(kvm_memory_attributes {
+                    address,
+                    size,
+                    attributes,
+                    flags: 0,
+                })
+                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+            if !private {
+                self.punch_hole_guest_memfd(address, size)?;
+            }
+
+            return Ok(());
+        };
+
+        let mut slots: Vec<(u64, u64)> = memory_slots
+            .read()
+            .unwrap()
+            .values()
+            .map(|slot| (slot.guest_phys_addr, slot.memory_size))
+            .filter(|(slot_addr, slot_size)| {
+                *slot_addr < end
+                    && slot_addr
+                        .checked_add(*slot_size)
+                        .is_some_and(|slot_end| slot_end > address)
+            })
+            .collect();
+        slots.sort_unstable();
+
+        if slots.is_empty() {
+            if private {
+                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "attempted to convert non-guest-memfd range to private: address={address:#x}, size={size:#x}"
+                )));
+            }
+
+            debug!(
+                "Ignoring shared conversion for non-guest-memfd range: address={address:#x}, size={size:#x}"
+            );
+            return Ok(());
+        }
+
+        let mut covered_until = address;
+        for (slot_addr, slot_size) in slots {
+            let slot_end = slot_addr.checked_add(slot_size).ok_or_else(|| {
+                cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd slot overflow"))
+            })?;
+            let range_start = address.max(slot_addr);
+            let range_end = end.min(slot_end);
+            if range_start >= range_end {
+                continue;
+            }
+
+            if private && range_start > covered_until {
+                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "attempted to convert non-guest-memfd hole to private: address={address:#x}, size={size:#x}, hole_start={covered_until:#x}, hole_end={range_start:#x}"
+                )));
+            }
+
+            self.vm_fd
+                .set_memory_attributes(kvm_memory_attributes {
+                    address: range_start,
+                    size: range_end - range_start,
+                    attributes,
+                    flags: 0,
+                })
+                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+            if !private {
+                self.punch_hole_guest_memfd(range_start, range_end - range_start)?;
+            }
+
+            covered_until = covered_until.max(range_end);
+        }
+
+        if private && covered_until < end {
+            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                "attempted to convert trailing non-guest-memfd hole to private: address={address:#x}, size={size:#x}, covered_until={covered_until:#x}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn allocate_guest_memfd(&self, address: u64, size: u64) -> cpu::Result<()> {
+        let Some(memory_slots) = &self.memory_slots else {
+            return Ok(());
+        };
+
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow"))
+        })?;
+
+        let slots = memory_slots.read().unwrap();
+
+        for slot in slots.values() {
+            let slot_end = slot
+                .guest_phys_addr
+                .checked_add(slot.memory_size)
+                .ok_or_else(|| {
+                    cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd slot overflow"))
+                })?;
+
+            let alloc_start = address.max(slot.guest_phys_addr);
+            let alloc_end = end.min(slot_end);
+            if alloc_start >= alloc_end {
+                continue;
+            }
+
+            // Each guest_memfd is per-region and sized to memory_size,
+            // so the region's data always starts at offset 0.
+            let offset = alloc_start - slot.guest_phys_addr;
+            let length = alloc_end - alloc_start;
+            // SAFETY: fd is valid, offset and len are within the slot's range.
+            let ret = unsafe {
+                libc::fallocate64(
+                    slot.guest_memfd.as_raw_fd(),
+                    0,
+                    offset as libc::off64_t,
+                    length as libc::off64_t,
+                )
+            };
+
+            if ret != 0 {
+                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "guest_memfd allocate failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
         }
 
         Ok(())
