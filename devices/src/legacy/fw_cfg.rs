@@ -186,6 +186,9 @@ pub struct FwCfg {
     items: Vec<FwCfgItem>,                           // 0x20 and above
     known_items: [FwCfgContent; FW_CFG_KNOWN_ITEMS], // 0x0 to 0x19
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+    /// Optional hook called before fw_cfg DMA read/write.
+    /// Arguments: (guest_address, length)
+    pub dma_pre_hook: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 }
 
 #[repr(C)]
@@ -431,6 +434,7 @@ impl FwCfg {
             items: vec![],
             known_items,
             memory,
+            dma_pre_hook: None,
         }
     }
 
@@ -608,6 +612,9 @@ impl FwCfg {
         }
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
+        if let Some(hook) = &self.dma_pre_hook {
+            hook(addr, len as u64);
+        }
         let ret = if control.read() {
             self.dma_read(self.selector, len, addr)
         } else if control.write() {

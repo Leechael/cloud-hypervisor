@@ -1585,6 +1585,18 @@ impl DeviceManager {
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
         )));
 
+        #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+        {
+            let cpu_manager = self.cpu_manager.clone();
+            fw_cfg.lock().unwrap().dma_pre_hook = Some(Arc::new(
+                move |addr: u64, len: u64| {
+                    if let Ok(cm) = cpu_manager.lock() {
+                        let _ = cm.convert_guest_memory_region(addr, len, false);
+                    }
+                },
+            ));
+        }
+
         self.fw_cfg = Some(fw_cfg.clone());
 
         self.bus_devices
@@ -5478,8 +5490,13 @@ impl Aml for DeviceManager {
 
         let mut pci_scan_methods = Vec::new();
         for i in 0..self.pci_segments.len() {
+            let pci_name = if i == 0 {
+                "\\_SB_.PCI0.PCNT".into()
+            } else {
+                format!("\\_SB_.PC{i:02X}.PCNT").as_str().into()
+            };
             pci_scan_methods.push(aml::MethodCall::new(
-                format!("\\_SB_.PC{i:02X}.PCNT").as_str().into(),
+                pci_name,
                 vec![],
             ));
         }

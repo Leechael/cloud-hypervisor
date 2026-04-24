@@ -544,8 +544,13 @@ impl Aml for PciSegment {
         let prt = aml::Name::new("_PRT".into(), &aml::Package::new(prt_package_list));
         pci_dsdt_inner_data.push(&prt);
 
+        let pci_name = if self.id == 0 {
+            "_SB_.PCI0".into()
+        } else {
+            format!("_SB_.PC{:02X}", self.id).as_str().into()
+        };
         aml::Device::new(
-            format!("_SB_.PC{:02X}", self.id).as_str().into(),
+            pci_name,
             pci_dsdt_inner_data,
         )
         .to_aml_bytes(sink);
