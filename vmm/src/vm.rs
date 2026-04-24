@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{any, cmp, result, str, thread};
+use std::{ptr, slice};
 
 use anyhow::{Context, anyhow};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -32,7 +33,7 @@ use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 #[cfg(not(target_arch = "x86_64"))]
 use arch::uefi;
 #[cfg(feature = "tdx")]
-use arch::x86_64::tdx::{InitramfsInfo, TdvfSection, TdvfSectionType};
+use arch::x86_64::tdx::{TdvfSection, TdvfSectionType};
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits, layout};
 use devices::AcpiNotificationFlags;
 #[cfg(target_arch = "aarch64")]
@@ -1513,7 +1514,7 @@ impl Vm {
             .into_iter()
             .filter(|(_, _, ram)| *ram)
             .filter_map(|(start, region_size, _)| {
-                if start >= u32::MAX as u64 + 1 {
+                if start > u32::MAX as u64 {
                     return None;
                 }
 
@@ -1789,8 +1790,7 @@ impl Vm {
             }
         }
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None)
-            | (Some(firmware), Some(_)) if payload.fw_cfg_config.is_some() => {
+            (Some(firmware), None) | (Some(firmware), Some(_)) if payload.fw_cfg_enabled() => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_kernel(firmware, None, memory_manager)
             }
@@ -1812,8 +1812,7 @@ impl Vm {
         memory_manager: Arc<Mutex<MemoryManager>>,
     ) -> Result<EntryPoint> {
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None)
-            | (Some(firmware), Some(_)) if payload.fw_cfg_config.is_some() => {
+            (Some(firmware), None) | (Some(firmware), Some(_)) if payload.fw_cfg_enabled() => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_firmware(&firmware, memory_manager)
             }
@@ -2565,20 +2564,38 @@ impl Vm {
             .as_ref()
             .unwrap()
             .boot_guest_memory();
+        // Collect TDVF sections that need allocation and merge overlapping ranges
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
         for section in sections {
-            // No need to allocate if the section falls within guest RAM ranges
             if boot_guest_memory.address_in_range(GuestAddress(section.address)) {
                 info!(
                     "Not allocating TDVF Section: {section:x?} since it is already part of guest RAM"
                 );
-                continue;
+            } else {
+                ranges.push((section.address, section.address + section.size));
             }
-
-            info!("Allocating TDVF Section: {section:x?}");
+        }
+        // Sort by start address and merge overlapping ranges
+        ranges.sort_by_key(|r| r.0);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            } else {
+                merged.push((start, end));
+            }
+        }
+        for (start, end) in merged {
+            let size = (end - start) as usize;
+            info!("Allocating merged TDVF range: {start:#x} - {end:#x}, size={size:#x}");
             self.memory_manager
                 .lock()
                 .unwrap()
-                .add_ram_region(GuestAddress(section.address), section.size as usize)
+                .add_ram_region(GuestAddress(start), size)
                 .map_err(Error::AllocatingTdvfMemory)?;
         }
 
@@ -2760,24 +2777,55 @@ impl Vm {
         let mem = guest_memory.memory();
 
         for section in sections {
-            let size = section.size.try_into().unwrap();
+            let section_type = section.r#type;
+            let section_address = section.address;
+            let section_size = section.size;
+            let section_attributes = section.attributes;
+            let size = section_size.try_into().unwrap();
+
+            let host_ptr = if matches!(
+                section_type,
+                TdvfSectionType::TdHob | TdvfSectionType::TempMem
+            ) {
+                // Allocate page-aligned host buffer for INIT_MEM_REGION
+                // SAFETY: FFI call with valid arguments; the returned pointer is
+                // checked against MAP_FAILED below.
+                let ptr = unsafe {
+                    libc::mmap(
+                        ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                        -1,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(Error::AllocatingTdvfMemory(
+                        memory_manager::Error::MemoryRangeAllocation,
+                    ));
+                }
+                if matches!(section_type, TdvfSectionType::TdHob) {
+                    // SAFETY: ptr was just mmap'd with `size` bytes above.
+                    let slice = unsafe { slice::from_raw_parts_mut(ptr as *mut u8, size) };
+                    mem.read_slice(slice, GuestAddress(section_address))
+                        .map_err(Error::FirmwareLoad)?;
+                }
+                ptr as *mut u8
+            } else {
+                virtio_devices::get_host_address_range(&*mem, GuestAddress(section_address), size)
+                    .unwrap()
+            };
+
             // SAFETY: get_host_address_range does proper bounds checking
             unsafe {
-                self.cpu_manager
-                    .lock()
-                    .unwrap()
-                    .tdx_init_memory_region(
-                        virtio_devices::get_host_address_range(
-                            &*mem,
-                            GuestAddress(section.address),
-                            size,
-                        )
-                        .unwrap(),
-                        section.address,
-                        size,
-                        /* TDVF_SECTION_ATTRIBUTES_EXTENDMR */
-                        section.attributes == 1,
-                    )
+                self.cpu_manager.lock().unwrap().tdx_init_memory_region(
+                    host_ptr,
+                    section_address,
+                    size,
+                    /* TDVF_SECTION_ATTRIBUTES_EXTENDMR */
+                    section_attributes == 1,
+                )
             }
             .map_err(Error::CpuManager)?;
         }

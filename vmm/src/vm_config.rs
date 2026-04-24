@@ -1058,6 +1058,18 @@ impl FromStr for FwCfgItemList {
 }
 
 impl PayloadConfig {
+    /// Whether the fw_cfg device is enabled for this payload.
+    pub fn fw_cfg_enabled(&self) -> bool {
+        #[cfg(feature = "fw_cfg")]
+        {
+            self.fw_cfg_config.is_some()
+        }
+        #[cfg(not(feature = "fw_cfg"))]
+        {
+            false
+        }
+    }
+
     /// Validates the payload config.
     ///
     /// Succeeds if Cloud Hypervisor will be able to boot the configuration.
@@ -1072,22 +1084,23 @@ impl PayloadConfig {
                 return Ok(());
             }
         }
+        #[cfg(feature = "fw_cfg")]
+        let fw_cfg_enabled = self.fw_cfg_config.is_some();
+        #[cfg(not(feature = "fw_cfg"))]
+        let fw_cfg_enabled = false;
+
         match (&self.firmware, &self.kernel) {
-            (Some(_firmware), Some(_kernel)) => {
-                if self.fw_cfg_config.is_some() {
-                    Ok(())
-                } else {
-                    Err(PayloadConfigError::FirmwarePlusOtherPayloads)
-                }
-            }
+            (Some(_firmware), Some(_kernel)) => Ok(()),
             (Some(_firmware), None) => {
-                if self.fw_cfg_config.is_none() {
+                if !fw_cfg_enabled {
                     if self.cmdline.is_some() {
                         warn!("Ignoring cmdline parameter as firmware is provided as the payload");
                         self.cmdline = None;
                     }
                     if self.initramfs.is_some() {
-                        warn!("Ignoring initramfs parameter as firmware is provided as the payload");
+                        warn!(
+                            "Ignoring initramfs parameter as firmware is provided as the payload"
+                        );
                         self.initramfs = None;
                     }
                 }
