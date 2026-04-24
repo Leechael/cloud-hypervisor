@@ -213,6 +213,12 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to finalize TDX")]
     FinalizeTdx(#[source] std::io::Error),
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    ///
+    /// Error setting memory attributes
+    ///
+    #[error("Failed to set memory attributes")]
+    SetMemoryAttributes(#[source] std::io::Error),
     #[cfg(feature = "tdx")]
     ///
     /// Error initializing the TDX memory region
@@ -462,9 +468,18 @@ pub trait Vm: Send + Sync + Any {
         Ok(())
     }
 
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn set_memory_attributes(&self, _address: u64, _size: u64, _attributes: u64) -> Result<()> {
+        unimplemented!()
+    }
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     fn enable_x2apic_api(&self) -> Result<()> {
         unimplemented!("x2Apic is only supported on KVM/Linux hosts")
+    }
+
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn share_memory_region(&self, _address: u64, _size: u64) -> Result<()> {
+        unimplemented!()
     }
 }
 

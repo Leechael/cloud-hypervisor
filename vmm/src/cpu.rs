@@ -643,6 +643,24 @@ impl Vcpu {
         self.vcpu.run()
     }
 
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> Result<()> {
+        use hypervisor::kvm::KvmVcpu;
+        let kvm_vcpu = self
+            .vcpu
+            .as_any()
+            .downcast_ref::<KvmVcpu>()
+            .ok_or_else(|| Error::VcpuCreate(anyhow::anyhow!("not a KvmVcpu")))?;
+        kvm_vcpu
+            .convert_guest_memory_region(address, size, private)
+            .map_err(|e| Error::VcpuRun(e.into()))
+    }
+
     #[cfg(feature = "sev_snp")]
     pub fn set_sev_control_register(&self, vmsa_pfn: u64) -> Result<()> {
         self.vcpu
@@ -1109,6 +1127,21 @@ impl CpuManager {
         Ok(vcpus)
     }
 
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> Result<()> {
+        if let Some(vcpu) = self.vcpus.first() {
+            let vcpu = vcpu.lock().unwrap();
+            vcpu.convert_guest_memory_region(address, size, private)
+        } else {
+            Err(Error::DesiredVCpuCountIsZero)
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub fn init_pmu(&self, irq: u32) -> Result<bool> {
         for cpu in self.vcpus.iter() {
@@ -1406,7 +1439,14 @@ impl CpuManager {
                                     #[cfg(feature = "tdx")]
                                     VmExit::Tdx => {
                                             match vcpu.vcpu.get_tdx_exit_details() {
-                                                Ok(details) => match details {
+                                                Ok(details) => {
+                                                    let detail_str = match details {
+                                                        TdxExitDetails::MapGpa => "MapGpa",
+                                                        TdxExitDetails::GetQuote => "GetQuote",
+                                                        TdxExitDetails::SetupEventNotifyInterrupt => "SetupEventNotifyInterrupt",
+                                                    };
+                                                    info!("KVM_EXIT_TDX details={detail_str}");
+                                                    match details {
                                                     TdxExitDetails::MapGpa => {
                                                         match vcpu.vcpu.handle_tdx_map_gpa(tdx_shared_gpa_mask) {
                                                             Ok(()) => {
@@ -1430,7 +1470,7 @@ impl CpuManager {
                                                         warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
                                                         vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                                     }
-                                                },
+                                                }},
                                                 Err(e) => {
                                                     error!("Unexpected TDX VMCALL: {e}");
                                                     vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);

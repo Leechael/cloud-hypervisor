@@ -875,6 +875,7 @@ fn vcpu_thread_rules(
         (libc::SYS_clock_gettime, vec![]),
         (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_close, vec![]),
+        (libc::SYS_fallocate, vec![]),
         (libc::SYS_dup, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_epoll_ctl, vec![]),
