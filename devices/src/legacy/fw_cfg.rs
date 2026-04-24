@@ -14,6 +14,7 @@
 use std::{
     cmp,
     ffi::CString,
+    fmt,
     fs::File,
     io::{ErrorKind, Read, Result, Seek, SeekFrom},
     mem::offset_of,
@@ -179,6 +180,23 @@ pub struct FwCfgItem {
     pub content: FwCfgContent,
 }
 
+/// Optional hook called before fw_cfg DMA read/write.
+/// Arguments: (guest_address, length)
+#[derive(Clone)]
+pub struct FwCfgDmaPreHook(pub Arc<dyn Fn(u64, u64) + Send + Sync>);
+
+impl FwCfgDmaPreHook {
+    pub fn new(f: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+}
+
+impl fmt::Debug for FwCfgDmaPreHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FwCfgDmaPreHook").finish_non_exhaustive()
+    }
+}
+
 /// https://www.qemu.org/docs/master/specs/fw_cfg.html
 #[derive(Debug)]
 pub struct FwCfg {
@@ -188,6 +206,7 @@ pub struct FwCfg {
     items: Vec<FwCfgItem>,                           // 0x20 and above
     known_items: [FwCfgContent; FW_CFG_KNOWN_ITEMS], // 0x0 to 0x19
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+    pub dma_pre_hook: Option<FwCfgDmaPreHook>,
 }
 
 #[repr(C)]
@@ -432,6 +451,7 @@ impl FwCfg {
             items: vec![],
             known_items,
             memory,
+            dma_pre_hook: None,
         }
     }
 
@@ -614,6 +634,9 @@ impl FwCfg {
         }
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
+        if let Some(hook) = &self.dma_pre_hook {
+            (hook.0)(addr, len as u64);
+        }
         let ret = if control.read() {
             self.dma_read(self.selector, len, addr)
         } else if control.write() {

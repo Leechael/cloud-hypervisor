@@ -25,7 +25,7 @@ pub use self::cmos::Cmos;
 #[cfg(target_arch = "x86_64")]
 pub use self::debug_port::DebugPort;
 #[cfg(feature = "fw_cfg")]
-pub use self::fw_cfg::FwCfg;
+pub use self::fw_cfg::{FwCfg, FwCfgDmaPreHook};
 #[cfg(target_arch = "x86_64")]
 pub use self::fwdebug::FwDebugDevice;
 #[cfg(target_arch = "aarch64")]
