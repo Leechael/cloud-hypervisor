@@ -875,16 +875,17 @@ impl PayloadConfig {
                 return Ok(());
             }
         }
+        #[cfg(feature = "fw_cfg")]
+        let fw_cfg_enabled = self.fw_cfg_config.is_some();
+        #[cfg(not(feature = "fw_cfg"))]
+        let fw_cfg_enabled = false;
+
         match (&self.firmware, &self.kernel) {
             (Some(_firmware), Some(_kernel)) => {
-                if self.fw_cfg_config.is_some() {
-                    Ok(())
-                } else {
-                    Err(PayloadConfigError::FirmwarePlusOtherPayloads)
-                }
+                Ok(())
             }
             (Some(_firmware), None) => {
-                if self.fw_cfg_config.is_none() {
+                if !fw_cfg_enabled {
                     if self.cmdline.is_some() {
                         warn!("Ignoring cmdline parameter as firmware is provided as the payload");
                         self.cmdline = None;
