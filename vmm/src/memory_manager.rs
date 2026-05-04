@@ -1482,6 +1482,13 @@ impl MemoryManager {
             )
         } else {
             // Init guest memory
+            #[cfg(feature = "tdx")]
+            let arch_mem_regions = if tdx_enabled {
+                arch::tdx_q35_arch_memory_regions()
+            } else {
+                arch::arch_memory_regions()
+            };
+            #[cfg(not(feature = "tdx"))]
             let arch_mem_regions = arch::arch_memory_regions();
 
             let ram_regions: Vec<(GuestAddress, usize)> = arch_mem_regions

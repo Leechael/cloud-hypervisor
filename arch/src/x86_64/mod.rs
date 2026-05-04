@@ -916,31 +916,61 @@ pub fn configure_vcpu(
 /// Returns a Vec of the valid memory addresses.
 ///
 /// These should be used to configure the GuestMemory structure for the platform.
-/// For x86_64 all addresses are valid from the start of the kernel except a
-/// carve out at the end of 32bit address space.
-pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
-    vec![
-        // 0 GiB ~ 3GiB: memory before the gap
+fn arch_memory_regions_with_lowmem_end(
+    lowmem_end: GuestAddress,
+) -> Vec<(GuestAddress, usize, RegionType)> {
+    assert!(lowmem_end <= layout::MEM_32BIT_RESERVED_START);
+
+    let mut regions = vec![
+        // 0 GiB ~ lowmem_end: memory before the 32-bit gap.
         (
             GuestAddress(0),
-            layout::MEM_32BIT_RESERVED_START.raw_value() as usize,
+            lowmem_end.raw_value() as usize,
             RegionType::Ram,
         ),
-        // 4 GiB ~ inf: memory after the gap
+        // 4 GiB ~ inf: memory after the gap.
         (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
-        // 3 GiB ~ 3712 MiB: 32-bit device memory hole
+    ];
+
+    if lowmem_end < layout::MEM_32BIT_RESERVED_START {
+        regions.push((
+            lowmem_end,
+            layout::MEM_32BIT_RESERVED_START.unchecked_offset_from(lowmem_end) as usize,
+            RegionType::Reserved,
+        ));
+    }
+
+    regions.extend_from_slice(&[
+        // 3 GiB ~ 3712 MiB: 32-bit device memory hole.
         (
             layout::MEM_32BIT_RESERVED_START,
             layout::MEM_32BIT_DEVICES_SIZE as usize,
             RegionType::SubRegion,
         ),
-        // 3712 MiB ~ 3968 MiB: 32-bit reserved memory hole
+        // 3712 MiB ~ 3968 MiB: 32-bit reserved memory hole.
         (
             layout::MEM_32BIT_RESERVED_START.unchecked_add(layout::MEM_32BIT_DEVICES_SIZE),
             (layout::MEM_32BIT_RESERVED_SIZE - layout::MEM_32BIT_DEVICES_SIZE) as usize,
             RegionType::Reserved,
         ),
-    ]
+    ]);
+
+    regions
+}
+
+/// For x86_64 all addresses are valid from the start of the kernel except a
+/// carve out at the end of 32bit address space.
+pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
+    arch_memory_regions_with_lowmem_end(layout::MEM_32BIT_RESERVED_START)
+}
+
+/// Q35-like x86_64 memory layout used by TDX/OVMF guests.
+///
+/// Matching QEMU q35's 2GiB low-memory split prevents OVMF from allocating
+/// shared DMA buffers from the same below-4GiB RAM range that is backed by
+/// private guest_memfd pages.
+pub fn tdx_q35_arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
+    arch_memory_regions_with_lowmem_end(layout::Q35_LOWMEM_END)
 }
 
 /// Configures the system and should be called once per vm before starting vcpu threads.
@@ -1500,6 +1530,42 @@ mod unit_tests {
         assert_eq!(4, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
         assert_eq!(GuestAddress(1 << 32), regions[1].0);
+    }
+
+    #[test]
+    fn tdx_q35_regions_keep_below_4g_dma_hole_out_of_ram() {
+        let regions = tdx_q35_arch_memory_regions();
+
+        assert_eq!(5, regions.len());
+        assert_eq!(
+            (
+                GuestAddress(0),
+                layout::Q35_LOWMEM_END.0 as usize,
+                RegionType::Ram
+            ),
+            regions[0]
+        );
+        assert_eq!(
+            (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
+            regions[1]
+        );
+        assert_eq!(
+            (
+                layout::Q35_LOWMEM_END,
+                layout::MEM_32BIT_RESERVED_START.unchecked_offset_from(layout::Q35_LOWMEM_END)
+                    as usize,
+                RegionType::Reserved,
+            ),
+            regions[2]
+        );
+        assert_eq!(
+            (
+                layout::MEM_32BIT_RESERVED_START,
+                layout::MEM_32BIT_DEVICES_SIZE as usize,
+                RegionType::SubRegion,
+            ),
+            regions[3]
+        );
     }
 
     #[test]
