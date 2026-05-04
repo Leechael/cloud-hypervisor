@@ -139,6 +139,8 @@ use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
     PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::GuestMemoryMmap;
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -176,6 +178,27 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+
+#[cfg(target_arch = "x86_64")]
+fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
+    let four_gib = arch::layout::RAM_64BIT_START.0;
+    let mut below_4g = 0u64;
+    let mut above_4g = 0u64;
+
+    for region in guest_memory.iter() {
+        let start = region.start_addr().0;
+        let end = start.saturating_add(region.len() as u64);
+
+        if start < four_gib {
+            below_4g += std::cmp::min(end, four_gib) - start;
+        }
+        if end > four_gib {
+            above_4g += end - std::cmp::max(start, four_gib);
+        }
+    }
+
+    (below_4g, above_4g)
+}
 
 /// Errors associated with device manager
 #[derive(Error, Debug)]
@@ -2081,17 +2104,8 @@ impl DeviceManager {
             .map_err(DeviceManagerError::BusError)?;
         {
             // Add a CMOS emulated device
-            let mem_size = self
-                .memory_manager
-                .lock()
-                .unwrap()
-                .guest_memory()
-                .memory()
-                .last_addr()
-                .0
-                + 1;
-            let mem_below_4g = cmp::min(layout::MEM_32BIT_RESERVED_START.0, mem_size);
-            let mem_above_4g = mem_size.saturating_sub(layout::RAM_64BIT_START.0);
+            let guest_memory = self.memory_manager.lock().unwrap().guest_memory().memory();
+            let (mem_below_4g, mem_above_4g) = cmos_memory_sizes(&guest_memory);
 
             let cmos = Arc::new(Mutex::new(legacy::Cmos::new(
                 mem_below_4g,
@@ -6198,6 +6212,36 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cmos_memory_sizes_with_default_gap() {
+        let guest_memory = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(0),
+            arch::layout::MEM_32BIT_RESERVED_START.0 as usize,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            (arch::layout::MEM_32BIT_RESERVED_START.0, 0),
+            cmos_memory_sizes(&guest_memory)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cmos_memory_sizes_with_q35_lowmem_gap() {
+        let guest_memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), arch::layout::Q35_LOWMEM_END.0 as usize),
+            (GuestAddress(0x1_0000_0000), 0x4000_0000),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            (arch::layout::Q35_LOWMEM_END.0, 0x4000_0000),
+            cmos_memory_sizes(&guest_memory)
+        );
+    }
 
     #[test]
     fn test_s5_sleep_state_uses_complete_package() {
