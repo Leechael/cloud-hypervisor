@@ -10,7 +10,6 @@
 //
 
 #[cfg(target_arch = "x86_64")]
-use std::cmp;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "sev_snp")]
 use std::fmt;
@@ -62,7 +61,7 @@ use devices::legacy::Serial;
 use devices::legacy::fw_cfg::FW_CFG_ACPI_ID;
 #[cfg(feature = "fw_cfg")]
 use devices::legacy::{
-    FwCfg,
+    FwCfg, FwCfgDmaPreHook,
     fw_cfg::{PORT_FW_CFG_BASE, PORT_FW_CFG_WIDTH},
 };
 #[cfg(feature = "pvmemcontrol")]
@@ -125,6 +124,8 @@ use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(target_arch = "x86_64")]
+use crate::GuestMemoryMmap;
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
@@ -139,8 +140,6 @@ use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
     PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
-#[cfg(target_arch = "x86_64")]
-use crate::GuestMemoryMmap;
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -179,6 +178,18 @@ const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
 
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, all(feature = "tdx", feature = "fw_cfg"))
+))]
+fn page_aligned_range(address: u64, size: u64) -> Option<(u64, u64)> {
+    const PAGE_SIZE: u64 = 4096;
+    let start = address & !(PAGE_SIZE - 1);
+    let end = address.checked_add(size)?.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+
+    (end > start).then_some((start, end - start))
+}
+
 #[cfg(target_arch = "x86_64")]
 fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
     let four_gib = arch::layout::RAM_64BIT_START.0;
@@ -187,13 +198,13 @@ fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
 
     for region in guest_memory.iter() {
         let start = region.start_addr().0;
-        let end = start.saturating_add(region.len() as u64);
+        let end = start.saturating_add(region.len());
 
         if start < four_gib {
-            below_4g += std::cmp::min(end, four_gib) - start;
+            below_4g += end.min(four_gib) - start;
         }
         if end > four_gib {
-            above_4g += end - std::cmp::max(start, four_gib);
+            above_4g += end - start.max(four_gib);
         }
     }
 
@@ -1631,13 +1642,14 @@ impl DeviceManager {
         #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
         {
             let cpu_manager = self.cpu_manager.clone();
-            fw_cfg.lock().unwrap().dma_pre_hook = Some(Arc::new(
-                move |addr: u64, len: u64| {
-                    if let Ok(cm) = cpu_manager.lock() {
-                        let _ = cm.convert_guest_memory_region(addr, len, false);
+            fw_cfg.lock().unwrap().dma_pre_hook =
+                Some(FwCfgDmaPreHook::new(move |addr: u64, len: u64| {
+                    if let Some((start, size)) = page_aligned_range(addr, len)
+                        && let Ok(cm) = cpu_manager.lock()
+                    {
+                        let _ = cm.convert_guest_memory_region(start, size, false);
                     }
-                },
-            ));
+                }));
         }
 
         self.fw_cfg = Some(fw_cfg.clone());
@@ -5759,10 +5771,7 @@ impl Aml for DeviceManager {
             } else {
                 format!("\\_SB_.PC{i:02X}.PCNT").as_str().into()
             };
-            pci_scan_methods.push(aml::MethodCall::new(
-                pci_name,
-                vec![],
-            ));
+            pci_scan_methods.push(aml::MethodCall::new(pci_name, vec![]));
         }
         let mut pci_scan_inner: Vec<&dyn Aml> = Vec::new();
         for method in &pci_scan_methods {
@@ -6212,6 +6221,15 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_page_aligned_range() {
+        assert_eq!(None, page_aligned_range(0x1000, 0));
+        assert_eq!(Some((0x1000, 0x1000)), page_aligned_range(0x1000, 1));
+        assert_eq!(Some((0x1000, 0x2000)), page_aligned_range(0x1800, 0x1000));
+        assert_eq!(None, page_aligned_range(u64::MAX - 0x800, 0x1000));
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
