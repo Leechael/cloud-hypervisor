@@ -176,6 +176,15 @@ const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
 
+#[cfg(all(target_arch = "x86_64", any(test, feature = "tdx")))]
+fn page_aligned_range(address: u64, size: u64) -> Option<(u64, u64)> {
+    const PAGE_SIZE: u64 = 4096;
+    let start = address & !(PAGE_SIZE - 1);
+    let end = address.checked_add(size)?.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+
+    (end > start).then_some((start, end - start))
+}
+
 #[cfg(target_arch = "x86_64")]
 fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
     let four_gib = arch::layout::RAM_64BIT_START.0;
@@ -1613,8 +1622,10 @@ impl DeviceManager {
             let cpu_manager = self.cpu_manager.clone();
             fw_cfg.lock().unwrap().dma_pre_hook = Some(Arc::new(
                 move |addr: u64, len: u64| {
-                    if let Ok(cm) = cpu_manager.lock() {
-                        let _ = cm.convert_guest_memory_region(addr, len, false);
+                    if let Some((start, size)) = page_aligned_range(addr, len) {
+                        if let Ok(cm) = cpu_manager.lock() {
+                            let _ = cm.convert_guest_memory_region(start, size, false);
+                        }
                     }
                 },
             ));
@@ -5921,6 +5932,15 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_page_aligned_range() {
+        assert_eq!(None, page_aligned_range(0x1000, 0));
+        assert_eq!(Some((0x1000, 0x1000)), page_aligned_range(0x1000, 1));
+        assert_eq!(Some((0x1000, 0x2000)), page_aligned_range(0x1800, 0x1000));
+        assert_eq!(None, page_aligned_range(u64::MAX - 0x800, 0x1000));
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
