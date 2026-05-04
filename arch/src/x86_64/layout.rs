@@ -80,6 +80,10 @@ pub const SMBIOS_START: u64 = 0xf0000; // First possible location per the spec.
 // ** High RAM (start: 1MiB, length: 3071MiB) **
 pub const HIGH_RAM_START: GuestAddress = GuestAddress(0x100000);
 
+// QEMU q35 moves the low-memory/PCI-hole split down to 2GiB for large
+// guests. TDX/OVMF depends on this shape for below-4GiB DMA allocations.
+pub const Q35_LOWMEM_END: GuestAddress = GuestAddress(0x8000_0000);
+
 // == No fixed addresses in the "High RAM" range ==
 
 // ** 32-bit reserved area (start: 3GiB, length: 896MiB) **
