@@ -2982,16 +2982,6 @@ impl Vm {
             // guest. This prevents the guest from ignoring/discarding memory
             // regions provided by the host.
             self.init_tdx_memory(&sections)?;
-            // Share all RAM regions to allow OVMF to use RAM for DMA buffers
-            let boot_guest_memory = self.memory_manager.lock().as_ref().unwrap().boot_guest_memory();
-            for region in boot_guest_memory.iter() {
-                let start = region.start_addr().0;
-                let size = region.len();
-                info!("Sharing memory region: {start:#x} - {size:#x}");
-                self.vm
-                    .share_memory_region(start, size)
-                    .map_err(Error::FinalizeTdx)?;
-            }
             // With TDX memory and CPU state configured TDX setup is complete
             self.vm.tdx_finalize().map_err(Error::FinalizeTdx)?;
         }
