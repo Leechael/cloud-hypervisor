@@ -2718,6 +2718,19 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             let exit_hypercall_cap_mask =
                 self.kvm.check_extension_int(crate::kvm::Cap::ExitHypercall);
             let enable_hypercall = {
+                #[cfg(feature = "tdx")]
+                {
+                    _config.tdx_enabled
+                }
+                #[cfg(all(not(feature = "tdx"), feature = "sev_snp"))]
+                {
+                    _config.sev_snp_enabled
+                }
+                #[cfg(all(not(feature = "tdx"), not(feature = "sev_snp")))]
+                {
+                    false
+                }
+            } || {
                 #[cfg(feature = "sev_snp")]
                 {
                     _config.sev_snp_enabled
@@ -3775,7 +3788,7 @@ impl cpu::Vcpu for KvmVcpu {
                         let ret_ptr = hypercall.ret as *mut u64;
                         (hypercall.nr, hypercall.args, ret_ptr)
                     };
-                    warn!(
+                    debug!(
                         "VcpuExit::Hypercall nr={} args=[{:#x}, {:#x}, {:#x}]",
                         nr, args[0], args[1], args[2]
                     );
@@ -3817,7 +3830,7 @@ impl cpu::Vcpu for KvmVcpu {
 
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::MemoryFault { flags, gpa, size } => {
-                    warn!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
+                    debug!("VcpuExit::MemoryFault: flags={flags:#x}, gpa={gpa:#x}, size={size:#x}");
 
                     const KVM_MEMORY_EXIT_FLAG_PRIVATE: u64 =
                         kvm_bindings::KVM_MEMORY_EXIT_FLAG_PRIVATE as u64;
@@ -3851,33 +3864,7 @@ impl cpu::Vcpu for KvmVcpu {
                         return Ok(cpu::VmExit::Ignore);
                     }
 
-                    if !private {
-                        self.punch_hole_guest_memfd(gpa, size)?;
-                    } else {
-                        self.allocate_guest_memfd(gpa, size)?;
-                    }
-
-                    const KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE: u64 = 4096;
-
-                    let mut offset = 0u64;
-                    while offset < size {
-                        let chunk_size =
-                            std::cmp::min(KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE, size - offset);
-                        self.vm_fd
-                            .set_memory_attributes(kvm_memory_attributes {
-                                address: gpa + offset,
-                                size: chunk_size,
-                                attributes: if private {
-                                    KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
-                                } else {
-                                    0u64
-                                },
-                                flags: 0,
-                            })
-                            .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
-                        offset += chunk_size;
-                    }
-
+                    self.convert_guest_memory_region(gpa, size, private)?;
                     Ok(cpu::VmExit::Ignore)
                 }
 
@@ -4695,6 +4682,9 @@ impl cpu::Vcpu for KvmVcpu {
 
         match tdx_vmcall.subfunction {
             TDG_VP_VMCALL_MAP_GPA => {
+                if !self.tdx_legacy_cpuid {
+                    return Err(cpu::HypervisorCpuError::UnknownTdxVmCall);
+                }
                 debug!(
                     "TDX VMCALL MAP_GPA: r12={:#x} r13={:#x} r14={:#x} r15={:#x} rbx={:#x} rdx={:#x}",
                     tdx_vmcall.in_r12,
@@ -5029,9 +5019,7 @@ impl KvmVcpu {
 
             if !private {
                 self.punch_hole_guest_memfd(address, size)?;
-            }
-            #[cfg(feature = "tdx")]
-            if private && self.tdx_legacy_cpuid {
+            } else {
                 self.discard_userspace_memory(address, size)?;
             }
             return Ok(());
@@ -5109,9 +5097,7 @@ impl KvmVcpu {
 
             if !private {
                 self.punch_hole_guest_memfd(range_start, range_end - range_start)?;
-            }
-            #[cfg(feature = "tdx")]
-            if private && self.tdx_legacy_cpuid {
+            } else {
                 self.discard_userspace_memory(range_start, range_end - range_start)?;
             }
 
