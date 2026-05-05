@@ -19,7 +19,6 @@ use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use std::os::unix::io::AsRawFd;
-#[cfg(feature = "tdx")]
 use std::os::unix::io::RawFd;
 use std::result;
 #[cfg(target_arch = "x86_64")]
@@ -29,7 +28,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::anyhow;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use kvm_bindings::kvm_create_guest_memfd;
-use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
+use kvm_ioctls::{DeviceFd, NoDatamatch, VcpuFd, VmFd};
 #[cfg(target_arch = "x86_64")]
 use log::warn;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
@@ -102,12 +101,13 @@ pub use kvm_bindings::kvm_vcpu_events as VcpuEvents;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::nested::KvmNestedStateBuffer;
 pub use kvm_bindings::{
-    self, KVM_GUESTDBG_ENABLE, KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP,
-    KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
-    KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
-    kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_pit_config, kvm_run,
-    kvm_userspace_memory_region, kvm_userspace_memory_region2,
+    self, KVM_DEV_VFIO_FILE, KVM_DEV_VFIO_FILE_ADD, KVM_DEV_VFIO_FILE_DEL, KVM_GUESTDBG_ENABLE,
+    KVM_GUESTDBG_SINGLESTEP, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD,
+    KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY, KVM_MSI_VALID_DEVID, kvm_clock_data,
+    kvm_create_device, kvm_create_device as CreateDevice, kvm_device_attr as DeviceAttr,
+    kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug, kvm_irq_routing, kvm_irq_routing_entry,
+    kvm_mp_state, kvm_pit_config, kvm_run, kvm_userspace_memory_region,
+    kvm_userspace_memory_region2,
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
@@ -1259,6 +1259,55 @@ impl KvmVm {
             .map_err(|e| vm::HypervisorVmError::CreateDevice(e.into()))?;
         Ok(VfioDeviceFd::new_from_kvm(device_fd))
     }
+
+    /// Create a `KVM_DEV_TYPE_VFIO` anchor device on this VM.
+    ///
+    /// This is the device that VFIO group/cdev fds get attached to via
+    /// `KVM_DEV_VFIO_FILE_ADD` so that KVM can track which VFIO ranges are
+    /// pinned by the IOMMU. CH normally relies on `vfio-ioctls` to wire this
+    /// up automatically (it calls `KVM_DEV_VFIO_FILE_ADD/DEL` internally on
+    /// `VfioContainer`/`VfioIommufd` when given a passthrough device handle),
+    /// but this helper exists for callers that want to drive the attachment
+    /// directly.
+    pub fn create_kvm_vfio_device(&self) -> vm::Result<DeviceFd> {
+        let mut vfio_dev = kvm_create_device {
+            type_: kvm_device_type_KVM_DEV_TYPE_VFIO,
+            fd: 0,
+            flags: 0,
+        };
+        self.fd
+            .create_device(&mut vfio_dev)
+            .map_err(|e| vm::HypervisorVmError::CreateDevice(e.into()))
+    }
+
+    /// Add a VFIO group / cdev fd to a `KVM_DEV_TYPE_VFIO` device using
+    /// `KVM_DEV_VFIO_FILE_ADD`.
+    pub fn kvm_vfio_add_fd(&self, dev: &DeviceFd, fd: RawFd) -> vm::Result<()> {
+        let fd_ptr = &fd as *const RawFd;
+        let attr = DeviceAttr {
+            flags: 0,
+            group: KVM_DEV_VFIO_FILE,
+            attr: u64::from(KVM_DEV_VFIO_FILE_ADD),
+            addr: fd_ptr as u64,
+        };
+        dev.set_device_attr(&attr)
+            .map_err(|e| vm::HypervisorVmError::SetVfioDeviceFd(e.into()))
+    }
+
+    /// Remove a VFIO group / cdev fd from a `KVM_DEV_TYPE_VFIO` device using
+    /// `KVM_DEV_VFIO_FILE_DEL`.
+    pub fn kvm_vfio_del_fd(&self, dev: &DeviceFd, fd: RawFd) -> vm::Result<()> {
+        let fd_ptr = &fd as *const RawFd;
+        let attr = DeviceAttr {
+            flags: 0,
+            group: KVM_DEV_VFIO_FILE,
+            attr: u64::from(KVM_DEV_VFIO_FILE_DEL),
+            addr: fd_ptr as u64,
+        };
+        dev.set_device_attr(&attr)
+            .map_err(|e| vm::HypervisorVmError::SetVfioDeviceFd(e.into()))
+    }
+
     /// Checks if a particular `Cap` is available.
     pub fn check_extension(&self, c: Cap) -> bool {
         self.fd.check_extension(c)

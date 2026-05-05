@@ -4104,6 +4104,15 @@ impl DeviceManager {
     ) -> DeviceManagerResult<(PciBdf, String)> {
         // If the passthrough device has not been created yet, it is created
         // here and stored in the DeviceManager structure for future needs.
+        //
+        // The handle returned by `create_passthrough_device` is the
+        // `KVM_DEV_TYPE_VFIO` (or `MSHV_DEV_TYPE_VFIO`) anchor device. It is
+        // forwarded into `VfioContainer::new` / `VfioIommufd::new` below so
+        // that vfio-ioctls can automatically issue `KVM_DEV_VFIO_FILE_ADD`
+        // (group fd in legacy mode, cdev fd in iommufd mode) and the matching
+        // `KVM_DEV_VFIO_FILE_DEL` on teardown. This is what lets KVM track
+        // IOMMU pinning for VFIO ranges (correctness on stock hosts, and
+        // required for TDX private-memory bookkeeping).
         if self.passthrough_device.is_none() {
             self.passthrough_device = Some(
                 self.address_manager

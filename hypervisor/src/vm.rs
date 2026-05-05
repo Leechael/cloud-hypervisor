@@ -116,6 +116,12 @@ pub enum HypervisorVmError {
     #[error("Failed to set GSI routing")]
     CreateDevice(#[source] anyhow::Error),
     ///
+    /// Failed to set / clear a VFIO file fd on a KVM_DEV_TYPE_VFIO device
+    /// (KVM_DEV_VFIO_FILE_ADD / KVM_DEV_VFIO_FILE_DEL).
+    ///
+    #[error("Failed to attach/detach VFIO file fd to KVM VFIO device")]
+    SetVfioDeviceFd(#[source] anyhow::Error),
+    ///
     /// Get preferred target error
     ///
     #[error("Failed to get preferred target")]
