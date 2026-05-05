@@ -10,6 +10,8 @@
 //
 //
 
+use std::any::Any;
+
 use thiserror::Error;
 #[cfg(not(target_arch = "riscv64"))]
 use {anyhow::anyhow, vm_memory::GuestAddress};
@@ -360,6 +362,10 @@ pub type Result<T> = anyhow::Result<T, HypervisorCpuError>;
 ///
 pub trait Vcpu: Send + Sync {
     ///
+    /// Downcast to the underlying hypervisor-specific vCPU type.
+    ///
+    fn as_any(&self) -> &dyn Any;
+    ///
     /// Returns StandardRegisters with default value set
     ///
     fn create_standard_regs(&self) -> StandardRegisters {
@@ -566,7 +572,7 @@ pub trait Vcpu: Send + Sync {
     ///
     /// Handle a TDX MAP_GPA request using the hypervisor-specific memory conversion path.
     ///
-    fn handle_tdx_map_gpa(&mut self, _shared_gpa_mask: u64) -> Result<()> {
+    fn handle_tdx_map_gpa(&mut self, _shared_gpa_mask: u64) -> Result<TdxExitStatus> {
         unimplemented!()
     }
     #[cfg(feature = "tdx")]

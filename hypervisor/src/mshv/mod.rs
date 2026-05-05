@@ -468,6 +468,13 @@ pub struct MshvVcpu {
 /// ```
 impl cpu::Vcpu for MshvVcpu {
     ///
+    /// Downcast to the underlying MshvVcpu type
+    ///
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    ///
     /// Returns StandardRegisters with default value set
     ///
     fn create_standard_regs(&self) -> crate::StandardRegisters {

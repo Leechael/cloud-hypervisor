@@ -126,6 +126,11 @@ pub enum HypervisorVmError {
     #[error("Failed to enable split Irq")]
     EnableSplitIrq(#[source] anyhow::Error),
     ///
+    /// Create in-kernel PIT error
+    ///
+    #[error("Failed to create in-kernel PIT")]
+    CreatePit(#[source] anyhow::Error),
+    ///
     /// Enable x2apic API error
     ///
     #[error("Failed to enable x2apic API")]
@@ -384,6 +389,11 @@ pub trait Vm: Send + Sync + Any {
     /// Enable split Irq capability
     #[cfg(target_arch = "x86_64")]
     fn enable_split_irq(&self) -> Result<()>;
+    /// Create in-kernel PIT
+    #[cfg(target_arch = "x86_64")]
+    fn create_pit2(&self) -> Result<()> {
+        Ok(())
+    }
     /// Retrieve guest clock.
     #[cfg(target_arch = "x86_64")]
     fn get_clock(&self) -> Result<ClockData>;

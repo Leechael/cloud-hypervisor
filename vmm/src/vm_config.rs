@@ -881,9 +881,7 @@ impl PayloadConfig {
         let fw_cfg_enabled = false;
 
         match (&self.firmware, &self.kernel) {
-            (Some(_firmware), Some(_kernel)) => {
-                Ok(())
-            }
+            (Some(_firmware), Some(_kernel)) => Ok(()),
             (Some(_firmware), None) => {
                 if !fw_cfg_enabled {
                     if self.cmdline.is_some() {
@@ -891,7 +889,9 @@ impl PayloadConfig {
                         self.cmdline = None;
                     }
                     if self.initramfs.is_some() {
-                        warn!("Ignoring initramfs parameter as firmware is provided as the payload");
+                        warn!(
+                            "Ignoring initramfs parameter as firmware is provided as the payload"
+                        );
                         self.initramfs = None;
                     }
                 }

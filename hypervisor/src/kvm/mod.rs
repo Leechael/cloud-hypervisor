@@ -22,20 +22,18 @@ use std::os::unix::io::AsRawFd;
 #[cfg(feature = "tdx")]
 use std::os::unix::io::RawFd;
 use std::result;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-use std::sync::Mutex;
 #[cfg(target_arch = "x86_64")]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::anyhow;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
-#[cfg(any(feature = "sev_snp", feature = "tdx"))]
-use log::debug;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+use log::{debug, info};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -108,9 +106,11 @@ pub use kvm_bindings::{
     KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
     KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
     kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
-    kvm_userspace_memory_region2,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_pit_config, kvm_run,
+    kvm_userspace_memory_region, kvm_userspace_memory_region2,
 };
+#[cfg(feature = "tdx")]
+use kvm_bindings::{KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_X86_TDX_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
     KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
@@ -120,8 +120,6 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
-#[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_X86_TDX_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
@@ -132,6 +130,58 @@ use vmm_sys_util::{fam::FamStruct, ioctl_io_nr};
 #[cfg(feature = "tdx")]
 use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+const KVM_CAP_VM_TYPES_RAW: libc::c_ulong = 235;
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+const KVM_X86_TDX_VM_LEGACY: u64 = 2;
+#[cfg(feature = "tdx")]
+const TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE: u64 = 1 << 28;
+#[cfg(feature = "tdx")]
+const KVM_CAP_MAX_VCPUS_RAW: u32 = 66;
+#[cfg(feature = "tdx")]
+const KVM_CAP_EXCEPTION_PAYLOAD_RAW: u32 = 164;
+#[cfg(feature = "tdx")]
+const KVM_CAP_X86_USER_SPACE_MSR_RAW: u32 = 188;
+#[cfg(feature = "tdx")]
+const KVM_CAP_X86_TRIPLE_FAULT_EVENT_RAW: u32 = 218;
+#[cfg(feature = "tdx")]
+const KVM_CAP_X86_NOTIFY_VMEXIT_RAW: u32 = 219;
+#[cfg(feature = "tdx")]
+const KVM_CAP_MAX_VCPU_ID_RAW: u32 = 128;
+#[cfg(feature = "tdx")]
+const KVM_MEMORY_MAPPING_RAW: libc::c_ulong = 0xc020_aed5;
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+static TDX_IO_EXIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn tdx_should_log_io(index: usize, port: u16) -> bool {
+    if index < 512 {
+        return true;
+    }
+    if (0xcf8..=0xcff).contains(&port) {
+        return true;
+    }
+
+    matches!(
+        port,
+        0x20 | 0x21
+            | 0x40..=0x43
+            | 0x60
+            | 0x61
+            | 0x64
+            | 0x70
+            | 0x71
+            | 0x80
+            | 0x92
+            | 0xa0
+            | 0xa1
+            | 0xb2
+            | 0xb3
+            | 0x510..=0x51b
+            | 0x600..=0x60b
+    ) && (index < 8192 || index % 4096 == 0)
+}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
 #[cfg(target_arch = "aarch64")]
@@ -141,6 +191,8 @@ use crate::kvm::x86_64::XsaveStateError;
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
+#[cfg(feature = "tdx")]
+ioctl_io_nr!(KVM_SET_TSC_KHZ_VM, kvm_bindings::KVMIO, 0xa2);
 
 #[cfg(feature = "sev_snp")]
 use igvm_defs::PAGE_SIZE_4K;
@@ -203,6 +255,8 @@ fn make_segment(sev_selector: igvm::snp_defs::SevSelector) -> Segment {
 #[cfg(feature = "tdx")]
 const KVM_EXIT_TDX: u32 = 50;
 #[cfg(feature = "tdx")]
+const KVM_EXIT_TDX_LEGACY: u32 = 40;
+#[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_MAP_GPA: u64 = 0x10001;
 #[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_GET_QUOTE: u64 = 0x10002;
@@ -211,7 +265,13 @@ const TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT: u64 = 0x10004;
 #[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_SUCCESS: u64 = 0;
 #[cfg(feature = "tdx")]
+const TDG_VP_VMCALL_RETRY: u64 = 1;
+#[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
+#[cfg(feature = "tdx")]
+const TDG_VP_VMCALL_ALIGN_ERROR: u64 = 0x8000000000000002;
+#[cfg(feature = "tdx")]
+const TDX_MAP_GPA_MAX_LEN: u64 = 64 * 1024 * 1024;
 
 #[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, std::os::raw::c_ulong);
@@ -230,14 +290,16 @@ enum TdxCommand {
 #[cfg(feature = "tdx")]
 pub enum TdxExitDetails {
     MapGpa,
-    GetQuote,
-    SetupEventNotifyInterrupt,
+    GetQuote { gpa: u64, size: u64 },
+    SetupEventNotifyInterrupt { vector: u64 },
 }
 
 #[cfg(feature = "tdx")]
 pub enum TdxExitStatus {
     Success,
     InvalidOperand,
+    AlignError,
+    Retry(u64),
 }
 
 #[cfg(feature = "tdx")]
@@ -252,6 +314,274 @@ fn tdx_init_cpuid_entry(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
         0x1f => true,
         _ => false,
     }
+}
+
+#[cfg(feature = "tdx")]
+fn tdx_legacy_cpuid_entries() -> Vec<kvm_bindings::kvm_cpuid_entry2> {
+    [
+        (
+            0x0000_0000,
+            0,
+            0,
+            0x0000_001f,
+            0x756e_6547,
+            0x6c65_746e,
+            0x4965_6e69,
+        ),
+        (
+            0x0000_0001,
+            0,
+            0,
+            0x000c_06f2,
+            0x0000_0800,
+            0xf7fa_3217,
+            0x2fab_fbff,
+        ),
+        (
+            0x0000_0002,
+            0,
+            0x0000_0006,
+            0x0000_0001,
+            0x0000_0000,
+            0x0000_004d,
+            0x002c_307d,
+        ),
+        (
+            0x0000_0004,
+            0,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0000_0121,
+            0x01c0_003f,
+            0x0000_003f,
+            0x0000_0001,
+        ),
+        (
+            0x0000_0004,
+            1,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0000_0122,
+            0x01c0_003f,
+            0x0000_003f,
+            0x0000_0001,
+        ),
+        (
+            0x0000_0004,
+            2,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0000_0143,
+            0x03c0_003f,
+            0x0000_0fff,
+            0x0000_0001,
+        ),
+        (
+            0x0000_0004,
+            3,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0000_0163,
+            0x03c0_003f,
+            0x0000_3fff,
+            0x0000_0006,
+        ),
+        (0x0000_0004, 4, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_0005, 0, 0, 0, 0, 3, 0),
+        (0x0000_0006, 0, 0, 4, 0, 0, 0),
+        (
+            0x0000_0007,
+            0,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            1,
+            0xf1bf_0fb9,
+            0x1b41_5f4e,
+            0xffc9_4410,
+        ),
+        (
+            0x0000_0007,
+            1,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x1c30,
+            0,
+            0,
+            0,
+        ),
+        (
+            0x0000_000b,
+            0,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0,
+            1,
+            0x100,
+            0,
+        ),
+        (
+            0x0000_000b,
+            1,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0,
+            1,
+            0x201,
+            0,
+        ),
+        (0x0000_000b, 2, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 2, 0),
+        (
+            0x0000_000d,
+            0,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0006_02e7,
+            0x2b00,
+            0x2b00,
+            0,
+        ),
+        (
+            0x0000_000d,
+            1,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x1f,
+            0x2cf0,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            2,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x100,
+            0x240,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            5,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x40,
+            0x440,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            6,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x200,
+            0x480,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            7,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x400,
+            0x680,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            9,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            8,
+            0xa80,
+            0,
+            0,
+        ),
+        (
+            0x0000_000d,
+            15,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x328,
+            0,
+            1,
+            0,
+        ),
+        (
+            0x0000_000d,
+            17,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x40,
+            0xac0,
+            2,
+            0,
+        ),
+        (
+            0x0000_000d,
+            18,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x2000,
+            0xb00,
+            6,
+            0,
+        ),
+        (0x0000_000d, 63, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_0012, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_0012, 1, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_0012, 2, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_0014, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
+        (0x0000_001d, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 1, 0, 0, 0),
+        (
+            0x0000_001d,
+            1,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0x0400_2000,
+            0x0008_0040,
+            0x10,
+            0,
+        ),
+        (
+            0x0000_001e,
+            0,
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            0,
+            0x4010,
+            0,
+            0,
+        ),
+        (
+            0x8000_0000,
+            0,
+            0,
+            0x8000_0008,
+            0x756e_6547,
+            0x6c65_746e,
+            0x4965_6e69,
+        ),
+        (0x8000_0001, 0, 0, 0x000c_06f2, 0, 0x121, 0x2c10_0800),
+        (
+            0x8000_0002,
+            0,
+            0,
+            0x4554_4e49,
+            0x2952_284c,
+            0x4f45_5820,
+            0x2952_284e,
+        ),
+        (0x8000_0003, 0, 0, 0x4c4f_4720, 0x3536_2044, 0x0059_3632, 0),
+        (
+            0x8000_0005,
+            0,
+            0,
+            0x01ff_01ff,
+            0x01ff_01ff,
+            0x4002_0140,
+            0x4002_0140,
+        ),
+        (0x8000_0006, 0, 0, 0, 0x4200_4200, 0x0200_8140, 0x0080_8140),
+        (0x8000_0008, 0, 0, 0x0034_3934, 0x200, 0, 0),
+    ]
+    .into_iter()
+    .map(
+        |(function, index, flags, eax, ebx, ecx, edx)| kvm_bindings::kvm_cpuid_entry2 {
+            function,
+            index,
+            flags,
+            eax,
+            ebx,
+            ecx,
+            edx,
+            ..Default::default()
+        },
+    )
+    .collect()
 }
 
 #[cfg(feature = "tdx")]
@@ -289,6 +619,7 @@ impl Default for TdxCapabilities {
 }
 
 #[cfg(feature = "tdx")]
+#[repr(C)]
 #[derive(Copy, Clone)]
 pub struct KvmTdxExit {
     pub type_: u32,
@@ -307,9 +638,9 @@ pub union KvmTdxExitU {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq)]
 pub struct KvmTdxExitVmcall {
+    pub reg_mask: u64,
     pub type_: u64,
     pub subfunction: u64,
-    pub reg_mask: u64,
     pub in_r12: u64,
     pub in_r13: u64,
     pub in_r14: u64,
@@ -586,6 +917,8 @@ struct KvmGuestMemSlot {
     slot: u32,
     guest_phys_addr: u64,
     memory_size: u64,
+    userspace_addr: u64,
+    flags: u32,
     guest_memfd_offset: u64,
     guest_memfd: u32,
 }
@@ -593,6 +926,8 @@ struct KvmGuestMemSlot {
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
     fd: Arc<VmFd>,
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    kvm_fd: RawFd,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
@@ -601,6 +936,8 @@ pub struct KvmVm {
     guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
+    #[cfg(feature = "tdx")]
+    tdx_legacy_vm_type: bool,
 }
 
 impl KvmVm {
@@ -865,12 +1202,20 @@ impl vm::Vm for KvmVm {
             hyperv_synic: AtomicBool::new(false),
             #[cfg(target_arch = "x86_64")]
             xsave_size,
+            #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+            kvm_fd: self.kvm_fd,
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             vm_fd: self.fd.clone(),
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             guest_memfds: self.guest_memfds.clone(),
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             guest_mem_slots: self.guest_mem_slots.clone(),
+            #[cfg(feature = "tdx")]
+            tdx_legacy_cpuid: self.tdx_legacy_vm_type,
+            #[cfg(feature = "tdx")]
+            tdx_fw_cfg_dma_hi: 0,
+            #[cfg(feature = "tdx")]
+            tdx_pending_shared_2m_ranges: Mutex::new(HashMap::new()),
         };
         Ok(Box::new(vcpu))
     }
@@ -1115,6 +1460,8 @@ impl vm::Vm for KvmVm {
                         slot: region.slot,
                         guest_phys_addr: region.guest_phys_addr,
                         memory_size: region.memory_size,
+                        userspace_addr: region.userspace_addr,
+                        flags: region.flags,
                         guest_memfd_offset: region.guest_memfd_offset,
                         guest_memfd: region.guest_memfd,
                     },
@@ -1217,6 +1564,13 @@ impl vm::Vm for KvmVm {
             .enable_cap(&cap)
             .map_err(|e| vm::HypervisorVmError::EnableSplitIrq(e.into()))?;
         Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn create_pit2(&self) -> vm::Result<()> {
+        self.fd
+            .create_pit2(kvm_pit_config::default())
+            .map_err(|e| vm::HypervisorVmError::CreatePit(e.into()))
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1337,7 +1691,539 @@ impl vm::Vm for KvmVm {
     /// Initialize TDX for this VM
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_init(&self, cpuid: &[CpuIdEntry], _max_vcpus: u32) -> vm::Result<()> {
+    fn tdx_init(&self, cpuid: &[CpuIdEntry], max_vcpus: u32) -> vm::Result<()> {
+        if self.tdx_legacy_vm_type {
+            for (cap, arg0) in [
+                (KVM_CAP_EXCEPTION_PAYLOAD_RAW, 1),
+                (KVM_CAP_X86_TRIPLE_FAULT_EVENT_RAW, 1),
+                (KVM_CAP_X86_NOTIFY_VMEXIT_RAW, 3),
+                (KVM_CAP_X86_USER_SPACE_MSR_RAW, 4),
+            ] {
+                self.fd
+                    .enable_cap(&kvm_enable_cap {
+                        cap,
+                        args: [arg0, 0, 0, 0],
+                        ..Default::default()
+                    })
+                    .map_err(|e| vm::HypervisorVmError::InitializeTdx(e.into()))?;
+            }
+
+            for cap in [KVM_CAP_MAX_VCPU_ID_RAW, KVM_CAP_MAX_VCPUS_RAW] {
+                self.fd
+                    .enable_cap(&kvm_enable_cap {
+                        cap,
+                        args: [max_vcpus.into(), 0, 0, 0],
+                        ..Default::default()
+                    })
+                    .map_err(|e| vm::HypervisorVmError::InitializeTdx(e.into()))?;
+            }
+        }
+
+        // QEMU's TDX path programs the VM TSC frequency before KVM_TDX_INIT_VM.
+        // Passing 0 asks KVM to use the host TSC frequency.
+        let ret = unsafe { ioctl_with_val(&self.fd.as_raw_fd(), KVM_SET_TSC_KHZ_VM(), 0) };
+        if ret < 0 {
+            return Err(vm::HypervisorVmError::InitializeTdx(
+                std::io::Error::last_os_error().into(),
+            ));
+        }
+
+        if self.tdx_legacy_vm_type {
+            #[repr(C)]
+            #[derive(Copy, Clone, Default)]
+            struct TdxCpuidConfigLegacy {
+                leaf: u32,
+                sub_leaf: u32,
+                eax: u32,
+                ebx: u32,
+                ecx: u32,
+                edx: u32,
+            }
+
+            #[repr(C)]
+            struct TdxCapabilitiesLegacy {
+                attrs_fixed0: u64,
+                attrs_fixed1: u64,
+                xfam_fixed0: u64,
+                xfam_fixed1: u64,
+                supported_gpaw: u32,
+                padding: u32,
+                reserved: [u64; 251],
+                nr_cpuid_configs: u32,
+                cpuid_configs: [TdxCpuidConfigLegacy; TDX_MAX_NR_CPUID_CONFIGS],
+            }
+
+            impl Default for TdxCapabilitiesLegacy {
+                fn default() -> Self {
+                    Self {
+                        attrs_fixed0: 0,
+                        attrs_fixed1: 0,
+                        xfam_fixed0: 0,
+                        xfam_fixed1: 0,
+                        supported_gpaw: 0,
+                        padding: 0,
+                        reserved: [0; 251],
+                        nr_cpuid_configs: TDX_MAX_NR_CPUID_CONFIGS as u32,
+                        cpuid_configs: [TdxCpuidConfigLegacy::default(); TDX_MAX_NR_CPUID_CONFIGS],
+                    }
+                }
+            }
+
+            let mut caps = TdxCapabilitiesLegacy::default();
+            tdx_command(
+                &self.fd.as_raw_fd(),
+                TdxCommand::Capabilities,
+                0,
+                &mut caps as *mut _ as *const _,
+            )
+            .map_err(vm::HypervisorVmError::InitializeTdx)?;
+
+            let host_addr_bits = unsafe { std::arch::x86_64::__cpuid(0x8000_0008).eax };
+            let host_phys_bits = host_addr_bits & 0xff;
+            let legacy_addr_bits =
+                (host_addr_bits & 0x0000_ff00) | host_phys_bits | (host_phys_bits << 16);
+
+            let legacy_cpuid_entries = [
+                (
+                    0x4000_0000,
+                    0,
+                    0,
+                    0x4000_0001,
+                    0x4b4d_564b,
+                    0x564b_4d56,
+                    0x0000_004d,
+                ),
+                (
+                    0x4000_0001,
+                    0,
+                    0,
+                    0x0000_ba82,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0000,
+                    0,
+                    0,
+                    0x0000_001f,
+                    0x756e_6547,
+                    0x6c65_746e,
+                    0x4965_6e69,
+                ),
+                (
+                    0x0000_0001,
+                    0,
+                    0,
+                    0x000c_06f2,
+                    0x0000_0800,
+                    0xf7fa_3217,
+                    0x2fab_fbff,
+                ),
+                (
+                    0x0000_0002,
+                    0,
+                    0x0000_0006,
+                    0x0000_0001,
+                    0x0000_0000,
+                    0x0000_004d,
+                    0x002c_307d,
+                ),
+                (
+                    0x0000_0004,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0121,
+                    0x01c0_003f,
+                    0x0000_003f,
+                    0x0000_0001,
+                ),
+                (
+                    0x0000_0004,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0122,
+                    0x01c0_003f,
+                    0x0000_003f,
+                    0x0000_0001,
+                ),
+                (
+                    0x0000_0004,
+                    2,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0143,
+                    0x03c0_003f,
+                    0x0000_0fff,
+                    0x0000_0001,
+                ),
+                (
+                    0x0000_0004,
+                    3,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0163,
+                    0x03c0_003f,
+                    0x0000_3fff,
+                    0x0000_0006,
+                ),
+                (
+                    0x0000_0004,
+                    4,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0005,
+                    0,
+                    0,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0003,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0006,
+                    0,
+                    0,
+                    0x0000_0004,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0007,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0001,
+                    0xf1bf_0fb9,
+                    0x1b41_5f4e,
+                    0xffc9_4410,
+                ),
+                (
+                    0x0000_0007,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_1c30,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000b,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0001,
+                    0x0000_0100,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000b,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0001,
+                    0x0000_0201,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000b,
+                    2,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0002,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0006_02e7,
+                    0x0000_2b00,
+                    0x0000_2b00,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_001f,
+                    0x0000_2cf0,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    2,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0100,
+                    0x0000_0240,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    5,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0040,
+                    0x0000_0440,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    6,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0200,
+                    0x0000_0480,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    7,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0400,
+                    0x0000_0680,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    9,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0008,
+                    0x0000_0a80,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    15,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0328,
+                    0x0000_0000,
+                    0x0000_0001,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    17,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0040,
+                    0x0000_0ac0,
+                    0x0000_0002,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    18,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_2000,
+                    0x0000_0b00,
+                    0x0000_0006,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_000d,
+                    63,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0012,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0012,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0012,
+                    2,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_0014,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_001d,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0001,
+                    0x0000_0000,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_001d,
+                    1,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0400_2000,
+                    0x0008_0040,
+                    0x0000_0010,
+                    0x0000_0000,
+                ),
+                (
+                    0x0000_001e,
+                    0,
+                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+                    0x0000_0000,
+                    0x0000_4010,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+                (
+                    0x8000_0000,
+                    0,
+                    0,
+                    0x8000_0008,
+                    0x756e_6547,
+                    0x6c65_746e,
+                    0x4965_6e69,
+                ),
+                (
+                    0x8000_0001,
+                    0,
+                    0,
+                    0x000c_06f2,
+                    0x0000_0000,
+                    0x0000_0121,
+                    0x2c10_0800,
+                ),
+                (
+                    0x8000_0002,
+                    0,
+                    0,
+                    0x4554_4e49,
+                    0x2952_284c,
+                    0x4f45_5820,
+                    0x2952_284e,
+                ),
+                (
+                    0x8000_0003,
+                    0,
+                    0,
+                    0x4c4f_4720,
+                    0x3536_2044,
+                    0x0059_3632,
+                    0x0000_0000,
+                ),
+                (
+                    0x8000_0005,
+                    0,
+                    0,
+                    0x01ff_01ff,
+                    0x01ff_01ff,
+                    0x4002_0140,
+                    0x4002_0140,
+                ),
+                (
+                    0x8000_0006,
+                    0,
+                    0,
+                    0x0000_0000,
+                    0x4200_4200,
+                    0x0200_8140,
+                    0x0080_8140,
+                ),
+                (
+                    0x8000_0008,
+                    0,
+                    0,
+                    legacy_addr_bits,
+                    0x0000_0200,
+                    0x0000_0000,
+                    0x0000_0000,
+                ),
+            ];
+            let cpuid_nent = legacy_cpuid_entries.len();
+            let mut tdx_cpuid = Vec::with_capacity(cpuid_nent);
+
+            for (function, index, flags, eax, ebx, ecx, edx) in legacy_cpuid_entries {
+                let entry = kvm_bindings::kvm_cpuid_entry2 {
+                    function,
+                    index,
+                    flags,
+                    eax,
+                    ebx,
+                    ecx,
+                    edx,
+                    ..Default::default()
+                };
+
+                tdx_cpuid.push(entry);
+            }
+
+            tdx_cpuid.resize(
+                TDX_MAX_NR_CPUID_CONFIGS,
+                kvm_bindings::kvm_cpuid_entry2::default(),
+            );
+
+            #[repr(C)]
+            struct TdxInitVmLegacy {
+                attributes: u64,
+                mrconfigid: [u64; 6],
+                mrowner: [u64; 6],
+                mrownerconfig: [u64; 6],
+                reserved: [u64; 1004],
+                cpuid_nent: u32,
+                cpuid_padding: u32,
+                cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
+            }
+
+            let attributes =
+                (TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE & caps.attrs_fixed0) | caps.attrs_fixed1;
+            info!(
+                "TDX legacy init: attrs_fixed0={:#x} attrs_fixed1={:#x} attributes={:#x} cpuid_nent={}",
+                caps.attrs_fixed0, caps.attrs_fixed1, attributes, cpuid_nent
+            );
+
+            let data = TdxInitVmLegacy {
+                attributes,
+                mrconfigid: [0; 6],
+                mrowner: [0; 6],
+                mrownerconfig: [0; 6],
+                reserved: [0; 1004],
+                cpuid_nent: cpuid_nent as u32,
+                cpuid_padding: 0,
+                cpuid_entries: tdx_cpuid.as_slice().try_into().unwrap(),
+            };
+
+            return tdx_command(
+                &self.fd.as_raw_fd(),
+                TdxCommand::InitVm,
+                0,
+                &data as *const _ as *const _,
+            )
+            .map_err(vm::HypervisorVmError::InitializeTdx);
+        }
 
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
@@ -1359,18 +2245,19 @@ impl vm::Vm for KvmVm {
         let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
             .into_iter()
             .filter(tdx_init_cpuid_entry)
+            .filter_map(|mut entry| {
+                caps.cpuid_configs[..caps.cpuid_nent as usize]
+                    .iter()
+                    .find(|mask| mask.function == entry.function && mask.index == entry.index)
+                    .map(|mask| {
+                        entry.eax &= mask.eax;
+                        entry.ebx &= mask.ebx;
+                        entry.ecx &= mask.ecx;
+                        entry.edx &= mask.edx;
+                        entry
+                    })
+            })
             .collect();
-        for entry in &mut tdx_cpuid {
-            if let Some(mask) = caps.cpuid_configs[..caps.cpuid_nent as usize]
-                .iter()
-                .find(|mask| mask.function == entry.function && mask.index == entry.index)
-            {
-                entry.eax &= mask.eax;
-                entry.ebx &= mask.ebx;
-                entry.ecx &= mask.ecx;
-                entry.edx &= mask.edx;
-            }
-        }
         let cpuid_nent = tdx_cpuid.len();
         tdx_cpuid.resize(
             TDX_MAX_NR_CPUID_CONFIGS,
@@ -1389,8 +2276,14 @@ impl vm::Vm for KvmVm {
             cpuid_padding: u32,
             cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
+        let attributes = TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
+        info!(
+            "TDX init: attributes={:#x} xfam={:#x} cpuid_nent={}",
+            attributes, xfam, cpuid_nent
+        );
+
         let data = TdxInitVm {
-            attributes: 0,
+            attributes,
             xfam,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
@@ -1408,7 +2301,6 @@ impl vm::Vm for KvmVm {
             &data as *const _ as *const _,
         )
         .map_err(vm::HypervisorVmError::InitializeTdx)
-
     }
 
     ///
@@ -1438,6 +2330,34 @@ impl vm::Vm for KvmVm {
         size: usize,
         measure: bool,
     ) -> vm::Result<()> {
+        if self.tdx_legacy_vm_type {
+            #[repr(C)]
+            struct KvmMemoryMapping {
+                base_gfn: u64,
+                nr_pages: u64,
+                flags: u64,
+                source: u64,
+            }
+            let data = KvmMemoryMapping {
+                base_gfn: guest_address >> 12,
+                nr_pages: (size / 4096).try_into().unwrap(),
+                flags: 0,
+                source: 0,
+            };
+
+            if !measure {
+                return Ok(());
+            }
+
+            return tdx_command(
+                &self.fd.as_raw_fd(),
+                TdxCommand::InitMemRegion,
+                0,
+                &data as *const _ as *const _,
+            )
+            .map_err(vm::HypervisorVmError::InitMemRegionTdx);
+        }
+
         #[repr(C)]
         struct TdxInitMemRegion {
             host_address: u64,
@@ -1460,12 +2380,7 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-    fn set_memory_attributes(
-        &self,
-        address: u64,
-        size: u64,
-        attributes: u64,
-    ) -> vm::Result<()> {
+    fn set_memory_attributes(&self, address: u64, size: u64, attributes: u64) -> vm::Result<()> {
         self.fd
             .set_memory_attributes(kvm_bindings::kvm_memory_attributes {
                 address,
@@ -1494,12 +2409,8 @@ impl vm::Vm for KvmVm {
             ))
         })?;
 
-        let slots: Vec<KvmGuestMemSlot> = guest_mem_slots
-            .read()
-            .unwrap()
-            .values()
-            .copied()
-            .collect();
+        let slots: Vec<KvmGuestMemSlot> =
+            guest_mem_slots.read().unwrap().values().copied().collect();
         let memfds = guest_memfds.read().unwrap();
 
         for slot in slots {
@@ -1566,12 +2477,14 @@ fn tdx_command(
         flags: u32,
         data: u64,
         error: u64,
+        unused: u64,
     }
     let cmd = TdxIoctlCmd {
         id: command as u32,
         flags,
         data: data as _,
         error: 0,
+        unused: 0,
     };
     loop {
         // SAFETY: FFI call. All input parameters are valid.
@@ -1620,6 +2533,24 @@ impl KvmHypervisor {
         msr_list.as_mut_slice().copy_from_slice(&indices);
 
         Ok(msr_list)
+    }
+
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    fn tdx_vm_type(&self) -> u64 {
+        let supported = self.kvm.check_extension_raw(KVM_CAP_VM_TYPES_RAW) as u64;
+        let current = KVM_X86_TDX_VM.into();
+
+        if supported & (1u64 << current) != 0 {
+            current
+        } else if supported & (1u64 << KVM_X86_TDX_VM_LEGACY) != 0 {
+            warn!(
+                "host KVM supports legacy TDX VM type {} instead of kvm-bindings value {}",
+                KVM_X86_TDX_VM_LEGACY, current
+            );
+            KVM_X86_TDX_VM_LEGACY
+        } else {
+            current
+        }
     }
 }
 
@@ -1715,7 +2646,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[cfg(feature = "tdx")]
             if _config.tdx_enabled {
-                vm_type = KVM_X86_TDX_VM.into();
+                vm_type = self.tdx_vm_type();
             }
         }
 
@@ -1754,18 +2685,16 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             let mut guest_memfds = None;
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             let mut guest_mem_slots = None;
-            if (_config.tdx_enabled
-                || {
-                    #[cfg(feature = "sev_snp")]
-                    {
-                        _config.sev_snp_enabled
-                    }
-                    #[cfg(not(feature = "sev_snp"))]
-                    {
-                        false
-                    }
-                })
-                && fd.check_extension(Cap::GuestMemfd)
+            if (_config.tdx_enabled || {
+                #[cfg(feature = "sev_snp")]
+                {
+                    _config.sev_snp_enabled
+                }
+                #[cfg(not(feature = "sev_snp"))]
+                {
+                    false
+                }
+            }) && fd.check_extension(Cap::GuestMemfd)
             {
                 guest_memfds = Some(Arc::new(RwLock::new(HashMap::new())));
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
@@ -1782,15 +2711,6 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                     _config.sev_snp_enabled
                 }
                 #[cfg(not(feature = "sev_snp"))]
-                {
-                    false
-                }
-            } || {
-                #[cfg(feature = "tdx")]
-                {
-                    _config.tdx_enabled
-                }
-                #[cfg(not(feature = "tdx"))]
                 {
                     false
                 }
@@ -1823,6 +2743,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             Ok(Arc::new(KvmVm {
                 fd: Arc::new(fd),
+                #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+                kvm_fd: self.kvm.as_raw_fd(),
                 msrs,
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 #[cfg(feature = "sev_snp")]
@@ -1830,6 +2752,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 guest_memfds,
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 guest_mem_slots,
+                #[cfg(feature = "tdx")]
+                tdx_legacy_vm_type: _config.tdx_enabled && vm_type == KVM_X86_TDX_VM_LEGACY,
             }))
         }
 
@@ -1880,7 +2804,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     fn tdx_capabilities(&self) -> hypervisor::Result<TdxCapabilities> {
         let vm_fd = self
             .kvm
-            .create_vm_with_type(KVM_X86_TDX_VM.into())
+            .create_vm_with_type(self.tdx_vm_type())
             .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
 
         let mut data = TdxCapabilities {
@@ -1930,12 +2854,20 @@ pub struct KvmVcpu {
     hyperv_synic: AtomicBool,
     #[cfg(target_arch = "x86_64")]
     xsave_size: i32,
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    kvm_fd: RawFd,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     vm_fd: Arc<VmFd>,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
+    #[cfg(feature = "tdx")]
+    tdx_legacy_cpuid: bool,
+    #[cfg(feature = "tdx")]
+    tdx_fw_cfg_dma_hi: u32,
+    #[cfg(feature = "tdx")]
+    tdx_pending_shared_2m_ranges: Mutex<HashMap<u64, [u64; 8]>>,
 }
 
 /// Implementation of Vcpu trait for KVM
@@ -1952,6 +2884,13 @@ pub struct KvmVcpu {
 /// let vcpu = vm.create_vcpu(0, None).unwrap();
 /// ```
 impl cpu::Vcpu for KvmVcpu {
+    ///
+    /// Downcast to the underlying KvmVcpu type
+    ///
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     ///
     /// Returns StandardRegisters with default value set
     ///
@@ -2383,6 +3322,156 @@ impl cpu::Vcpu for KvmVcpu {
     /// X86 specific call to setup the CPUID registers.
     ///
     fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+        #[cfg(feature = "tdx")]
+        if self.tdx_legacy_cpuid {
+            let mut cpuid = vec![
+                kvm_bindings::kvm_cpuid_entry2 {
+                    function: 0x4000_0000,
+                    eax: 0x4000_0001,
+                    ebx: 0x4b4d_564b,
+                    ecx: 0x564b_4d56,
+                    edx: 0x0000_004d,
+                    ..Default::default()
+                },
+                kvm_bindings::kvm_cpuid_entry2 {
+                    function: 0x4000_0001,
+                    eax: 0x0000_ba82,
+                    ..Default::default()
+                },
+            ];
+            cpuid.extend(tdx_legacy_cpuid_entries());
+            let kvm_cpuid = <CpuId>::from_entries(&cpuid).map_err(|_| {
+                cpu::HypervisorCpuError::SetCpuid(anyhow!("failed to create CpuId"))
+            })?;
+
+            let mut supported_mcg_cap: u64 = 0;
+            // SAFETY: KVM_X86_GET_MCE_CAP_SUPPORTED writes the supported MCG capability bits.
+            let ret = unsafe {
+                libc::ioctl(
+                    self.kvm_fd,
+                    0xffff_ffff_8008_ae9d as libc::c_ulong,
+                    &mut supported_mcg_cap,
+                )
+            };
+            if ret < 0 {
+                return Err(cpu::HypervisorCpuError::SetCpuid(
+                    std::io::Error::last_os_error().into(),
+                ));
+            }
+
+            let mut mcg_cap: u64 = 0x100010a;
+            // SAFETY: KVM_X86_SETUP_MCE takes a pointer to a u64 MCG capability value.
+            let ret = unsafe {
+                libc::ioctl(
+                    self.fd.as_raw_fd(),
+                    0x4008ae9c as libc::c_ulong,
+                    &mut mcg_cap,
+                )
+            };
+            if ret < 0 {
+                return Err(cpu::HypervisorCpuError::SetCpuid(
+                    std::io::Error::last_os_error().into(),
+                ));
+            }
+
+            let slots: Vec<KvmGuestMemSlot> = self
+                .guest_mem_slots
+                .as_ref()
+                .map(|slots| slots.read().unwrap().values().copied().collect())
+                .unwrap_or_default();
+
+            for slot in &slots {
+                self.vm_fd
+                    .set_memory_attributes(kvm_memory_attributes {
+                        address: slot.guest_phys_addr,
+                        size: slot.memory_size,
+                        attributes: 0,
+                        flags: 0,
+                    })
+                    .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()))?;
+
+                let region = kvm_userspace_memory_region2 {
+                    slot: slot.slot,
+                    memory_size: 0,
+                    ..Default::default()
+                };
+                // SAFETY: Removing a registered KVM memslot by setting its size to 0.
+                unsafe {
+                    self.vm_fd
+                        .set_user_memory_region2(region)
+                        .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()))?;
+                }
+            }
+            if let Some(guest_memfds) = &self.guest_memfds {
+                let mut guest_memfds = guest_memfds.write().unwrap();
+                for slot in &slots {
+                    guest_memfds.remove(&slot.slot);
+                }
+            }
+
+            let set_cpuid_result = self
+                .fd
+                .set_cpuid2(&kvm_cpuid)
+                .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()));
+
+            let mut restore_result = Ok(());
+            for slot in &slots {
+                let mut slot = *slot;
+                if let Some(guest_memfds) = &self.guest_memfds {
+                    let fd = match self.vm_fd.create_guest_memfd(kvm_create_guest_memfd {
+                        size: slot.memory_size,
+                        ..Default::default()
+                    }) {
+                        Ok(fd) => {
+                            // SAFETY: KVM returned a new owned file descriptor.
+                            unsafe { OwnedFd::from_raw_fd(fd) }
+                        }
+                        Err(e) => {
+                            restore_result = Err(cpu::HypervisorCpuError::SetCpuid(e.into()));
+                            break;
+                        }
+                    };
+                    slot.guest_memfd = fd.as_raw_fd() as u32;
+                    guest_memfds.write().unwrap().insert(slot.slot, fd);
+                    if let Some(guest_mem_slots) = &self.guest_mem_slots {
+                        guest_mem_slots.write().unwrap().insert(slot.slot, slot);
+                    }
+                }
+                let region = kvm_userspace_memory_region2 {
+                    slot: slot.slot,
+                    guest_phys_addr: slot.guest_phys_addr,
+                    memory_size: slot.memory_size,
+                    userspace_addr: slot.userspace_addr,
+                    flags: slot.flags,
+                    guest_memfd: slot.guest_memfd,
+                    guest_memfd_offset: slot.guest_memfd_offset,
+                    ..Default::default()
+                };
+                // SAFETY: Restoring the same non-overlapping memslot that was removed above.
+                if let Err(e) = unsafe { self.vm_fd.set_user_memory_region2(region) } {
+                    restore_result = Err(cpu::HypervisorCpuError::SetCpuid(e.into()));
+                    break;
+                }
+                if let Err(e) = self.vm_fd.set_memory_attributes(kvm_memory_attributes {
+                    address: slot.guest_phys_addr,
+                    size: slot.memory_size,
+                    attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                    flags: 0,
+                }) {
+                    restore_result = Err(cpu::HypervisorCpuError::SetCpuid(e.into()));
+                    break;
+                }
+            }
+
+            set_cpuid_result?;
+            restore_result?;
+            return Ok(());
+        }
+
+        #[cfg(feature = "tdx")]
+        let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+            cpuid.iter().map(|e| (*e).into()).collect();
+        #[cfg(not(feature = "tdx"))]
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
         let kvm_cpuid = <CpuId>::from_entries(&cpuid)
@@ -2531,8 +3620,15 @@ impl cpu::Vcpu for KvmVcpu {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
                     if let Some(vm_ops) = &self.vm_ops {
-                        return vm_ops
-                            .pio_read(addr.into(), data)
+                        let ret = vm_ops.pio_read(addr.into(), data);
+                        #[cfg(feature = "tdx")]
+                        if self.tdx_legacy_cpuid {
+                            let n = TDX_IO_EXIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                            if tdx_should_log_io(n, addr) {
+                                info!("TDX_IO in port={addr:#x} len={} data={data:x?}", data.len());
+                            }
+                        }
+                        return ret
                             .map(|_| cpu::VmExit::Ignore)
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
@@ -2541,9 +3637,49 @@ impl cpu::Vcpu for KvmVcpu {
                 }
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoOut(addr, data) => {
+                    let data = data.to_vec();
+                    #[cfg(feature = "tdx")]
+                    if self.tdx_legacy_cpuid {
+                        if data.len() == 4 && (addr == 0x514 || addr == 0x518) {
+                            let mut buf = [0u8; 4];
+                            buf.copy_from_slice(&data);
+                            let val = u32::from_be_bytes(buf);
+                            if addr == 0x514 {
+                                self.tdx_fw_cfg_dma_hi = val;
+                            } else {
+                                let dma_address =
+                                    ((self.tdx_fw_cfg_dma_hi as u64) << 32) | val as u64;
+                                let start = dma_address & !0xfffu64;
+                                self.convert_guest_memory_region(start, 0x1000, false)?;
+                            }
+                        }
+                        if addr == 0x64 && data.first().copied() == Some(0xfe) {
+                            match self.fd.get_regs() {
+                                Ok(regs) => warn!(
+                                    "TDX i8042 reset PIO at rip={:#x} rsp={:#x} rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}",
+                                    regs.rip,
+                                    regs.rsp,
+                                    regs.rax,
+                                    regs.rbx,
+                                    regs.rcx,
+                                    regs.rdx,
+                                    regs.rsi,
+                                    regs.rdi
+                                ),
+                                Err(e) => warn!("TDX i8042 reset PIO; failed to read regs: {e}"),
+                            }
+                        }
+                        let n = TDX_IO_EXIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if tdx_should_log_io(n, addr) {
+                            info!(
+                                "TDX_IO out port={addr:#x} len={} data={data:x?}",
+                                data.len()
+                            );
+                        }
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
-                            .pio_write(addr.into(), data)
+                            .pio_write(addr.into(), &data)
                             .map(|_| cpu::VmExit::Ignore)
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
@@ -2573,8 +3709,18 @@ impl cpu::Vcpu for KvmVcpu {
 
                 VcpuExit::MmioRead(addr, data) => {
                     if let Some(vm_ops) = &self.vm_ops {
-                        return vm_ops
-                            .mmio_read(addr, data)
+                        let ret = vm_ops.mmio_read(addr, data);
+                        #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+                        if self.tdx_legacy_cpuid {
+                            let n = TDX_IO_EXIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                            if n < 512 {
+                                info!(
+                                    "TDX_MMIO read addr={addr:#x} len={} data={data:x?}",
+                                    data.len()
+                                );
+                            }
+                        }
+                        return ret
                             .map(|_| cpu::VmExit::Ignore)
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()));
                     }
@@ -2582,6 +3728,16 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::MmioWrite(addr, data) => {
+                    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+                    if self.tdx_legacy_cpuid {
+                        let n = TDX_IO_EXIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                        if n < 512 {
+                            info!(
+                                "TDX_MMIO write addr={addr:#x} len={} data={data:x?}",
+                                data.len()
+                            );
+                        }
+                    }
                     if let Some(vm_ops) = &self.vm_ops {
                         return vm_ops
                             .mmio_write(addr, data)
@@ -2593,7 +3749,11 @@ impl cpu::Vcpu for KvmVcpu {
                 }
                 VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
                 #[cfg(feature = "tdx")]
-                VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
+                VcpuExit::Unsupported(reason)
+                    if reason == KVM_EXIT_TDX || reason == KVM_EXIT_TDX_LEGACY =>
+                {
+                    Ok(cpu::VmExit::Tdx)
+                }
                 VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 VcpuExit::Hypercall(hypercall) => {
@@ -2605,10 +3765,7 @@ impl cpu::Vcpu for KvmVcpu {
                     };
                     warn!(
                         "VcpuExit::Hypercall nr={} args=[{:#x}, {:#x}, {:#x}]",
-                        nr,
-                        args[0],
-                        args[1],
-                        args[2]
+                        nr, args[0], args[1], args[2]
                     );
                     // 4th bit of attributes argument is encrypted page bit
                     match nr {
@@ -2659,14 +3816,30 @@ impl cpu::Vcpu for KvmVcpu {
                         )));
                     }
 
-                    let attributes = if flags & KVM_MEMORY_EXIT_FLAG_PRIVATE != 0 {
-                        KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
-                    } else {
-                        0u64
-                    };
+                    let private = flags & KVM_MEMORY_EXIT_FLAG_PRIVATE != 0;
 
-                    // Match QEMU order: fallocate first, then set_memory_attributes
-                    if attributes == 0 {
+                    #[cfg(feature = "tdx")]
+                    if self.tdx_legacy_cpuid {
+                        if !private {
+                            let mut flushed_fault = false;
+                            for (flush_start, flush_size) in
+                                self.take_all_tdx_pending_shared_ranges()
+                            {
+                                if gpa >= flush_start && gpa < flush_start + flush_size {
+                                    flushed_fault = true;
+                                }
+                                self.convert_guest_memory_region(flush_start, flush_size, false)?;
+                            }
+                            if !flushed_fault {
+                                self.convert_guest_memory_region(gpa, size, false)?;
+                            }
+                        } else {
+                            self.convert_guest_memory_region(gpa, size, true)?;
+                        }
+                        return Ok(cpu::VmExit::Ignore);
+                    }
+
+                    if !private {
                         self.punch_hole_guest_memfd(gpa, size)?;
                     } else {
                         self.allocate_guest_memfd(gpa, size)?;
@@ -2676,12 +3849,17 @@ impl cpu::Vcpu for KvmVcpu {
 
                     let mut offset = 0u64;
                     while offset < size {
-                        let chunk_size = std::cmp::min(KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE, size - offset);
+                        let chunk_size =
+                            std::cmp::min(KVM_MEMORY_ATTRIBUTE_CHUNK_SIZE, size - offset);
                         self.vm_fd
                             .set_memory_attributes(kvm_memory_attributes {
                                 address: gpa + offset,
                                 size: chunk_size,
-                                attributes,
+                                attributes: if private {
+                                    KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
+                                } else {
+                                    0u64
+                                },
                                 flags: 0,
                             })
                             .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
@@ -2692,9 +3870,17 @@ impl cpu::Vcpu for KvmVcpu {
                 }
 
                 r => {
-                    warn!("KVM_RUN unexpected exit reason: {r:?}");
+                    let exit_debug = format!("{r:?}");
+                    let kvm_run = self.fd.get_kvm_run();
+                    let raw_exit_reason = (*kvm_run).exit_reason;
+                    // SAFETY: for KVM_EXIT_UNKNOWN the hw union member is active.
+                    let hardware_exit_reason =
+                        unsafe { (*kvm_run).__bindgen_anon_1.hw.hardware_exit_reason };
+                    warn!(
+                        "KVM_RUN unexpected exit reason: {exit_debug}, raw_exit_reason={raw_exit_reason}, hardware_exit_reason={hardware_exit_reason:#x}"
+                    );
                     Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                        "Unexpected exit reason on vcpu run: {r:?}"
+                        "Unexpected exit reason on vcpu run: {exit_debug}"
                     )))
                 }
             },
@@ -3390,6 +4576,63 @@ impl cpu::Vcpu for KvmVcpu {
         size: usize,
         measure: bool,
     ) -> cpu::Result<()> {
+        if self.tdx_legacy_cpuid {
+            #[repr(C)]
+            struct KvmMemoryMapping {
+                base_gfn: u64,
+                nr_pages: u64,
+                flags: u64,
+                source: u64,
+            }
+
+            let mut mapping = KvmMemoryMapping {
+                base_gfn: guest_address >> 12,
+                nr_pages: (size / 4096).try_into().unwrap(),
+                flags: 0,
+                source: host_address as u64,
+            };
+
+            loop {
+                // SAFETY: KVM reads the mapping descriptor and pins pages from source.
+                let ret = unsafe {
+                    libc::ioctl(
+                        self.fd.as_raw_fd(),
+                        KVM_MEMORY_MAPPING_RAW,
+                        &mut mapping as *mut KvmMemoryMapping,
+                    )
+                };
+                if ret == 0 {
+                    break;
+                }
+
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                    continue;
+                }
+
+                return Err(cpu::HypervisorCpuError::InitializeTdx(err));
+            }
+
+            if measure {
+                let extend = KvmMemoryMapping {
+                    base_gfn: guest_address >> 12,
+                    nr_pages: (size / 4096).try_into().unwrap(),
+                    flags: 0,
+                    source: 0,
+                };
+
+                tdx_command(
+                    &self.vm_fd.as_raw_fd(),
+                    TdxCommand::InitMemRegion,
+                    0,
+                    &extend as *const _ as *const _,
+                )
+                .map_err(cpu::HypervisorCpuError::InitializeTdx)?;
+            }
+
+            return Ok(());
+        }
+
         #[repr(C)]
         struct TdxInitMemRegion {
             host_address: u64,
@@ -3440,7 +4683,7 @@ impl cpu::Vcpu for KvmVcpu {
 
         match tdx_vmcall.subfunction {
             TDG_VP_VMCALL_MAP_GPA => {
-                warn!(
+                debug!(
                     "TDX VMCALL MAP_GPA: r12={:#x} r13={:#x} r14={:#x} r15={:#x} rbx={:#x} rdx={:#x}",
                     tdx_vmcall.in_r12,
                     tdx_vmcall.in_r13,
@@ -3451,9 +4694,14 @@ impl cpu::Vcpu for KvmVcpu {
                 );
                 Ok(TdxExitDetails::MapGpa)
             }
-            TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote),
+            TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote {
+                gpa: tdx_vmcall.in_r12,
+                size: tdx_vmcall.in_r13,
+            }),
             TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
-                Ok(TdxExitDetails::SetupEventNotifyInterrupt)
+                Ok(TdxExitDetails::SetupEventNotifyInterrupt {
+                    vector: tdx_vmcall.in_r12,
+                })
             }
             _ => Err(cpu::HypervisorCpuError::UnknownTdxVmCall),
         }
@@ -3463,7 +4711,7 @@ impl cpu::Vcpu for KvmVcpu {
     /// Set the status code for TDX exit
     ///
     #[cfg(feature = "tdx")]
-    fn handle_tdx_map_gpa(&mut self, shared_gpa_mask: u64) -> cpu::Result<()> {
+    fn handle_tdx_map_gpa(&mut self, shared_gpa_mask: u64) -> cpu::Result<TdxExitStatus> {
         let kvm_run = self.fd.get_kvm_run();
         // SAFETY: accessing a union field in a valid structure
         let tdx_vmcall = unsafe {
@@ -3487,21 +4735,49 @@ impl cpu::Vcpu for KvmVcpu {
         );
 
         if size == 0 {
-            return Ok(());
+            return Ok(TdxExitStatus::Success);
         }
 
         if address & 0xfff != 0 || size & 0xfff != 0 {
-            return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                "TDX MAP_GPA range is not 4K aligned: address={address:#x}, size={size:#x}"
-            )));
+            return Ok(TdxExitStatus::AlignError);
         }
+
+        let host_addr_bits = unsafe { std::arch::x86_64::__cpuid(0x8000_0008).eax };
+        let host_phys_bits = host_addr_bits & 0xff;
+        let phys_limit = 1u64.checked_shl(host_phys_bits).unwrap_or(0);
+        if phys_limit != 0
+            && (address >= phys_limit
+                || address
+                    .checked_add(size)
+                    .is_none_or(|end| end >= phys_limit))
+        {
+            return Ok(TdxExitStatus::InvalidOperand);
+        }
+
+        if self.tdx_legacy_cpuid && !private {
+            for (flush_start, flush_size) in self.take_all_tdx_pending_shared_ranges() {
+                self.convert_guest_memory_region(flush_start, flush_size, false)?;
+            }
+        }
+
+        let convert_size = std::cmp::min(size, TDX_MAP_GPA_MAX_LEN);
 
         // Linux TDX guests issue TDG.VP.VMCALL<MapGPA> with:
         //   r12 = start GPA (shared bit encoded in the GPA for private->shared)
         //   r13 = range length in bytes
         // The host must update KVM memory attributes and punch holes in guest_memfd
         // for shared ranges so the mapping actually becomes visible to the VMM.
-        self.convert_guest_memory_region(address, size, private)
+        self.convert_guest_memory_region(address, convert_size, private)?;
+
+        if convert_size < size {
+            let mut next_address = address + convert_size;
+            if !private {
+                next_address |= shared_gpa_mask;
+            }
+            Ok(TdxExitStatus::Retry(next_address))
+        } else {
+            Ok(TdxExitStatus::Success)
+        }
     }
 
     #[cfg(feature = "tdx")]
@@ -3518,6 +4794,11 @@ impl cpu::Vcpu for KvmVcpu {
         tdx_vmcall.status_code = match status {
             TdxExitStatus::Success => TDG_VP_VMCALL_SUCCESS,
             TdxExitStatus::InvalidOperand => TDG_VP_VMCALL_INVALID_OPERAND,
+            TdxExitStatus::AlignError => TDG_VP_VMCALL_ALIGN_ERROR,
+            TdxExitStatus::Retry(next_address) => {
+                tdx_vmcall.out_r11 = next_address;
+                TDG_VP_VMCALL_RETRY
+            }
         };
     }
 
@@ -3708,7 +4989,12 @@ impl cpu::Vcpu for KvmVcpu {
 
 impl KvmVcpu {
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-    pub fn convert_guest_memory_region(&self, address: u64, size: u64, private: bool) -> cpu::Result<()> {
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> cpu::Result<()> {
         let attributes = if private {
             KVM_MEMORY_ATTRIBUTE_PRIVATE as u64
         } else {
@@ -3732,7 +5018,10 @@ impl KvmVcpu {
             if !private {
                 self.punch_hole_guest_memfd(address, size)?;
             }
-
+            #[cfg(feature = "tdx")]
+            if private && self.tdx_legacy_cpuid {
+                self.discard_userspace_memory(address, size)?;
+            }
             return Ok(());
         };
 
@@ -3751,6 +5040,17 @@ impl KvmVcpu {
             .collect();
         slots.sort_by_key(|slot| slot.guest_phys_addr);
 
+        if !private {
+            self.vm_fd
+                .set_memory_attributes(kvm_memory_attributes {
+                    address,
+                    size,
+                    attributes,
+                    flags: 0,
+                })
+                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+        }
+
         if slots.is_empty() {
             if private {
                 return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
@@ -3759,16 +5059,19 @@ impl KvmVcpu {
             }
 
             debug!(
-                "Ignoring shared conversion for non-guest-memfd range: address={address:#x}, size={size:#x}"
+                "Converted non-guest-memfd range to shared: address={address:#x}, size={size:#x}"
             );
             return Ok(());
         }
 
         let mut covered_until = address;
         for slot in slots {
-            let slot_end = slot.guest_phys_addr.checked_add(slot.memory_size).ok_or_else(|| {
-                cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd slot overflow"))
-            })?;
+            let slot_end = slot
+                .guest_phys_addr
+                .checked_add(slot.memory_size)
+                .ok_or_else(|| {
+                    cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd slot overflow"))
+                })?;
             let range_start = std::cmp::max(address, slot.guest_phys_addr);
             let range_end = std::cmp::min(end, slot_end);
             if range_start >= range_end {
@@ -3781,17 +5084,23 @@ impl KvmVcpu {
                 )));
             }
 
-            self.vm_fd
-                .set_memory_attributes(kvm_memory_attributes {
-                    address: range_start,
-                    size: range_end - range_start,
-                    attributes,
-                    flags: 0,
-                })
-                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+            if private {
+                self.vm_fd
+                    .set_memory_attributes(kvm_memory_attributes {
+                        address: range_start,
+                        size: range_end - range_start,
+                        attributes,
+                        flags: 0,
+                    })
+                    .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+            }
 
             if !private {
                 self.punch_hole_guest_memfd(range_start, range_end - range_start)?;
+            }
+            #[cfg(feature = "tdx")]
+            if private && self.tdx_legacy_cpuid {
+                self.discard_userspace_memory(range_start, range_end - range_start)?;
             }
 
             covered_until = covered_until.max(range_end);
@@ -3807,6 +5116,96 @@ impl KvmVcpu {
     }
 
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn discard_userspace_memory(&self, address: u64, size: u64) -> cpu::Result<()> {
+        let Some(guest_mem_slots) = &self.guest_mem_slots else {
+            return Ok(());
+        };
+
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("userspace memory discard range overflow"))
+        })?;
+
+        let slots: Vec<KvmGuestMemSlot> =
+            guest_mem_slots.read().unwrap().values().copied().collect();
+
+        for slot in slots {
+            let slot_start = slot.guest_phys_addr;
+            let slot_end = slot
+                .guest_phys_addr
+                .checked_add(slot.memory_size)
+                .ok_or_else(|| {
+                    cpu::HypervisorCpuError::RunVcpu(anyhow!("guest memory slot overflow"))
+                })?;
+
+            let discard_start = std::cmp::max(address, slot_start);
+            let discard_end = std::cmp::min(end, slot_end);
+            if discard_start >= discard_end {
+                continue;
+            }
+
+            let host_addr = slot
+                .userspace_addr
+                .checked_add(discard_start - slot_start)
+                .ok_or_else(|| {
+                    cpu::HypervisorCpuError::RunVcpu(anyhow!("userspace address overflow"))
+                })?;
+            let length = discard_end - discard_start;
+            let ret = unsafe {
+                libc::madvise(
+                    host_addr as *mut libc::c_void,
+                    length as libc::size_t,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if ret != 0 {
+                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "userspace memory discard failed: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn take_all_tdx_pending_shared_ranges(&self) -> Vec<(u64, u64)> {
+        const MAP_GPA_PAGE_SIZE: u64 = 4096;
+        const MAP_GPA_PAGES_PER_BATCH: usize = 512;
+
+        let mut ranges = self.tdx_pending_shared_2m_ranges.lock().unwrap();
+        let pending: Vec<(u64, [u64; 8])> = ranges.drain().collect();
+        let mut flush_ranges = Vec::new();
+
+        for (range_start, bitmap) in pending {
+            let is_set =
+                |index: usize| -> bool { bitmap[index / 64] & (1u64 << (index % 64)) != 0 };
+
+            let mut page = 0;
+            while page < MAP_GPA_PAGES_PER_BATCH {
+                if !is_set(page) {
+                    page += 1;
+                    continue;
+                }
+
+                let first_page = page;
+                page += 1;
+                while page < MAP_GPA_PAGES_PER_BATCH && is_set(page) {
+                    page += 1;
+                }
+
+                flush_ranges.push((
+                    range_start + first_page as u64 * MAP_GPA_PAGE_SIZE,
+                    (page - first_page) as u64 * MAP_GPA_PAGE_SIZE,
+                ));
+            }
+        }
+
+        flush_ranges.sort_by_key(|(start, _)| *start);
+        flush_ranges
+    }
+
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     fn punch_hole_guest_memfd(&self, address: u64, size: u64) -> cpu::Result<()> {
         let Some(guest_memfds) = &self.guest_memfds else {
             return Ok(());
@@ -3815,16 +5214,12 @@ impl KvmVcpu {
             return Ok(());
         };
 
-        let end = address
-            .checked_add(size)
-            .ok_or_else(|| cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow")))?;
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow"))
+        })?;
 
-        let slots: Vec<KvmGuestMemSlot> = guest_mem_slots
-            .read()
-            .unwrap()
-            .values()
-            .copied()
-            .collect();
+        let slots: Vec<KvmGuestMemSlot> =
+            guest_mem_slots.read().unwrap().values().copied().collect();
         let memfds = guest_memfds.read().unwrap();
 
         for slot in slots {
@@ -3882,16 +5277,12 @@ impl KvmVcpu {
             return Ok(());
         };
 
-        let end = address
-            .checked_add(size)
-            .ok_or_else(|| cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow")))?;
+        let end = address.checked_add(size).ok_or_else(|| {
+            cpu::HypervisorCpuError::RunVcpu(anyhow!("guest_memfd range overflow"))
+        })?;
 
-        let slots: Vec<KvmGuestMemSlot> = guest_mem_slots
-            .read()
-            .unwrap()
-            .values()
-            .copied()
-            .collect();
+        let slots: Vec<KvmGuestMemSlot> =
+            guest_mem_slots.read().unwrap().values().copied().collect();
         let memfds = guest_memfds.read().unwrap();
 
         for slot in slots {

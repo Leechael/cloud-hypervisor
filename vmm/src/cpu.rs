@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::{cmp, io, result, thread};
+use std::{cmp, env, io, result, thread};
 
 use acpi_tables::sdt::Sdt;
 use acpi_tables::{Aml, aml};
@@ -94,6 +94,19 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::physical_bits;
 use crate::vm_config::{CoreScheduling, CpusConfig};
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_HDR_SIZE: u64 = 24;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_MAX_BUF_LEN: u64 = 128 * 1024;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_STRUCTURE_VERSION: u64 = 1;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_SUCCESS: u64 = 0;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_ERROR: u64 = 0x8000_0000_0000_0000;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_QGS_UNAVAILABLE: u64 = 0x8000_0000_0000_0001;
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -862,6 +875,214 @@ impl VcpuState {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_get_quote_qgs_port() -> u32 {
+    env::var("CH_TDX_QGS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(4050)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_read_le_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_read_le_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_write_le_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_write_le_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx", target_os = "linux"))]
+fn tdx_qgs_vsock_request(port: u32, request: &[u8], max_response: usize) -> io::Result<Vec<u8>> {
+    // QEMU's tdx-guest object connects to the host QGS over AF_VSOCK cid 2.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let addr = libc::sockaddr_vm {
+            svm_family: libc::AF_VSOCK as libc::sa_family_t,
+            svm_reserved1: 0,
+            svm_port: port,
+            svm_cid: libc::VMADDR_CID_HOST,
+            svm_zero: [0; 4],
+        };
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut sent = 0;
+        while sent < request.len() {
+            let ret = unsafe {
+                libc::send(
+                    fd,
+                    request[sent..].as_ptr() as *const libc::c_void,
+                    request.len() - sent,
+                    0,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "zero-length write to QGS",
+                ));
+            }
+            sent += ret as usize;
+        }
+
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_WR);
+        }
+
+        let mut response = Vec::new();
+        let mut scratch = [0u8; 4096];
+        while response.len() < max_response {
+            let limit = cmp::min(scratch.len(), max_response - response.len());
+            let ret =
+                unsafe { libc::recv(fd, scratch.as_mut_ptr() as *mut libc::c_void, limit, 0) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                break;
+            }
+            response.extend_from_slice(&scratch[..ret as usize]);
+        }
+
+        Ok(response)
+    })();
+
+    unsafe {
+        libc::close(fd);
+    }
+
+    result
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx", not(target_os = "linux")))]
+fn tdx_qgs_vsock_request(_port: u32, _request: &[u8], _max_response: usize) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TDX QGS vsock is only supported on Linux",
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn handle_tdx_get_quote(
+    vm_ops: &Arc<dyn VmOps>,
+    shared_gpa_mask: u64,
+    raw_gpa: u64,
+    buf_len: u64,
+) -> TdxExitStatus {
+    if buf_len == 0 || raw_gpa & shared_gpa_mask == 0 {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let gpa = raw_gpa & !shared_gpa_mask;
+    if gpa & 0xfff != 0 || buf_len & 0xfff != 0 {
+        return TdxExitStatus::AlignError;
+    }
+    if buf_len > TDX_GET_QUOTE_MAX_BUF_LEN || buf_len < TDX_GET_QUOTE_HDR_SIZE {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let mut header = [0u8; TDX_GET_QUOTE_HDR_SIZE as usize];
+    if let Err(e) = vm_ops.guest_mem_read(gpa, &mut header) {
+        warn!("TDX GET_QUOTE failed to read header: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let structure_version = tdx_read_le_u64(&header, 0);
+    let error_code = tdx_read_le_u64(&header, 8);
+    let in_len = tdx_read_le_u32(&header, 16) as u64;
+    let out_len = tdx_read_le_u32(&header, 20);
+
+    if structure_version != TDX_GET_QUOTE_STRUCTURE_VERSION
+        || error_code != TDX_VP_GET_QUOTE_SUCCESS
+        || out_len != 0
+        || in_len > buf_len - TDX_GET_QUOTE_HDR_SIZE
+    {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let payload_gpa = gpa + TDX_GET_QUOTE_HDR_SIZE;
+    let mut request = vec![0u8; in_len as usize];
+    if let Err(e) = vm_ops.guest_mem_read(payload_gpa, &mut request) {
+        warn!("TDX GET_QUOTE failed to read request payload: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let max_response = (buf_len - TDX_GET_QUOTE_HDR_SIZE) as usize;
+    let qgs_port = tdx_get_quote_qgs_port();
+    let response = match tdx_qgs_vsock_request(qgs_port, &request, max_response) {
+        Ok(response) => response,
+        Err(e) => {
+            warn!("TDX GET_QUOTE QGS request failed on port {qgs_port}: {e}");
+            tdx_write_le_u64(&mut header, 8, TDX_VP_GET_QUOTE_QGS_UNAVAILABLE);
+            if let Err(e) = vm_ops.guest_mem_write(gpa, &header) {
+                warn!("TDX GET_QUOTE failed to publish QGS unavailable header: {e}");
+                return TdxExitStatus::InvalidOperand;
+            }
+            return TdxExitStatus::Success;
+        }
+    };
+
+    let status = if response.len() <= max_response {
+        if let Err(e) = vm_ops.guest_mem_write(payload_gpa, &response) {
+            warn!("TDX GET_QUOTE failed to write response payload: {e}");
+            TDX_VP_GET_QUOTE_ERROR
+        } else {
+            tdx_write_le_u32(&mut header, 20, response.len() as u32);
+            TDX_VP_GET_QUOTE_SUCCESS
+        }
+    } else {
+        TDX_VP_GET_QUOTE_ERROR
+    };
+
+    tdx_write_le_u64(&mut header, 8, status);
+    if let Err(e) = vm_ops.guest_mem_write(gpa, &header) {
+        warn!("TDX GET_QUOTE failed to publish completion header: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    info!(
+        "TDX GET_QUOTE completed through QGS port {qgs_port}: request={} response={}",
+        request.len(),
+        response.len()
+    );
+    TdxExitStatus::Success
+}
+
 impl CpuManager {
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
@@ -895,7 +1116,16 @@ impl CpuManager {
         let cpu_vendor = hypervisor.get_cpu_vendor();
 
         #[cfg(target_arch = "x86_64")]
-        if config.features.amx {
+        if config.features.amx || {
+            #[cfg(feature = "tdx")]
+            {
+                tdx_enabled
+            }
+            #[cfg(not(feature = "tdx"))]
+            {
+                false
+            }
+        } {
             hypervisor
                 .enable_amx_state_components()
                 .map_err(|e| Error::AmxEnable(e.into()))?;
@@ -1179,12 +1409,25 @@ impl CpuManager {
         #[cfg(feature = "guest_debug")]
         let vm_debug_evt = self.vm_debug_evt.try_clone().unwrap();
         #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
-        let tdx_shared_gpa_mask = 1u64
-            << u32::from(physical_bits(self.hypervisor.as_ref(), self.config.max_phys_bits));
+        let tdx_shared_gpa_mask = if self.tdx_enabled {
+            let phys_bits = physical_bits(self.hypervisor.as_ref(), self.config.max_phys_bits);
+            if phys_bits > 48 {
+                1u64 << 51
+            } else {
+                1u64 << 47
+            }
+        } else {
+            1u64 << u32::from(physical_bits(
+                self.hypervisor.as_ref(),
+                self.config.max_phys_bits,
+            ))
+        };
         let panic_exit_evt = self.exit_evt.try_clone().unwrap();
         let vcpus_kill_signalled = self.vcpus_kill_signalled.clone();
         let vcpus_pause_signalled = self.vcpus_pause_signalled.clone();
         let vcpus_kick_signalled = self.vcpus_kick_signalled.clone();
+        #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+        let vm_ops = self.vm_ops.clone();
 
         let mut vcpu_states = self.vcpu_states.lock().unwrap();
 
@@ -1327,7 +1570,7 @@ impl CpuManager {
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
 
-                    std::panic::catch_unwind(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1442,16 +1685,16 @@ impl CpuManager {
                                                 Ok(details) => {
                                                     let detail_str = match details {
                                                         TdxExitDetails::MapGpa => "MapGpa",
-                                                        TdxExitDetails::GetQuote => "GetQuote",
-                                                        TdxExitDetails::SetupEventNotifyInterrupt => "SetupEventNotifyInterrupt",
+                                                        TdxExitDetails::GetQuote { .. } => "GetQuote",
+                                                        TdxExitDetails::SetupEventNotifyInterrupt { .. } => "SetupEventNotifyInterrupt",
                                                     };
-                                                    info!("KVM_EXIT_TDX details={detail_str}");
+                                                    log::debug!("KVM_EXIT_TDX details={detail_str}");
                                                     match details {
                                                     TdxExitDetails::MapGpa => {
                                                         match vcpu.vcpu.handle_tdx_map_gpa(tdx_shared_gpa_mask) {
-                                                            Ok(()) => {
-                                                                warn!("TDG_VP_VMCALL_MAP_GPA handled");
-                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                            Ok(status) => {
+                                                                log::debug!("TDG_VP_VMCALL_MAP_GPA handled");
+                                                                vcpu.vcpu.set_tdx_status(status);
                                                                 continue;
                                                             }
                                                             Err(e) => {
@@ -1462,13 +1705,22 @@ impl CpuManager {
                                                             }
                                                         }
                                                     }
-                                                    TdxExitDetails::GetQuote => {
-                                                        warn!("TDG_VP_VMCALL_GET_QUOTE not supported");
-                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                    TdxExitDetails::GetQuote { gpa, size } => {
+                                                        let status = handle_tdx_get_quote(
+                                                            &vm_ops,
+                                                            tdx_shared_gpa_mask,
+                                                            gpa,
+                                                            size,
+                                                        );
+                                                        vcpu.vcpu.set_tdx_status(status);
                                                     }
-                                                    TdxExitDetails::SetupEventNotifyInterrupt => {
-                                                        warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
-                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                    TdxExitDetails::SetupEventNotifyInterrupt { vector } => {
+                                                        let status = if (32..=255).contains(&vector) {
+                                                            TdxExitStatus::Success
+                                                        } else {
+                                                            TdxExitStatus::InvalidOperand
+                                                        };
+                                                        vcpu.vcpu.set_tdx_status(status);
                                                     }
                                                 }},
                                                 Err(e) => {
@@ -1495,7 +1747,7 @@ impl CpuManager {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .or_else(|_| {
                         panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
                         error!("vCPU thread panicked");
@@ -1699,9 +1951,6 @@ impl CpuManager {
             let vcpu = vcpu.lock().unwrap();
             vcpu.vcpu
                 .tdx_init(hob_address)
-                .map_err(Error::InitializeTdx)?;
-            vcpu.vcpu
-                .set_cpuid2(&self.cpuid)
                 .map_err(Error::InitializeTdx)?;
         }
         Ok(())

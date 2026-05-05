@@ -629,15 +629,8 @@ pub fn generate_common_cpuid(
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
     #[cfg(feature = "tdx")]
-    let tdx_capabilities = if config.tdx {
-        let caps = hypervisor
-            .tdx_capabilities()
-            .map_err(Error::TdxCapabilities)?;
-        info!("TDX capabilities {caps:#?}");
-        Some(caps)
-    } else {
-        None
-    };
+    let tdx_capabilities: Option<hypervisor::kvm::TdxCapabilities> =
+        if config.tdx { None } else { None };
 
     // Update some existing CPUID
     for entry in cpuid.as_mut_slice().iter_mut() {
@@ -718,6 +711,11 @@ pub fn generate_common_cpuid(
             // Set CPU physical bits
             0x8000_0008 => {
                 entry.eax = (entry.eax & 0xffff_ff00) | (config.phys_bits as u32 & 0xff);
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax =
+                        (entry.eax & !0x00ff_0000) | ((config.phys_bits as u32 & 0xff) << 16);
+                }
             }
             0x4000_0001 => {
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
@@ -970,7 +968,38 @@ pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
 /// shared DMA buffers from the same below-4GiB RAM range that is backed by
 /// private guest_memfd pages.
 pub fn tdx_q35_arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
-    arch_memory_regions_with_lowmem_end(layout::Q35_LOWMEM_END)
+    vec![
+        // 0 GiB ~ 2 GiB: low memory visible to the guest.
+        (
+            GuestAddress(0),
+            layout::Q35_LOWMEM_END.raw_value() as usize,
+            RegionType::Ram,
+        ),
+        // 4 GiB ~ inf: memory above the 32-bit PCI hole.
+        (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
+        // 2 GiB ~ 2816 MiB: QEMU q35 32-bit PCI MMIO window.
+        (
+            layout::Q35_MEM_32BIT_DEVICES_START,
+            layout::Q35_MEM_32BIT_DEVICES_SIZE as usize,
+            RegionType::SubRegion,
+        ),
+        // 2816 MiB ~ 3072 MiB: QEMU q35 PCI ECAM/MMCONFIG window.
+        (
+            layout::Q35_PCI_MMCONFIG_START,
+            layout::Q35_PCI_MMCONFIG_SIZE as usize,
+            RegionType::Reserved,
+        ),
+        // 3072 MiB ~ 4 GiB: remaining firmware/platform reserved space.
+        (
+            layout::Q35_PCI_MMCONFIG_START.unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
+            layout::RAM_64BIT_START
+                .unchecked_offset_from(
+                    layout::Q35_PCI_MMCONFIG_START
+                        .unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
+                ) as usize,
+            RegionType::Reserved,
+        ),
+    ]
 }
 
 /// Configures the system and should be called once per vm before starting vcpu threads.
@@ -1551,18 +1580,17 @@ mod unit_tests {
         );
         assert_eq!(
             (
-                layout::Q35_LOWMEM_END,
-                layout::MEM_32BIT_RESERVED_START.unchecked_offset_from(layout::Q35_LOWMEM_END)
-                    as usize,
-                RegionType::Reserved,
+                layout::Q35_MEM_32BIT_DEVICES_START,
+                layout::Q35_MEM_32BIT_DEVICES_SIZE as usize,
+                RegionType::SubRegion,
             ),
             regions[2]
         );
         assert_eq!(
             (
-                layout::MEM_32BIT_RESERVED_START,
-                layout::MEM_32BIT_DEVICES_SIZE as usize,
-                RegionType::SubRegion,
+                layout::Q35_PCI_MMCONFIG_START,
+                layout::Q35_PCI_MMCONFIG_SIZE as usize,
+                RegionType::Reserved,
             ),
             regions[3]
         );
