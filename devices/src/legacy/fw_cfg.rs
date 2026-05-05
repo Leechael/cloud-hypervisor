@@ -219,6 +219,8 @@ pub struct FwCfg {
     /// Optional hook called before fw_cfg DMA read/write.
     /// Arguments: (guest_address, length)
     pub dma_pre_hook: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+    linuxboot_option_rom_enabled: bool,
+    patch_linux_setup_header: bool,
 }
 
 impl std::fmt::Debug for FwCfg {
@@ -232,6 +234,11 @@ impl std::fmt::Debug for FwCfg {
             .field("arch_known_items", &self.arch_known_items)
             .field("memory", &self.memory)
             .field("dma_pre_hook", &self.dma_pre_hook.is_some())
+            .field(
+                "linuxboot_option_rom_enabled",
+                &self.linuxboot_option_rom_enabled,
+            )
+            .field("patch_linux_setup_header", &self.patch_linux_setup_header)
             .finish()
     }
 }
@@ -564,6 +571,14 @@ impl FwCfg {
     }
 
     pub fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> FwCfg {
+        Self::new_with_options(memory, true, true)
+    }
+
+    pub fn new_with_options(
+        memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+        linuxboot_option_rom_enabled: bool,
+        patch_linux_setup_header: bool,
+    ) -> FwCfg {
         const DEFAULT_ITEM: FwCfgContent = FwCfgContent::Slice(&[]);
         let mut known_items = [DEFAULT_ITEM; FW_CFG_KNOWN_ITEMS];
         known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_SIGNATURE_VALUE);
@@ -602,6 +617,8 @@ impl FwCfg {
             arch_known_items,
             memory,
             dma_pre_hook: None,
+            linuxboot_option_rom_enabled,
+            patch_linux_setup_header,
         }
     }
 
@@ -856,6 +873,10 @@ impl FwCfg {
 
     #[cfg(target_arch = "x86_64")]
     fn add_linuxboot_option_rom(&mut self) -> Result<()> {
+        if !self.linuxboot_option_rom_enabled {
+            return Ok(());
+        }
+
         const LINUXBOOT_DMA_ROM: &str = "/usr/share/qemu/linuxboot_dma.bin";
         const LINUXBOOT_DMA_FW_CFG: &str = "genroms/linuxboot_dma.bin";
         const LINUXBOOT_DMA_BOOT_PATH: &[u8] = b"/rom@genroms/linuxboot_dma.bin\0";
@@ -1026,21 +1047,27 @@ impl FwCfg {
         file.read_exact_at(&mut buffer, 0)?;
         let bp = boot_params::from_mut_slice(&mut buffer).unwrap();
         #[cfg(target_arch = "x86_64")]
+        let setup_sects = if bp.hdr.setup_sects == 0 {
+            4
+        } else {
+            bp.hdr.setup_sects
+        };
+        #[cfg(target_arch = "x86_64")]
         {
             const FW_CFG_CMDLINE_LOAD_ADDR: u32 = 0x0002_0000;
-            // must set to 4 for backwards compatibility
-            // https://docs.kernel.org/arch/x86/boot.html#the-real-mode-kernel-header
-            if bp.hdr.setup_sects == 0 {
-                bp.hdr.setup_sects = 4;
+            if self.patch_linux_setup_header {
+                // Must set to 4 for backwards compatibility.
+                // https://docs.kernel.org/arch/x86/boot.html#the-real-mode-kernel-header
+                bp.hdr.setup_sects = setup_sects;
+                // Match QEMU's x86_load_linux() fw_cfg boot parameters.
+                bp.hdr.type_of_loader = 0xb0;
+                bp.hdr.loadflags |= 0x80;
+                bp.hdr.heap_end_ptr =
+                    (FW_CFG_CMDLINE_LOAD_ADDR - FW_CFG_SETUP_LOAD_ADDR - 0x200) as u16;
+                bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
             }
-            // Match QEMU's x86_load_linux() fw_cfg boot parameters.
-            bp.hdr.type_of_loader = 0xb0;
-            bp.hdr.loadflags |= 0x80;
-            bp.hdr.heap_end_ptr =
-                (FW_CFG_CMDLINE_LOAD_ADDR - FW_CFG_SETUP_LOAD_ADDR - 0x200) as u16;
-            bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
             let version = bp.hdr.version;
-            let setup_sects = bp.hdr.setup_sects;
+            let setup_sects = setup_sects;
             let type_of_loader = bp.hdr.type_of_loader;
             let loadflags = bp.hdr.loadflags;
             let heap_end_ptr = bp.hdr.heap_end_ptr;
@@ -1060,7 +1087,7 @@ impl FwCfg {
         #[cfg(target_arch = "aarch64")]
         let kernel_start = bp.text_offset;
         #[cfg(target_arch = "x86_64")]
-        let kernel_start = (bp.hdr.setup_sects as usize + 1) * 512;
+        let kernel_start = (setup_sects as usize + 1) * 512;
 
         #[cfg(target_arch = "x86_64")]
         if kernel_start <= buffer.len() {
@@ -1087,6 +1114,11 @@ impl FwCfg {
         self.known_items[FW_CFG_KERNEL_DATA as usize] =
             FwCfgContent::File(kernel_start as u64, file.try_clone()?);
         #[cfg(target_arch = "x86_64")]
+        self.add_item(FwCfgItem {
+            name: "etc/boot/kernel".to_string(),
+            content: FwCfgContent::File(0, file.try_clone()?),
+        })?;
+        #[cfg(target_arch = "x86_64")]
         self.add_linuxboot_option_rom()?;
         Ok(())
     }
@@ -1100,9 +1132,11 @@ impl FwCfg {
         {
             self.known_items[FW_CFG_CMDLINE_ADDR as usize] =
                 FwCfgContent::U32(FW_CFG_CMDLINE_LOAD_ADDR);
-            self.update_setup_data(|bp| {
-                bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
-            });
+            if self.patch_linux_setup_header {
+                self.update_setup_data(|bp| {
+                    bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
+                });
+            }
         }
         self.known_items[FW_CFG_CMDLINE_SIZE as usize] = FwCfgContent::U32(bytes.len() as u32);
         self.known_items[FW_CFG_CMDLINE_DATA as usize] = FwCfgContent::Bytes(bytes);
@@ -1146,10 +1180,12 @@ impl FwCfg {
                 .unwrap_or(FW_CFG_INITRD_LOAD_END_FALLBACK);
             let initramfs_addr = (initrd_load_end - initramfs_size as u32) & !0xfff;
             self.known_items[FW_CFG_INITRD_ADDR as usize] = FwCfgContent::U32(initramfs_addr);
-            self.update_setup_data(|bp| {
-                bp.hdr.ramdisk_image = initramfs_addr;
-                bp.hdr.ramdisk_size = initramfs_size as u32;
-            });
+            if self.patch_linux_setup_header {
+                self.update_setup_data(|bp| {
+                    bp.hdr.ramdisk_image = initramfs_addr;
+                    bp.hdr.ramdisk_size = initramfs_size as u32;
+                });
+            }
             info!(
                 "fw_cfg: initrd addr={:#x} size={:#x} load_end={:#x}",
                 initramfs_addr, initramfs_size, initrd_load_end

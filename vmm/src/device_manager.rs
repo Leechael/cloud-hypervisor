@@ -1640,8 +1640,16 @@ impl DeviceManager {
 
     #[cfg(feature = "fw_cfg")]
     pub fn create_fw_cfg_device(&mut self) -> Result<(), DeviceManagerError> {
-        let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new(
+        let linuxboot_option_rom_enabled = true;
+        #[cfg(feature = "tdx")]
+        let patch_linux_setup_header = !self.config.lock().unwrap().is_tdx_enabled();
+        #[cfg(not(feature = "tdx"))]
+        let patch_linux_setup_header = true;
+
+        let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new_with_options(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
+            linuxboot_option_rom_enabled,
+            patch_linux_setup_header,
         )));
 
         self.fw_cfg = Some(fw_cfg.clone());
