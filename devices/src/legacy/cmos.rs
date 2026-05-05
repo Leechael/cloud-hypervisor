@@ -13,7 +13,7 @@ use std::{mem, thread};
 #[cfg_attr(target_env = "musl", allow(deprecated))]
 use libc::time_t;
 use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
-use log::{info, warn};
+use log::warn;
 use vm_device::BusDevice;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -76,7 +76,7 @@ impl BusDevice for Cmos {
             INDEX_OFFSET => self.index = data[0],
             DATA_OFFSET => {
                 if self.index == 0x8f && data[0] == 0 {
-                    info!("CMOS reset");
+                    warn!("CMOS reset");
                     self.reset_evt.write(1).unwrap();
                     if let Some(vcpus_kill_signalled) = self.vcpus_kill_signalled.take() {
                         // Spin until we are sure the reset_evt has been handled and that when

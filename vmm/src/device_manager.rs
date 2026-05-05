@@ -123,6 +123,8 @@ use vm_migration::{
 use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(target_arch = "x86_64")]
+use crate::GuestMemoryMmap;
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
@@ -137,8 +139,6 @@ use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
     PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
 };
-#[cfg(target_arch = "x86_64")]
-use crate::GuestMemoryMmap;
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -983,6 +983,8 @@ impl MetaVirtioDevice {
 
 #[derive(Default)]
 pub struct AcpiPlatformAddresses {
+    pub pm1_evt_address: Option<GenericAddress>,
+    pub pm1_cnt_address: Option<GenericAddress>,
     pub pm_timer_address: Option<GenericAddress>,
     pub reset_reg_address: Option<GenericAddress>,
     pub sleep_control_reg_address: Option<GenericAddress>,
@@ -1290,9 +1292,29 @@ impl DeviceManager {
             }
         }
 
-        let start_of_mmio32_area = layout::MEM_32BIT_DEVICES_START.0;
-        let end_of_mmio32_area =
-            layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1;
+        #[cfg(feature = "tdx")]
+        let tdx_enabled = config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .is_some_and(|p| p.tdx);
+        #[cfg(not(feature = "tdx"))]
+        let tdx_enabled = false;
+
+        let (start_of_mmio32_area, end_of_mmio32_area, pci_mmconfig_start) = if tdx_enabled {
+            (
+                layout::Q35_MEM_32BIT_DEVICES_START.0,
+                layout::Q35_MEM_32BIT_DEVICES_START.0 + layout::Q35_MEM_32BIT_DEVICES_SIZE - 1,
+                layout::Q35_PCI_MMCONFIG_START.0,
+            )
+        } else {
+            (
+                layout::MEM_32BIT_DEVICES_START.0,
+                layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1,
+                layout::PCI_MMCONFIG_START.0,
+            )
+        };
         let pci_mmio32_allocators = create_mmio_allocators(
             start_of_mmio32_area,
             end_of_mmio32_area,
@@ -1360,6 +1382,8 @@ impl DeviceManager {
             &address_manager,
             Arc::clone(&address_manager.pci_mmio32_allocators[0]),
             Arc::clone(&address_manager.pci_mmio64_allocators[0]),
+            pci_mmconfig_start,
+            tdx_enabled,
             &pci_irq_slots,
         )?];
 
@@ -1370,6 +1394,8 @@ impl DeviceManager {
                 &address_manager,
                 Arc::clone(&address_manager.pci_mmio32_allocators[i]),
                 Arc::clone(&address_manager.pci_mmio64_allocators[i]),
+                pci_mmconfig_start,
+                tdx_enabled,
                 &pci_irq_slots,
             )?);
         }
@@ -1552,6 +1578,7 @@ impl DeviceManager {
             self.reset_evt
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
+            legacy_interrupt_manager.as_ref(),
         )?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1616,20 +1643,6 @@ impl DeviceManager {
         let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
         )));
-
-        #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
-        {
-            let cpu_manager = self.cpu_manager.clone();
-            fw_cfg.lock().unwrap().dma_pre_hook = Some(Arc::new(
-                move |addr: u64, len: u64| {
-                    if let Some((start, size)) = page_aligned_range(addr, len) {
-                        if let Ok(cm) = cpu_manager.lock() {
-                            let _ = cm.convert_guest_memory_region(start, size, false);
-                        }
-                    }
-                },
-            ));
-        }
 
         self.fw_cfg = Some(fw_cfg.clone());
 
@@ -1971,10 +1984,13 @@ impl DeviceManager {
             .unwrap()
             .vcpus_kill_signalled()
             .clone();
+        let q35_guest_exit_evt = guest_exit_evt
+            .try_clone()
+            .map_err(DeviceManagerError::EventFd)?;
         let shutdown_device = Arc::new(Mutex::new(devices::AcpiShutdownDevice::new(
             guest_exit_evt,
             reset_evt,
-            vcpus_kill_signalled,
+            vcpus_kill_signalled.clone(),
         )));
 
         self.bus_devices
@@ -1983,6 +1999,16 @@ impl DeviceManager {
         #[cfg(target_arch = "x86_64")]
         {
             let shutdown_pio_address: u16 = 0x600;
+            #[cfg(feature = "tdx")]
+            let tdx_enabled = self
+                .config
+                .lock()
+                .unwrap()
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.tdx);
+            #[cfg(not(feature = "tdx"))]
+            let tdx_enabled = false;
 
             self.address_manager
                 .allocator
@@ -1991,17 +2017,47 @@ impl DeviceManager {
                 .allocate_io_addresses(Some(GuestAddress(shutdown_pio_address.into())), 0x8, None)
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
-            self.address_manager
-                .io_bus
-                .insert(shutdown_device, shutdown_pio_address.into(), 0x4)
-                .map_err(DeviceManagerError::BusError)?;
+            if tdx_enabled {
+                let q35_pm1_evt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Evt::new()));
+                self.bus_devices
+                    .push(Arc::clone(&q35_pm1_evt) as Arc<dyn BusDeviceSync>);
+                info!("Adding q35 PM1_EVT io port {shutdown_pio_address:#x}");
+                self.address_manager
+                    .io_bus
+                    .insert(q35_pm1_evt, shutdown_pio_address.into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
+                let q35_pm1_cnt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Cnt::new(
+                    q35_guest_exit_evt,
+                    vcpus_kill_signalled.clone(),
+                )));
+                self.bus_devices
+                    .push(Arc::clone(&q35_pm1_cnt) as Arc<dyn BusDeviceSync>);
+                info!(
+                    "Adding q35 PM1_CNT io port {:#x}",
+                    shutdown_pio_address + 0x4
+                );
+                self.address_manager
+                    .io_bus
+                    .insert(q35_pm1_cnt, (shutdown_pio_address + 0x4).into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
+                self.acpi_platform_addresses.pm1_evt_address =
+                    Some(GenericAddress::io_port_address::<u32>(shutdown_pio_address));
+                self.acpi_platform_addresses.pm1_cnt_address = Some(
+                    GenericAddress::io_port_address::<u16>(shutdown_pio_address + 0x4),
+                );
+            } else {
+                self.address_manager
+                    .io_bus
+                    .insert(shutdown_device, shutdown_pio_address.into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
 
-            self.acpi_platform_addresses.sleep_control_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
-            self.acpi_platform_addresses.sleep_status_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
-            self.acpi_platform_addresses.reset_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                self.acpi_platform_addresses.sleep_control_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                self.acpi_platform_addresses.sleep_status_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                self.acpi_platform_addresses.reset_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+            }
         }
 
         let ged_irq = self
@@ -2072,7 +2128,11 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn add_legacy_devices(&mut self, reset_evt: EventFd) -> DeviceManagerResult<()> {
+    fn add_legacy_devices(
+        &mut self,
+        reset_evt: EventFd,
+        interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
+    ) -> DeviceManagerResult<()> {
         let vcpus_kill_signalled = self
             .cpu_manager
             .lock()
@@ -2088,9 +2148,76 @@ impl DeviceManager {
         self.bus_devices
             .push(Arc::clone(&i8042) as Arc<dyn BusDeviceSync>);
 
+        info!("Adding i8042 data io port 0x60");
         self.address_manager
             .io_bus
-            .insert(i8042, 0x61, 0x4)
+            .insert(Arc::clone(&i8042) as Arc<dyn BusDeviceSync>, 0x60, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+        info!("Adding i8042 command io port 0x64");
+        self.address_manager
+            .io_bus
+            .insert(i8042, 0x64, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let port61 = Arc::new(Mutex::new(devices::legacy::Port61::new()));
+        self.bus_devices
+            .push(Arc::clone(&port61) as Arc<dyn BusDeviceSync>);
+        info!("Adding port 0x61 system-control latch");
+        self.address_manager
+            .io_bus
+            .insert(port61, 0x61, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+        let pic = Arc::new(Mutex::new(devices::legacy::PicStub::new()));
+        self.bus_devices
+            .push(Arc::clone(&pic) as Arc<dyn BusDeviceSync>);
+        info!("Adding PIC master io ports 0x20-0x21");
+        self.address_manager
+            .io_bus
+            .insert(Arc::clone(&pic) as Arc<dyn BusDeviceSync>, 0x20, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+        info!("Adding PIC slave io ports 0xa0-0xa1");
+        self.address_manager
+            .io_bus
+            .insert(pic, 0xa0, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let pit_interrupt = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 0 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let pit = Arc::new(Mutex::new(devices::legacy::PitStub::new(pit_interrupt)));
+        self.bus_devices
+            .push(Arc::clone(&pit) as Arc<dyn BusDeviceSync>);
+        info!("Adding PIT io ports 0x40-0x43");
+        self.address_manager
+            .io_bus
+            .insert(pit, 0x40, 0x4)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let port92 = Arc::new(Mutex::new(devices::legacy::Port92::new()));
+        self.bus_devices
+            .push(Arc::clone(&port92) as Arc<dyn BusDeviceSync>);
+        info!("Adding port 0x92 system-control latch");
+        self.address_manager
+            .io_bus
+            .insert(port92, 0x92, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let apm = Arc::new(Mutex::new(devices::legacy::ApmStub::new()));
+        self.bus_devices
+            .push(Arc::clone(&apm) as Arc<dyn BusDeviceSync>);
+        info!("Adding q35 APM io ports 0xb2-0xb3");
+        self.address_manager
+            .io_bus
+            .insert(apm, 0xb2, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let com2 = Arc::new(Mutex::new(devices::legacy::ComPortStub::new()));
+        self.bus_devices
+            .push(Arc::clone(&com2) as Arc<dyn BusDeviceSync>);
+        info!("Adding COM2 io ports 0x2f8-0x2ff");
+        self.address_manager
+            .io_bus
+            .insert(com2, 0x2f8, 0x8)
             .map_err(DeviceManagerError::BusError)?;
         {
             // Add a CMOS emulated device
@@ -3221,7 +3348,19 @@ impl DeviceManager {
 
     fn make_virtio_rng_devices(&mut self) -> DeviceManagerResult<()> {
         // Add virtio-rng if required
-        let rng_config = self.config.lock().unwrap().rng.clone();
+        let config = self.config.lock().unwrap();
+        #[cfg(all(feature = "tdx", feature = "fw_cfg", target_arch = "x86_64"))]
+        if config.platform.as_ref().is_some_and(|p| p.tdx)
+            && config
+                .payload
+                .as_ref()
+                .is_some_and(|p| p.fw_cfg_config.is_some())
+        {
+            info!("Skipping default virtio-rng for TDX fw_cfg compatibility");
+            return Ok(());
+        }
+        let rng_config = config.rng.clone();
+        drop(config);
         if let Some(rng_path) = rng_config.src.to_str() {
             info!("Creating virtio-rng device: {rng_config:?}");
             let id = String::from(RNG_DEVICE_NAME);
@@ -5520,10 +5659,7 @@ impl Aml for DeviceManager {
             } else {
                 format!("\\_SB_.PC{i:02X}.PCNT").as_str().into()
             };
-            pci_scan_methods.push(aml::MethodCall::new(
-                pci_name,
-                vec![],
-            ));
+            pci_scan_methods.push(aml::MethodCall::new(pci_name, vec![]));
         }
         let mut pci_scan_inner: Vec<&dyn Aml> = Vec::new();
         for method in &pci_scan_methods {
@@ -5669,6 +5805,7 @@ impl Aml for DeviceManager {
                     ),
                     &aml::Name::new("_UID".into(), &aml::ZERO),
                     &aml::Name::new("_DDN".into(), &"COM1"),
+                    &aml::Name::new("_STA".into(), &0x0Fu8),
                     &aml::Name::new(
                         "_CRS".into(),
                         &aml::ResourceTemplate::new(vec![
@@ -5688,7 +5825,11 @@ impl Aml for DeviceManager {
             .to_aml_bytes(sink);
         }
 
-        aml::Name::new("_S5_".into(), &aml::Package::new(vec![&5u8])).to_aml_bytes(sink);
+        aml::Name::new(
+            "_S5_".into(),
+            &aml::Package::new(vec![&0u8, &0u8, &0u8, &0u8]),
+        )
+        .to_aml_bytes(sink);
 
         aml::Device::new(
             "_SB_.PWRB".into(),

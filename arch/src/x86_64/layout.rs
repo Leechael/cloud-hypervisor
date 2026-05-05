@@ -83,6 +83,11 @@ pub const HIGH_RAM_START: GuestAddress = GuestAddress(0x100000);
 // QEMU q35 moves the low-memory/PCI-hole split down to 2GiB for large
 // guests. TDX/OVMF depends on this shape for below-4GiB DMA allocations.
 pub const Q35_LOWMEM_END: GuestAddress = GuestAddress(0x8000_0000);
+pub const Q35_MEM_32BIT_DEVICES_START: GuestAddress = Q35_LOWMEM_END;
+pub const Q35_MEM_32BIT_DEVICES_SIZE: u64 = 768 << 20;
+pub const Q35_PCI_MMCONFIG_START: GuestAddress =
+    GuestAddress(Q35_MEM_32BIT_DEVICES_START.0 + Q35_MEM_32BIT_DEVICES_SIZE);
+pub const Q35_PCI_MMCONFIG_SIZE: u64 = 256 << 20;
 
 // == No fixed addresses in the "High RAM" range ==
 

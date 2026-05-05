@@ -50,7 +50,7 @@ impl BusDevice for AcpiShutdownDevice {
 
     fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
         if data[0] == 1 {
-            info!("ACPI Reboot signalled");
+            warn!("ACPI Reboot signalled");
             if let Err(e) = self.reset_evt.write(1) {
                 error!("Error triggering ACPI reset event: {e}");
             }

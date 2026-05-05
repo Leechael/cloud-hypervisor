@@ -1693,7 +1693,7 @@ impl Vmm {
                         break 'outer;
                     }
                     EpollDispatch::Reset => {
-                        info!("VM reset event");
+                        warn!("VM reset event");
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         self.vm_reboot().map_err(Error::VmReboot)?;

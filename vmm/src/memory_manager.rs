@@ -1636,6 +1636,7 @@ impl MemoryManager {
         };
 
         // The start of device area and RAM area are placed next to each other.
+        let start_of_device_area: GuestAddress = start_of_device_area;
         let end_of_ram_area = start_of_device_area.unchecked_sub(1);
         let ram_allocator = AddressAllocator::new(GuestAddress(0), start_of_device_area.0).unwrap();
 

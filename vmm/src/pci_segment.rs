@@ -14,7 +14,10 @@ use std::sync::{Arc, Mutex};
 use acpi_tables::{Aml, aml};
 use arch::layout;
 use log::info;
-use pci::{DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciRoot};
+use pci::{
+    DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciLpcBridge, PciQ35Ahci, PciQ35Smbus,
+    PciRoot,
+};
 #[cfg(target_arch = "x86_64")]
 use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE, PciConfigIo};
 use uuid::Uuid;
@@ -58,17 +61,38 @@ impl PciSegment {
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mmio_config_base: u64,
+        q35_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
-        let pci_root = PciRoot::new(None);
+        let pci_root = if q35_host_bridge {
+            PciRoot::new_q35()
+        } else {
+            PciRoot::new(None)
+        };
         let pci_bus = Arc::new(Mutex::new(PciBus::new(
             pci_root,
             Arc::clone(address_manager) as Arc<dyn DeviceRelocation>,
         )));
+        if q35_host_bridge && id == 0 {
+            let mut pci_bus_locked = pci_bus.lock().unwrap();
+            pci_bus_locked
+                .allocate_device_id(Some(31))
+                .map_err(DeviceManagerError::AllocatePciDeviceId)?;
+            pci_bus_locked
+                .add_device(31, Arc::new(Mutex::new(PciLpcBridge::new_ich9())))
+                .map_err(DeviceManagerError::AddPciDevice)?;
+            pci_bus_locked
+                .add_device_function(31, 2, Arc::new(Mutex::new(PciQ35Ahci::new())))
+                .map_err(DeviceManagerError::AddPciDevice)?;
+            pci_bus_locked
+                .add_device_function(31, 3, Arc::new(Mutex::new(PciQ35Smbus::new())))
+                .map_err(DeviceManagerError::AddPciDevice)?;
+        }
 
         let pci_config_mmio = Arc::new(Mutex::new(PciConfigMmio::new(Arc::clone(&pci_bus))));
         let mmio_config_address =
-            layout::PCI_MMCONFIG_START.0 + layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT * id as u64;
+            mmio_config_base + layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT * id as u64;
 
         address_manager
             .mmio_bus
@@ -78,6 +102,23 @@ impl PciSegment {
                 layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
             )
             .map_err(DeviceManagerError::BusError)?;
+
+        #[cfg(target_arch = "x86_64")]
+        if q35_host_bridge && id == 0 && mmio_config_address != 0xe000_0000 {
+            let compat_mmio_config_address = 0xe000_0000;
+            address_manager
+                .mmio_bus
+                .insert(
+                    Arc::clone(&pci_config_mmio) as Arc<dyn BusDeviceSync>,
+                    compat_mmio_config_address,
+                    layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT,
+                )
+                .map_err(DeviceManagerError::BusError)?;
+            info!(
+                "Adding q35 PCI MMIO config compatibility alias: id={}, address=0x{:x}",
+                id, compat_mmio_config_address
+            );
+        }
 
         let start_of_mem32_area = mem32_allocator.lock().unwrap().base().0;
         let end_of_mem32_area = mem32_allocator.lock().unwrap().end().0;
@@ -121,6 +162,8 @@ impl PciSegment {
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mmio_config_base: u64,
+        q35_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
         let mut segment = Self::new(
@@ -129,6 +172,8 @@ impl PciSegment {
             address_manager,
             mem32_allocator,
             mem64_allocator,
+            mmio_config_base,
+            q35_host_bridge,
             pci_irq_slots,
         )?;
         let pci_config_io = Arc::new(Mutex::new(PciConfigIo::new(Arc::clone(&segment.pci_bus))));
@@ -152,6 +197,8 @@ impl PciSegment {
         address_manager: &Arc<AddressManager>,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mmio_config_base: u64,
+        q35_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
         Self::new(
@@ -160,6 +207,8 @@ impl PciSegment {
             address_manager,
             mem32_allocator,
             mem64_allocator,
+            mmio_config_base,
+            q35_host_bridge,
             pci_irq_slots,
         )
     }
@@ -233,6 +282,7 @@ impl PciSegment {
         numa_node: u32,
         mem32_allocator: Arc<Mutex<AddressAllocator>>,
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
+        mmio_config_base: u64,
         pci_irq_slots: &[u8; 32],
         device_reloc: &Arc<dyn DeviceRelocation>,
     ) -> DeviceManagerResult<Self> {
@@ -241,7 +291,7 @@ impl PciSegment {
 
         let pci_config_mmio = Arc::new(Mutex::new(PciConfigMmio::new(Arc::clone(&pci_bus))));
         let mmio_config_address =
-            layout::PCI_MMCONFIG_START.0 + layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT * id as u64;
+            mmio_config_base + layout::PCI_MMIO_CONFIG_SIZE_PER_SEGMENT * id as u64;
 
         let start_of_mem32_area = mem32_allocator.lock().unwrap().base().0;
         let end_of_mem32_area = mem32_allocator.lock().unwrap().end().0;
@@ -549,11 +599,7 @@ impl Aml for PciSegment {
         } else {
             format!("_SB_.PC{:02X}", self.id).as_str().into()
         };
-        aml::Device::new(
-            pci_name,
-            pci_dsdt_inner_data,
-        )
-        .to_aml_bytes(sink);
+        aml::Device::new(pci_name, pci_dsdt_inner_data).to_aml_bytes(sink);
     }
 }
 
@@ -597,6 +643,8 @@ mod unit_tests {
             0,
             allocator_1,
             allocator_2,
+            layout::PCI_MMCONFIG_START.0,
+            false,
             &arr,
             &mock_device_reloc,
         )

@@ -17,6 +17,7 @@ use vm_device::{Bus, BusDevice, BusDeviceSync};
 use crate::PciBarConfiguration;
 use crate::configuration::{
     PciBarRegionType, PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType,
+    PciMassStorageSubclass, PciProgrammingInterface, PciSerialBusSubClass,
 };
 use crate::device::{BarReprogrammingParams, DeviceRelocation, Error as PciDeviceError, PciDevice};
 
@@ -27,6 +28,37 @@ pub const NUM_DEVICE_IDS: u8 = 32;
 
 const VENDOR_ID_INTEL: u16 = 0x8086;
 const DEVICE_ID_INTEL_VIRT_PCIE_HOST: u16 = 0x0d57;
+const DEVICE_ID_INTEL_P35_MCH: u16 = 0x29c0;
+const DEVICE_ID_INTEL_ICH9_LPC: u16 = 0x2918;
+const DEVICE_ID_INTEL_ICH9_AHCI: u16 = 0x2922;
+const DEVICE_ID_INTEL_ICH9_SMBUS: u16 = 0x2930;
+const Q35_PCIEXBAR_REG: usize = 0x60 / 4;
+const Q35_PCIEXBAR_DEFAULT: u32 = 0xb000_0000;
+const Q35_PCIEXBAR_LOW_WRITABLE_BITS: u32 = 0xf000_0007;
+const Q35_PCIEXBAR_HIGH_WRITABLE_BITS: u32 = 0x0000_000f;
+const PCI_COMMAND_STATUS_REG: usize = 0x04 / 4;
+const PCI_HEADER_TYPE_REG: usize = 0x0c / 4;
+const PCI_BAR4_REG: usize = 0x20 / 4;
+const PCI_CAPABILITY_LIST_REG: usize = 0x34 / 4;
+const PCI_INTERRUPT_REG: usize = 0x3c / 4;
+const PCI_HEADER_TYPE_MULTIFUNCTION: u32 = 0x0080_0000;
+const PCI_STATUS_CAPABILITIES: u32 = 0x0010_0000;
+const ICH9_LPC_PMBASE_REG: usize = 0x40 / 4;
+const ICH9_LPC_ACPI_CTRL_REG: usize = 0x44 / 4;
+const ICH9_LPC_PIRQA_ROUT_REG: usize = 0x60 / 4;
+const ICH9_LPC_PIRQE_ROUT_REG: usize = 0x68 / 4;
+const ICH9_LPC_IO_DEC_REG: usize = 0x80 / 4;
+const ICH9_LPC_RCBA_REG: usize = 0xf0 / 4;
+const ICH9_AHCI_MSI_CAP_REG: usize = 0x80 / 4;
+const ICH9_AHCI_SATA_CAP_REG: usize = 0xa8 / 4;
+
+struct AhciProgrammingInterface;
+
+impl PciProgrammingInterface for AhciProgrammingInterface {
+    fn get_register_value(&self) -> u8 {
+        0x01
+    }
+}
 
 /// Errors for device manager.
 #[derive(Error, Debug)]
@@ -84,11 +116,232 @@ impl PciRoot {
             }
         }
     }
+
+    /// Create a QEMU q35-compatible MCH host bridge.
+    pub fn new_q35() -> Self {
+        let mut config = PciConfiguration::new(
+            VENDOR_ID_INTEL,
+            DEVICE_ID_INTEL_P35_MCH,
+            0,
+            PciClassCode::BridgeDevice,
+            &PciBridgeSubclass::HostBridge,
+            None,
+            PciHeaderType::Device,
+            0,
+            0,
+            None,
+            None,
+        );
+
+        config.set_reg(Q35_PCIEXBAR_REG, Q35_PCIEXBAR_DEFAULT);
+        config.set_writable_bits(Q35_PCIEXBAR_REG, Q35_PCIEXBAR_LOW_WRITABLE_BITS);
+        config.set_writable_bits(Q35_PCIEXBAR_REG + 1, Q35_PCIEXBAR_HIGH_WRITABLE_BITS);
+
+        PciRoot { config }
+    }
 }
 
 impl BusDevice for PciRoot {}
 
 impl PciDevice for PciRoot {
+    fn write_config_register(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+        (
+            self.config.write_config_register(reg_idx, offset, data),
+            None,
+        )
+    }
+
+    fn read_config_register(&mut self, reg_idx: usize) -> u32 {
+        self.config.read_reg(reg_idx)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn id(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Minimal QEMU q35-compatible ICH9 LPC/ISA bridge at 00:1f.0.
+pub struct PciLpcBridge {
+    config: PciConfiguration,
+}
+
+impl PciLpcBridge {
+    pub fn new_ich9() -> Self {
+        let mut config = PciConfiguration::new(
+            VENDOR_ID_INTEL,
+            DEVICE_ID_INTEL_ICH9_LPC,
+            2,
+            PciClassCode::BridgeDevice,
+            &PciBridgeSubclass::IsaBridge,
+            None,
+            PciHeaderType::Device,
+            0,
+            0,
+            None,
+            None,
+        );
+
+        config.set_reg(
+            PCI_HEADER_TYPE_REG,
+            config.read_reg(PCI_HEADER_TYPE_REG) | PCI_HEADER_TYPE_MULTIFUNCTION,
+        );
+        config.set_reg(ICH9_LPC_PMBASE_REG, 0x0000_0001);
+        config.set_writable_bits(ICH9_LPC_PMBASE_REG, 0xffff_ff80);
+        config.set_reg(ICH9_LPC_ACPI_CTRL_REG, 0);
+        config.set_writable_bits(ICH9_LPC_ACPI_CTRL_REG, 0x0000_0087);
+        config.set_reg(ICH9_LPC_PIRQA_ROUT_REG, 0x8080_8080);
+        config.set_reg(ICH9_LPC_PIRQE_ROUT_REG, 0x8080_8080);
+        config.set_writable_bits(ICH9_LPC_PIRQA_ROUT_REG, 0xffff_ffff);
+        config.set_writable_bits(ICH9_LPC_PIRQE_ROUT_REG, 0xffff_ffff);
+        // QEMU marks COM1 as decoded in ICH9 LPC config byte 0x82 when an
+        // ISA serial device is present at 0x3f8. OVMF consults this q35 LPC
+        // state while building its console path.
+        config.set_reg(ICH9_LPC_IO_DEC_REG, 0x0001_0000);
+        config.set_reg(ICH9_LPC_RCBA_REG, 0);
+        config.set_writable_bits(ICH9_LPC_RCBA_REG, 0xffff_c001);
+
+        PciLpcBridge { config }
+    }
+}
+
+impl BusDevice for PciLpcBridge {}
+
+impl PciDevice for PciLpcBridge {
+    fn write_config_register(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+        (
+            self.config.write_config_register(reg_idx, offset, data),
+            None,
+        )
+    }
+
+    fn read_config_register(&mut self, reg_idx: usize) -> u32 {
+        self.config.read_reg(reg_idx)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn id(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Minimal q35 ICH9 AHCI function at 00:1f.2.
+pub struct PciQ35Ahci {
+    config: PciConfiguration,
+}
+
+impl PciQ35Ahci {
+    pub fn new() -> Self {
+        let ahci_pi = AhciProgrammingInterface;
+        let mut config = PciConfiguration::new(
+            VENDOR_ID_INTEL,
+            DEVICE_ID_INTEL_ICH9_AHCI,
+            2,
+            PciClassCode::MassStorage,
+            &PciMassStorageSubclass::SataController,
+            Some(&ahci_pi),
+            PciHeaderType::Device,
+            0x1af4,
+            0x1100,
+            None,
+            None,
+        );
+        config.set_reg(
+            PCI_HEADER_TYPE_REG,
+            config.read_reg(PCI_HEADER_TYPE_REG) | PCI_HEADER_TYPE_MULTIFUNCTION,
+        );
+        config.set_reg(
+            PCI_COMMAND_STATUS_REG,
+            config.read_reg(PCI_COMMAND_STATUS_REG) | PCI_STATUS_CAPABILITIES,
+        );
+        config.set_reg(PCI_BAR4_REG, 0x0000_0001);
+        config.set_reg(PCI_CAPABILITY_LIST_REG, 0x0000_0080);
+        config.set_reg(PCI_INTERRUPT_REG, 0x0000_0100);
+        config.set_reg(ICH9_AHCI_MSI_CAP_REG, 0x0000_a805);
+        config.set_reg(ICH9_AHCI_SATA_CAP_REG, 0x0000_0012);
+
+        PciQ35Ahci { config }
+    }
+}
+
+impl BusDevice for PciQ35Ahci {}
+
+impl PciDevice for PciQ35Ahci {
+    fn write_config_register(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+        (
+            self.config.write_config_register(reg_idx, offset, data),
+            None,
+        )
+    }
+
+    fn read_config_register(&mut self, reg_idx: usize) -> u32 {
+        self.config.read_reg(reg_idx)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn id(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Minimal q35 ICH9 SMBus function at 00:1f.3.
+pub struct PciQ35Smbus {
+    config: PciConfiguration,
+}
+
+impl PciQ35Smbus {
+    pub fn new() -> Self {
+        let mut config = PciConfiguration::new(
+            VENDOR_ID_INTEL,
+            DEVICE_ID_INTEL_ICH9_SMBUS,
+            2,
+            PciClassCode::SerialBusController,
+            &PciSerialBusSubClass::Smbus,
+            None,
+            PciHeaderType::Device,
+            0x1af4,
+            0x1100,
+            None,
+            None,
+        );
+        config.set_reg(
+            PCI_HEADER_TYPE_REG,
+            config.read_reg(PCI_HEADER_TYPE_REG) | PCI_HEADER_TYPE_MULTIFUNCTION,
+        );
+        config.set_reg(PCI_BAR4_REG, 0x0000_0001);
+        config.set_reg(PCI_INTERRUPT_REG, 0x0000_0100);
+
+        PciQ35Smbus { config }
+    }
+}
+
+impl BusDevice for PciQ35Smbus {}
+
+impl PciDevice for PciQ35Smbus {
     fn write_config_register(
         &mut self,
         reg_idx: usize,
@@ -124,17 +377,17 @@ enum DeviceIdState {
 pub struct PciBus {
     /// Devices attached to this bus.
     /// Device 0 is host bridge.
-    devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>>,
+    devices: HashMap<(u8, u8), Arc<Mutex<dyn PciDevice>>>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: [DeviceIdState; NUM_DEVICE_IDS as usize],
 }
 
 impl PciBus {
     pub fn new(pci_root: PciRoot, device_reloc: Arc<dyn DeviceRelocation>) -> Self {
-        let mut devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>> = HashMap::new();
+        let mut devices: HashMap<(u8, u8), Arc<Mutex<dyn PciDevice>>> = HashMap::new();
         let mut device_ids = [DeviceIdState::Free; NUM_DEVICE_IDS as usize];
 
-        devices.insert(PCI_ROOT_DEVICE_ID, Arc::new(Mutex::new(pci_root)));
+        devices.insert((PCI_ROOT_DEVICE_ID, 0), Arc::new(Mutex::new(pci_root)));
         device_ids[PCI_ROOT_DEVICE_ID as usize] = DeviceIdState::Allocated;
 
         PciBus {
@@ -170,7 +423,20 @@ impl PciBus {
     }
 
     pub fn add_device(&mut self, device_id: u8, device: Arc<Mutex<dyn PciDevice>>) -> Result<()> {
-        self.devices.insert(device_id, device);
+        self.add_device_function(device_id, 0, device)
+    }
+
+    pub fn add_device_function(
+        &mut self,
+        device_id: u8,
+        function: u8,
+        device: Arc<Mutex<dyn PciDevice>>,
+    ) -> Result<()> {
+        if device_id >= NUM_DEVICE_IDS || function > 7 {
+            return Err(PciRootError::InvalidPciDeviceSlot(device_id as usize));
+        }
+
+        self.devices.insert((device_id, function), device);
         Ok(())
     }
 
@@ -288,17 +554,12 @@ impl PciConfigIo {
             return 0xffff_ffff;
         }
 
-        // Don't support multi-function devices.
-        if function > 0 {
-            return 0xffff_ffff;
-        }
-
         self.pci_bus
             .as_ref()
             .lock()
             .unwrap()
             .devices
-            .get(&(device as u8))
+            .get(&(device as u8, function as u8))
             .map_or(0xffff_ffff, |d| {
                 d.lock().unwrap().read_config_register(register)
             })
@@ -314,7 +575,7 @@ impl PciConfigIo {
             return None;
         }
 
-        let (bus, device, _function, register) =
+        let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
         // Only support one bus.
@@ -323,7 +584,7 @@ impl PciConfigIo {
         }
 
         let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        if let Some(d) = pci_bus.devices.get(&(device as u8, function as u8)) {
             let mut device = d.lock().unwrap();
 
             // Update the register value
@@ -423,7 +684,7 @@ impl PciConfigMmio {
     }
 
     fn config_space_read(&self, config_address: u32) -> u32 {
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
         // Only support one bus.
         if bus != 0 {
@@ -434,7 +695,7 @@ impl PciConfigMmio {
             .lock()
             .unwrap()
             .devices
-            .get(&(device as u8))
+            .get(&(device as u8, function as u8))
             .map_or(0xffff_ffff, |d| {
                 d.lock().unwrap().read_config_register(register)
             })
@@ -445,7 +706,7 @@ impl PciConfigMmio {
             return;
         }
 
-        let (bus, device, _function, register) = parse_mmio_config_address(config_address);
+        let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
         // Only support one bus.
         if bus != 0 {
@@ -453,7 +714,7 @@ impl PciConfigMmio {
         }
 
         let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.devices.get(&(device as u8)) {
+        if let Some(d) = pci_bus.devices.get(&(device as u8, function as u8)) {
             let mut device = d.lock().unwrap();
 
             // Update the register value
