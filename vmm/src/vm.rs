@@ -441,6 +441,11 @@ struct VmOpsHandler {
     #[cfg(target_arch = "x86_64")]
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
+    /// TDX-only: weak handle to the MemoryManager so the hypervisor
+    /// can drive RamDiscardListener notifications via VmOps without
+    /// taking a strong reference cycle.
+    #[cfg(feature = "tdx")]
+    memory_manager: std::sync::Weak<Mutex<MemoryManager>>,
 }
 
 impl VmOps for VmOpsHandler {
@@ -502,6 +507,18 @@ impl VmOps for VmOpsHandler {
             _ => {}
         }
         Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn notify_memory_state_change(&self, gpa: u64, size: u64, private: bool) {
+        if let Some(mm) = self.memory_manager.upgrade() {
+            // Lock is uncontended on the vcpu thread; held briefly to
+            // dispatch into the listener registry. Listeners do their
+            // own synchronization (e.g. VFIO ioctl).
+            mm.lock()
+                .unwrap()
+                .notify_memory_state_change(gpa, size, private);
+        }
     }
 }
 
@@ -599,6 +616,8 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             io_bus: io_bus.clone(),
             mmio_bus: mmio_bus.clone(),
+            #[cfg(feature = "tdx")]
+            memory_manager: Arc::downgrade(&memory_manager),
         });
 
         // Create CPU manager

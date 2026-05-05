@@ -4879,6 +4879,17 @@ impl cpu::Vcpu for KvmVcpu {
 }
 
 impl KvmVcpu {
+    /// TDX-only: fan out a guest page state change to the VMM listener
+    /// registry through `VmOps`. Best-effort: if `vm_ops` is absent
+    /// the call is a no-op (mirrors the rest of `KvmVcpu` which
+    /// gracefully handles a missing `vm_ops`).
+    #[cfg(feature = "tdx")]
+    fn notify_memory_state_change(&self, address: u64, size: u64, private: bool) {
+        if let Some(vm_ops) = &self.vm_ops {
+            vm_ops.notify_memory_state_change(address, size, private);
+        }
+    }
+
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     pub fn convert_guest_memory_region(
         &self,
@@ -4896,6 +4907,13 @@ impl KvmVcpu {
             cpu::HypervisorCpuError::RunVcpu(anyhow!("guest memory conversion range overflow"))
         })?;
 
+        // TDX-only: drop IOMMU mappings before the host backing for the
+        // range disappears.
+        #[cfg(feature = "tdx")]
+        if private {
+            self.notify_memory_state_change(address, size, true);
+        }
+
         let Some(guest_mem_slots) = &self.guest_mem_slots else {
             self.vm_fd
                 .set_memory_attributes(kvm_memory_attributes {
@@ -4905,6 +4923,14 @@ impl KvmVcpu {
                     flags: 0,
                 })
                 .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+            // TDX-only: pages just became shared; let listeners
+            // populate IOMMU mappings before we punch the private
+            // backing.
+            #[cfg(feature = "tdx")]
+            if !private {
+                self.notify_memory_state_change(address, size, false);
+            }
 
             if !private {
                 self.punch_hole_guest_memfd(address, size)?;
@@ -4938,6 +4964,12 @@ impl KvmVcpu {
                     flags: 0,
                 })
                 .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+            // TDX-only: full range is now shared in KVM; notify
+            // listeners so they can DMA-map the host VA before we
+            // start punching the per-slot private backing.
+            #[cfg(feature = "tdx")]
+            self.notify_memory_state_change(address, size, false);
         }
 
         if slots.is_empty() {
@@ -5037,18 +5069,43 @@ impl KvmVcpu {
                     cpu::HypervisorCpuError::RunVcpu(anyhow!("userspace address overflow"))
                 })?;
             let length = discard_end - discard_start;
+
+            // P4.5: punch a hole in the shared backend so the
+            // file-backed (memfd / hugetlbfs) blocks are actually
+            // released, mirroring QEMU's `ram_block_discard_range`.
+            // MADV_REMOVE is equivalent to fallocate(PUNCH_HOLE) on
+            // the underlying file. For anonymous backings the kernel
+            // returns EINVAL; fall back to MADV_DONTNEED in that
+            // case so anon-shared CH guests keep working.
             let ret = unsafe {
                 libc::madvise(
                     host_addr as *mut libc::c_void,
                     length as libc::size_t,
-                    libc::MADV_DONTNEED,
+                    libc::MADV_REMOVE,
                 )
             };
             if ret != 0 {
-                return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                    "userspace memory discard failed: {}",
-                    std::io::Error::last_os_error()
-                )));
+                let err = std::io::Error::last_os_error();
+                let raw = err.raw_os_error().unwrap_or(0);
+                if raw == libc::EINVAL || raw == libc::ENOSYS || raw == libc::EOPNOTSUPP {
+                    let ret2 = unsafe {
+                        libc::madvise(
+                            host_addr as *mut libc::c_void,
+                            length as libc::size_t,
+                            libc::MADV_DONTNEED,
+                        )
+                    };
+                    if ret2 != 0 {
+                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                            "userspace memory discard failed (MADV_DONTNEED fallback): {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                } else {
+                    return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "userspace memory discard failed (MADV_REMOVE): {err}"
+                    )));
+                }
             }
         }
 

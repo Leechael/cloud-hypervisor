@@ -130,6 +130,8 @@ use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
+#[cfg(feature = "tdx")]
+use crate::memory_manager::ram_discard::RamDiscardListener;
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(feature = "ivshmem")]
@@ -1240,6 +1242,40 @@ fn use_64bit_bar_for_virtio_device(
     is_hotplug: bool,
 ) -> bool {
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
+}
+
+/// TDX-only: bridges `RamDiscardListener` into a `VfioOps` instance.
+///
+/// On `notify_populate` the listener installs an IOMMU mapping for the
+/// freshly-shared range; on `notify_discard` it tears it down before
+/// the host backing is released. The listener does *not* own the
+/// VFIO container — it merely calls into the existing `VfioOps`
+/// shared with `add_vfio_device`.
+#[cfg(feature = "tdx")]
+struct VfioRamDiscardListener {
+    vfio_ops: Arc<dyn VfioOps>,
+}
+
+#[cfg(feature = "tdx")]
+impl RamDiscardListener for VfioRamDiscardListener {
+    fn notify_populate(&self, gpa: u64, host_va: u64, size: u64) -> std::io::Result<()> {
+        // SAFETY: guest RAM at `host_va` is owned by MemoryManager and
+        // remains mapped for the VM's lifetime; VFIO read/writes via
+        // DMA are otherwise unsynchronized which is the existing
+        // contract for `vfio_dma_map`.
+        unsafe { self.vfio_ops.vfio_dma_map(gpa, size as usize, host_va as *mut u8) }.map_err(
+            |e| std::io::Error::other(format!("vfio_dma_map gpa={gpa:#x} size={size:#x}: {e}")),
+        )
+    }
+
+    fn notify_discard(&self, gpa: u64, size: u64) {
+        if let Err(e) = self.vfio_ops.vfio_dma_unmap(gpa, size as usize) {
+            warn!(
+                "VfioRamDiscardListener::notify_discard: vfio_dma_unmap gpa={gpa:#x} \
+                 size={size:#x}: {e}"
+            );
+        }
+    }
 }
 
 impl DeviceManager {
@@ -4184,24 +4220,58 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::VfioCreate)?;
 
         if needs_dma_mapping {
-            // Register DMA mapping in IOMMU.
-            // Do not register virtio-mem regions, as they are handled directly by
-            // virtio-mem device itself.
-            for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
-                for region in zone.regions() {
-                    // vfio_dma_map is unsound and ought to be marked as unsafe
-                    #[allow(unused_unsafe)]
-                    // SAFETY: GuestMemoryMmap guarantees that region points
-                    // to len bytes of valid memory starting at as_ptr()
-                    // that will only be freed with munmap().
-                    unsafe {
-                        vfio_ops.vfio_dma_map(
-                            region.start_addr().raw_value(),
-                            region.len() as usize,
-                            region.as_ptr(),
-                        )
+            // TDX-only: when guest_memfd is in use, RAM starts fully
+            // private; eager DMA-mapping every region would either
+            // fail (private pages can't be IOMMU-mapped) or pin pages
+            // the host can't access. Instead, register a
+            // RamDiscardListener that maps/unmaps in lockstep with
+            // share/private transitions. Non-TDX guests keep the
+            // existing eager-mapping behavior.
+            #[cfg(feature = "tdx")]
+            let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();
+            #[cfg(not(feature = "tdx"))]
+            let tdx_enabled = false;
+
+            if !tdx_enabled {
+                // Register DMA mapping in IOMMU.
+                // Do not register virtio-mem regions, as they are handled directly by
+                // virtio-mem device itself.
+                for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
+                    for region in zone.regions() {
+                        // vfio_dma_map is unsound and ought to be marked as unsafe
+                        #[allow(unused_unsafe)]
+                        // SAFETY: GuestMemoryMmap guarantees that region points
+                        // to len bytes of valid memory starting at as_ptr()
+                        // that will only be freed with munmap().
+                        unsafe {
+                            vfio_ops.vfio_dma_map(
+                                region.start_addr().raw_value(),
+                                region.len() as usize,
+                                region.as_ptr(),
+                            )
+                        }
+                        .map_err(DeviceManagerError::VfioDmaMap)?;
                     }
-                    .map_err(DeviceManagerError::VfioDmaMap)?;
+                }
+            } else {
+                #[cfg(feature = "tdx")]
+                {
+                    let listener: Arc<dyn RamDiscardListener> =
+                        Arc::new(VfioRamDiscardListener {
+                            vfio_ops: Arc::clone(&vfio_ops),
+                        });
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .register_ram_discard_listener(listener)
+                        .map_err(|e| {
+                            DeviceManagerError::VfioDmaMap(vfio_ioctls::VfioError::IommuDmaMap(
+                                vmm_sys_util::errno::Error::new(
+                                    e.raw_os_error().unwrap_or(libc::EIO),
+                                ),
+                            ))
+                        })?;
+                    info!("TDX: registered VfioRamDiscardListener instead of eager DMA-map");
                 }
             }
 

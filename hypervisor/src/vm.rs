@@ -507,4 +507,17 @@ pub trait VmOps: Send + Sync {
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> Result<()>;
+    /// TDX-only: hook called by the hypervisor whenever a guest page
+    /// range flips between shared and private. The VMM uses this to
+    /// drive `RamDiscardListener` notifications (e.g. VFIO IOMMU
+    /// updates) in lock-step with `KVM_SET_MEMORY_ATTRIBUTES`.
+    ///
+    /// `private == true` means the range is about to become private
+    /// (host-inaccessible); listeners are notified *before* the host
+    /// backing is punched out. `private == false` means the range
+    /// just became shared; listeners are notified *after*
+    /// `set_memory_attributes` has acknowledged the flip so the host
+    /// VA is safe to map.
+    #[cfg(feature = "tdx")]
+    fn notify_memory_state_change(&self, _gpa: u64, _size: u64, _private: bool) {}
 }
