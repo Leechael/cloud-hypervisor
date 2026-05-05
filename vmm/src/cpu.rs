@@ -338,6 +338,20 @@ struct LocalX2Apic {
     pub processor_id: u32,
 }
 
+/// Local x2APIC NMI structure. See ACPI spec section 5.2.12.13.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct LocalX2ApicNmi {
+    pub r#type: u8,
+    pub length: u8,
+    pub flags: u16,
+    pub processor_uid: u32,
+    pub local_x2apic_lint: u8,
+    pub _reserved: [u8; 3],
+}
+
 #[allow(dead_code)]
 #[repr(C, packed)]
 #[derive(Default, IntoBytes, Immutable, FromBytes)]
@@ -2130,14 +2144,39 @@ impl CpuManager {
                 ..Default::default()
             });
 
+            // PIT IRQ0 is routed to IOAPIC GSI 2 on q35. flags=0 (active high,
+            // edge trigger) matches QEMU's standard MADT for PC platforms.
             madt.append(InterruptSourceOverride {
                 r#type: acpi::ACPI_APIC_XRUPT_OVERRIDE,
                 length: 10,
                 bus: 0,
-                source: 4,
-                gsi: 4,
+                source: 0,
+                gsi: 2,
                 flags: 0,
             });
+
+            // ACPI SCI on IRQ9: active high, level triggered. Polarity=01
+            // (active high), Trigger=11 (level) -> flags = 0xd.
+            madt.append(InterruptSourceOverride {
+                r#type: acpi::ACPI_APIC_XRUPT_OVERRIDE,
+                length: 10,
+                bus: 0,
+                source: 9,
+                gsi: 9,
+                flags: 0xd,
+            });
+
+            // One Local x2APIC NMI structure per vCPU wiring NMI to LINT1.
+            for cpu in 0..self.config.max_vcpus {
+                madt.append(LocalX2ApicNmi {
+                    r#type: acpi::ACPI_X2APIC_LOCAL_NMI,
+                    length: 12,
+                    flags: 0,
+                    processor_uid: cpu,
+                    local_x2apic_lint: 1,
+                    _reserved: [0; 3],
+                });
+            }
         }
 
         #[cfg(target_arch = "aarch64")]

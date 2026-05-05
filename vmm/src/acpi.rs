@@ -34,6 +34,9 @@ pub const ACPI_X2APIC_PROCESSOR: u8 = 9;
 pub const ACPI_APIC_IO: u8 = 1;
 #[cfg(target_arch = "x86_64")]
 pub const ACPI_APIC_XRUPT_OVERRIDE: u8 = 2;
+/// ACPI Local x2APIC NMI structure type. See ACPI spec section 5.2.12.13.
+#[cfg(target_arch = "x86_64")]
+pub const ACPI_X2APIC_LOCAL_NMI: u8 = 0x0a;
 #[cfg(target_arch = "aarch64")]
 pub const ACPI_APIC_GENERIC_CPU_INTERFACE: u8 = 11;
 #[cfg(target_arch = "aarch64")]
