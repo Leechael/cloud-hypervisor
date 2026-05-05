@@ -12,6 +12,7 @@
 /// No kernel requirement if above functionality is not required,
 /// only firmware must implement mechanism to interact with this fw_cfg device
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{ErrorKind, Read, Result, Seek, SeekFrom},
     mem::offset_of,
@@ -19,23 +20,20 @@ use std::{
     sync::{Arc, Barrier},
 };
 
-use acpi_tables::rsdp::Rsdp;
+#[cfg(target_arch = "aarch64")]
 use arch::RegionType;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::layout::{
     MEM_32BIT_DEVICES_START, MEM_32BIT_RESERVED_START, RAM_64BIT_START, RAM_START as HIGH_RAM_START,
 };
 #[cfg(target_arch = "x86_64")]
-use arch::layout::{
-    EBDA_START, HIGH_RAM_START, MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START,
-    MEM_32BIT_RESERVED_START, PCI_MMCONFIG_SIZE, PCI_MMCONFIG_START, RAM_64BIT_START,
-};
+use arch::layout::{MEM_32BIT_DEVICES_START, RAM_64BIT_START};
 use bitfield_struct::bitfield;
 #[cfg(target_arch = "x86_64")]
 use linux_loader::bootparam::boot_params;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::arm64_image_header as boot_params;
-use log::{debug, error};
+use log::{debug, error, info};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{
@@ -44,13 +42,12 @@ use vm_memory::{
 use vmm_sys_util::sock_ctrl_msg::IntoIovec;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
-#[cfg(target_arch = "x86_64")]
-// https://github.com/project-oak/oak/tree/main/stage0_bin#memory-layout
-const STAGE0_START_ADDRESS: GuestAddress = GuestAddress(0xfffe_0000);
-#[cfg(target_arch = "x86_64")]
-const STAGE0_SIZE: usize = 0x2_0000;
 const E820_RAM: u32 = 1;
 const E820_RESERVED: u32 = 2;
+#[cfg(target_arch = "x86_64")]
+const KVM_IDENTITY_MAP_START: GuestAddress = GuestAddress(0xfeff_c000);
+#[cfg(target_arch = "x86_64")]
+const KVM_IDENTITY_MAP_SIZE: usize = 0x4000;
 
 #[cfg(target_arch = "x86_64")]
 const PORT_FW_CFG_SELECTOR: u64 = 0x510;
@@ -79,19 +76,42 @@ pub const PORT_FW_CFG_WIDTH: u64 = 0x10;
 
 const FW_CFG_SIGNATURE: u16 = 0x00;
 const FW_CFG_ID: u16 = 0x01;
+const FW_CFG_UUID: u16 = 0x02;
+const FW_CFG_RAM_SIZE: u16 = 0x03;
+const FW_CFG_NOGRAPHIC: u16 = 0x04;
+const FW_CFG_NB_CPUS: u16 = 0x05;
+const FW_CFG_KERNEL_ADDR: u16 = 0x07;
 const FW_CFG_KERNEL_SIZE: u16 = 0x08;
+const FW_CFG_BOOT_DEVICE: u16 = 0x0c;
+const FW_CFG_NUMA: u16 = 0x0d;
+const FW_CFG_BOOT_MENU: u16 = 0x0e;
+const FW_CFG_MAX_CPUS: u16 = 0x0f;
+const FW_CFG_KERNEL_ENTRY: u16 = 0x10;
+const FW_CFG_INITRD_ADDR: u16 = 0x0a;
 const FW_CFG_INITRD_SIZE: u16 = 0x0b;
 const FW_CFG_KERNEL_DATA: u16 = 0x11;
 const FW_CFG_INITRD_DATA: u16 = 0x12;
+const FW_CFG_CMDLINE_ADDR: u16 = 0x13;
 const FW_CFG_CMDLINE_SIZE: u16 = 0x14;
 const FW_CFG_CMDLINE_DATA: u16 = 0x15;
+const FW_CFG_SETUP_ADDR: u16 = 0x16;
 const FW_CFG_SETUP_SIZE: u16 = 0x17;
 const FW_CFG_SETUP_DATA: u16 = 0x18;
 const FW_CFG_FILE_DIR: u16 = 0x19;
 const FW_CFG_KNOWN_ITEMS: usize = 0x20;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_ARCH_LOCAL: u16 = 0x8000;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_ACPI_TABLES: u16 = FW_CFG_ARCH_LOCAL;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_IRQ0_OVERRIDE: u16 = FW_CFG_ARCH_LOCAL + 2;
+#[cfg(target_arch = "x86_64")]
+const FW_CFG_HPET: u16 = FW_CFG_ARCH_LOCAL + 4;
+#[cfg(target_arch = "x86_64")]
+const HPET_FW_CONFIG_SIZE: usize = 1 + 8 * (4 + 8 + 2 + 1);
 
 pub const FW_CFG_FILE_FIRST: u16 = 0x20;
-pub const FW_CFG_DMA_SIGNATURE: [u8; 8] = *b"QEMU CFG";
+pub const FW_CFG_SIGNATURE_VALUE: [u8; 4] = *b"QEMU";
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h
 pub const FW_CFG_ACPI_ID: &str = "QEMU0002";
 // Reserved (must be enabled)
@@ -108,8 +128,18 @@ const ALLOC_ZONE_HIGH: u8 = 0x1;
 const ALLOC_ZONE_FSEG: u8 = 0x2;
 
 const FW_CFG_FILENAME_TABLE_LOADER: &str = "etc/table-loader";
-const FW_CFG_FILENAME_RSDP: &str = "acpi/rsdp";
-const FW_CFG_FILENAME_ACPI_TABLES: &str = "acpi/tables";
+const FW_CFG_FILENAME_RSDP: &str = "etc/acpi/rsdp";
+const FW_CFG_FILENAME_ACPI_TABLES: &str = "etc/acpi/tables";
+#[cfg(target_arch = "x86_64")]
+const Q35_ACPI_TABLE_LOADER_SIZE: usize = 0x1000;
+#[cfg(target_arch = "x86_64")]
+const Q35_ACPI_TABLES_SIZE: usize = 0x2_0000;
+#[cfg(target_arch = "x86_64")]
+const Q35_ACPI_DATA_RESERVED_SIZE: usize = Q35_ACPI_TABLES_SIZE + 0x8000;
+#[cfg(target_arch = "x86_64")]
+const Q35_SMBIOS_ANCHOR_SIZE: usize = 0x18;
+#[cfg(target_arch = "x86_64")]
+const Q35_SMBIOS_TABLES_SIZE: usize = 0x13b;
 
 #[derive(Debug)]
 pub enum FwCfgContent {
@@ -178,17 +208,32 @@ pub struct FwCfgItem {
 }
 
 /// https://www.qemu.org/docs/master/specs/fw_cfg.html
-#[derive(Debug)]
 pub struct FwCfg {
     selector: u16,
     data_offset: u32,
     dma_address: u64,
     items: Vec<FwCfgItem>,                           // 0x20 and above
     known_items: [FwCfgContent; FW_CFG_KNOWN_ITEMS], // 0x0 to 0x19
+    arch_known_items: BTreeMap<u16, FwCfgContent>,
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
     /// Optional hook called before fw_cfg DMA read/write.
     /// Arguments: (guest_address, length)
     pub dma_pre_hook: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for FwCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FwCfg")
+            .field("selector", &self.selector)
+            .field("data_offset", &self.data_offset)
+            .field("dma_address", &self.dma_address)
+            .field("items", &self.items)
+            .field("known_items", &self.known_items)
+            .field("arch_known_items", &self.arch_known_items)
+            .field("memory", &self.memory)
+            .field("dma_pre_hook", &self.dma_pre_hook.is_some())
+            .finish()
+    }
 }
 
 #[repr(C)]
@@ -206,20 +251,16 @@ struct AccessControl {
     error: bool,
     // FW_CFG_DMA_CTL_READ = 0x02
     read: bool,
-    #[bits(1)]
-    _unused2: u8,
     // FW_CFG_DMA_CTL_SKIP = 0x04
     skip: bool,
-    #[bits(3)]
-    _unused3: u8,
-    // FW_CFG_DMA_CTL_ERROR = 0x08
+    // FW_CFG_DMA_CTL_SELECT = 0x08
     select: bool,
-    #[bits(7)]
-    _unused4: u8,
     // FW_CFG_DMA_CTL_WRITE = 0x10
     write: bool,
+    #[bits(11)]
+    _reserved: u16,
     #[bits(16)]
-    _unused: u32,
+    selector: u16,
 }
 
 #[repr(C)]
@@ -324,14 +365,14 @@ struct AcpiTableHeader {
 }
 
 struct AcpiTable {
-    rsdp: Rsdp,
+    rsdp: Vec<u8>,
     tables: Vec<u8>,
-    table_pointers: Vec<usize>,
+    table_pointers: Vec<(usize, u8)>,
     table_checksums: Vec<(usize, usize)>,
 }
 
 impl AcpiTable {
-    fn pointers(&self) -> &[usize] {
+    fn pointers(&self) -> &[(usize, u8)] {
         &self.table_pointers
     }
 
@@ -339,19 +380,19 @@ impl AcpiTable {
         &self.table_checksums
     }
 
-    fn take(self) -> (Rsdp, Vec<u8>) {
+    fn take(self) -> (Vec<u8>, Vec<u8>) {
         (self.rsdp, self.tables)
     }
 }
 
 // Creates fw_cfg items used by firmware to load and verify Acpi tables
 // https://github.com/qemu/qemu/blob/master/hw/acpi/bios-linker-loader.c
-fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
+fn create_acpi_loader(mut acpi_table: AcpiTable) -> [FwCfgItem; 3] {
     let mut table_loader_bytes: Vec<u8> = Vec::new();
     let allocate_rsdp = Allocate {
         command: COMMAND_ALLOCATE,
         file: create_file_name(FW_CFG_FILENAME_RSDP),
-        align: 4,
+        align: 16,
         zone: ALLOC_ZONE_FSEG,
         _pad: [0; 63],
     };
@@ -366,50 +407,69 @@ fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
     };
     table_loader_bytes.extend(allocate_tables.as_bytes());
 
-    for pointer_offset in acpi_table.pointers().iter() {
-        let pointer = create_intra_pointer(FW_CFG_FILENAME_ACPI_TABLES, *pointer_offset, 8);
+    for (pointer_offset, pointer_size) in acpi_table.pointers().iter() {
+        let pointer =
+            create_intra_pointer(FW_CFG_FILENAME_ACPI_TABLES, *pointer_offset, *pointer_size);
         table_loader_bytes.extend(pointer.as_bytes());
     }
-    for (offset, len) in acpi_table.checksums().iter() {
+    let table_checksums = acpi_table.checksums().to_vec();
+    for (offset, len) in table_checksums.iter() {
+        acpi_table.tables[*offset + offset_of!(AcpiTableHeader, checksum)] = 0;
         let checksum = create_acpi_table_checksum(*offset, *len);
         table_loader_bytes.extend(checksum.as_bytes());
     }
-    let pointer_rsdp_to_xsdt = AddPointer {
+    let (mut rsdp, tables) = acpi_table.take();
+    rsdp[8] = 0;
+    if rsdp.len() > 20 {
+        rsdp[32] = 0;
+    }
+    let (rsdp_pointer_offset, rsdp_pointer_size) = if rsdp.len() <= 20 { (16, 4) } else { (24, 8) };
+    let pointer_rsdp_to_root = AddPointer {
         command: COMMAND_ADD_POINTER,
         dst: create_file_name(FW_CFG_FILENAME_RSDP),
         src: create_file_name(FW_CFG_FILENAME_ACPI_TABLES),
-        offset: offset_of!(Rsdp, xsdt_addr) as u32,
-        size: 8,
+        offset: rsdp_pointer_offset,
+        size: rsdp_pointer_size,
         _pad: [0; 7],
     };
-    table_loader_bytes.extend(pointer_rsdp_to_xsdt.as_bytes());
+    table_loader_bytes.extend(pointer_rsdp_to_root.as_bytes());
     let checksum_rsdp = AddChecksum {
         command: COMMAND_ADD_CHECKSUM,
         file: create_file_name(FW_CFG_FILENAME_RSDP),
-        offset: offset_of!(Rsdp, checksum) as u32,
+        offset: 8,
         start: 0,
-        len: offset_of!(Rsdp, length) as u32,
-        _pad: [0; 56],
-    };
-    let checksum_rsdp_ext = AddChecksum {
-        command: COMMAND_ADD_CHECKSUM,
-        file: create_file_name(FW_CFG_FILENAME_RSDP),
-        offset: offset_of!(Rsdp, extended_checksum) as u32,
-        start: 0,
-        len: size_of::<Rsdp>() as u32,
+        len: 20,
         _pad: [0; 56],
     };
     table_loader_bytes.extend(checksum_rsdp.as_bytes());
-    table_loader_bytes.extend(checksum_rsdp_ext.as_bytes());
+    if rsdp.len() > 20 {
+        let checksum_rsdp_ext = AddChecksum {
+            command: COMMAND_ADD_CHECKSUM,
+            file: create_file_name(FW_CFG_FILENAME_RSDP),
+            offset: 32,
+            start: 0,
+            len: rsdp.len() as u32,
+            _pad: [0; 56],
+        };
+        table_loader_bytes.extend(checksum_rsdp_ext.as_bytes());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    table_loader_bytes.resize(Q35_ACPI_TABLE_LOADER_SIZE, 0);
 
     let table_loader = FwCfgItem {
         name: FW_CFG_FILENAME_TABLE_LOADER.to_owned(),
         content: FwCfgContent::Bytes(table_loader_bytes),
     };
-    let (rsdp, tables) = acpi_table.take();
     let acpi_rsdp = FwCfgItem {
         name: FW_CFG_FILENAME_RSDP.to_owned(),
-        content: FwCfgContent::Bytes(rsdp.as_bytes().to_owned()),
+        content: FwCfgContent::Bytes(rsdp),
+    };
+    #[cfg(target_arch = "x86_64")]
+    let tables = {
+        let mut padded = tables;
+        padded.resize(Q35_ACPI_TABLES_SIZE, 0);
+        padded
     };
     let apci_tables = FwCfgItem {
         name: FW_CFG_FILENAME_ACPI_TABLES.to_owned(),
@@ -418,14 +478,120 @@ fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
     [table_loader, acpi_rsdp, apci_tables]
 }
 
+#[cfg(target_arch = "x86_64")]
+fn smbios_checksum(bytes: &mut [u8]) {
+    let checksum = bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    bytes[5] = (0u8).wrapping_sub(checksum);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smbios_table(type_: u8, handle: u16, formatted: &[u8], strings: &[&str]) -> Vec<u8> {
+    let mut table = Vec::with_capacity(4 + formatted.len() + 2);
+    table.push(type_);
+    table.push((4 + formatted.len()) as u8);
+    table.extend_from_slice(&handle.to_le_bytes());
+    table.extend_from_slice(formatted);
+
+    if strings.is_empty() {
+        table.extend_from_slice(&[0, 0]);
+    } else {
+        for string in strings {
+            table.extend_from_slice(string.as_bytes());
+            table.push(0);
+        }
+        table.push(0);
+    }
+
+    table
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_qemu_compat_smbios() -> (Vec<u8>, Vec<u8>) {
+    let mut tables = Vec::new();
+
+    let mut bios_info = vec![0u8; 0x18 - 4];
+    bios_info[0] = 1;
+    bios_info[1] = 2;
+    bios_info[2..4].copy_from_slice(&0xe800u16.to_le_bytes());
+    bios_info[4] = 3;
+    tables.extend_from_slice(&smbios_table(
+        0,
+        0x0000,
+        &bios_info,
+        &["EDK II", "QEMU", "01/01/2026"],
+    ));
+
+    let mut system_info = vec![0u8; 0x1b - 4];
+    system_info[0] = 1;
+    system_info[1] = 2;
+    system_info[0x14] = 0x06;
+    tables.extend_from_slice(&smbios_table(
+        1,
+        0x0100,
+        &system_info,
+        &["minimal-tdx", "payload-initramfs"],
+    ));
+
+    tables.extend_from_slice(&smbios_table(127, 0x7f00, &[], &[]));
+    tables.resize(Q35_SMBIOS_TABLES_SIZE, 0);
+
+    let mut anchor = vec![0u8; Q35_SMBIOS_ANCHOR_SIZE];
+    anchor[0..5].copy_from_slice(b"_SM3_");
+    anchor[6] = Q35_SMBIOS_ANCHOR_SIZE as u8;
+    anchor[7] = 1;
+    anchor[8] = 3;
+    anchor[9] = 0;
+    anchor[10] = 0;
+    anchor[12..16].copy_from_slice(&(tables.len() as u32).to_le_bytes());
+    smbios_checksum(&mut anchor);
+
+    (anchor, tables)
+}
+
 impl FwCfg {
+    #[cfg(target_arch = "x86_64")]
+    fn update_setup_data<F>(&mut self, update: F)
+    where
+        F: FnOnce(&mut boot_params),
+    {
+        if let FwCfgContent::Bytes(buffer) = &mut self.known_items[FW_CFG_SETUP_DATA as usize] {
+            if buffer.len() >= size_of::<boot_params>() {
+                let bp =
+                    boot_params::from_mut_slice(&mut buffer[..size_of::<boot_params>()]).unwrap();
+                update(bp);
+            }
+        }
+    }
+
     pub fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> FwCfg {
         const DEFAULT_ITEM: FwCfgContent = FwCfgContent::Slice(&[]);
         let mut known_items = [DEFAULT_ITEM; FW_CFG_KNOWN_ITEMS];
-        known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_DMA_SIGNATURE);
+        known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_SIGNATURE_VALUE);
         known_items[FW_CFG_ID as usize] = FwCfgContent::Slice(&FW_CFG_FEATURE);
+        known_items[FW_CFG_UUID as usize] = FwCfgContent::Bytes(vec![0; 16]);
+        known_items[FW_CFG_NOGRAPHIC as usize] = FwCfgContent::Bytes(1u16.to_le_bytes().to_vec());
+        known_items[FW_CFG_NB_CPUS as usize] = FwCfgContent::Bytes(1u16.to_le_bytes().to_vec());
+        known_items[FW_CFG_BOOT_DEVICE as usize] = FwCfgContent::Bytes(0u16.to_le_bytes().to_vec());
+        known_items[FW_CFG_NUMA as usize] = FwCfgContent::Bytes(vec![0; 16]);
+        known_items[FW_CFG_BOOT_MENU as usize] = FwCfgContent::Bytes(0u16.to_le_bytes().to_vec());
+        known_items[FW_CFG_MAX_CPUS as usize] = FwCfgContent::Bytes(1u16.to_le_bytes().to_vec());
+        known_items[FW_CFG_KERNEL_ENTRY as usize] = FwCfgContent::U32(0);
         let file_buf = Vec::from(FwCfgFilesHeader { count_be: 0 }.as_mut_bytes());
         known_items[FW_CFG_FILE_DIR as usize] = FwCfgContent::Bytes(file_buf);
+
+        let mut arch_known_items = BTreeMap::new();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut hpet_config = vec![0; HPET_FW_CONFIG_SIZE];
+            hpet_config[0] = u8::MAX;
+
+            arch_known_items.insert(FW_CFG_ACPI_TABLES, FwCfgContent::Bytes(Vec::new()));
+            arch_known_items.insert(
+                FW_CFG_IRQ0_OVERRIDE,
+                FwCfgContent::Bytes(1u32.to_le_bytes().to_vec()),
+            );
+            arch_known_items.insert(FW_CFG_HPET, FwCfgContent::Bytes(hpet_config));
+        }
 
         FwCfg {
             selector: 0,
@@ -433,6 +599,7 @@ impl FwCfg {
             dma_address: 0,
             items: vec![],
             known_items,
+            arch_known_items,
             memory,
             dma_pre_hook: None,
         }
@@ -446,7 +613,14 @@ impl FwCfg {
         cmdline: Option<std::ffi::CString>,
         fw_cfg_item_list: Option<Vec<FwCfgItem>>,
     ) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        self.add_qemu_compat_files()?;
         if let Some(mem_size) = mem_size {
+            #[cfg(target_arch = "x86_64")]
+            {
+                self.known_items[FW_CFG_RAM_SIZE as usize] =
+                    FwCfgContent::Bytes((mem_size as u64).to_le_bytes().to_vec());
+            }
             self.add_e820(mem_size)?;
         }
         if let Some(kernel) = kernel {
@@ -456,7 +630,7 @@ impl FwCfg {
             self.add_kernel_cmdline(cmdline);
         }
         if let Some(initramfs) = initramfs {
-            self.add_initramfs_data(&initramfs)?;
+            self.add_initramfs_data(&initramfs, mem_size)?;
         }
         if let Some(fw_cfg_item_list) = fw_cfg_item_list {
             for item in fw_cfg_item_list {
@@ -468,47 +642,76 @@ impl FwCfg {
 
     pub fn add_e820(&mut self, mem_size: usize) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
-        let mut mem_regions = vec![
-            (GuestAddress(0), EBDA_START.0 as usize, RegionType::Ram),
-            (
-                MEM_32BIT_DEVICES_START,
-                MEM_32BIT_DEVICES_SIZE as usize,
-                RegionType::Reserved,
-            ),
-            (
-                PCI_MMCONFIG_START,
-                PCI_MMCONFIG_SIZE as usize,
-                RegionType::Reserved,
-            ),
-            (STAGE0_START_ADDRESS, STAGE0_SIZE, RegionType::Reserved),
-        ];
+        let mut mem_regions = {
+            // Match QEMU/KVM's fw_cfg e820 handoff: the KVM identity-map/TSS
+            // pages are advertised first, then the low RAM alias is exposed as
+            // one contiguous entry. OVMF uses this data for legacy INT 15
+            // services that linuxboot_dma relies on.
+            let mut regions = vec![(KVM_IDENTITY_MAP_START, KVM_IDENTITY_MAP_SIZE, E820_RESERVED)];
+            let below_4g = std::cmp::min(mem_size as u64, MEM_32BIT_DEVICES_START.0) as usize;
+            regions.push((GuestAddress(0), below_4g, E820_RAM));
+            regions
+        };
         #[cfg(target_arch = "aarch64")]
         let mut mem_regions = arch::aarch64::arch_memory_regions();
-        if mem_size < MEM_32BIT_DEVICES_START.0 as usize {
-            mem_regions.push((
-                HIGH_RAM_START,
-                mem_size - HIGH_RAM_START.0 as usize,
-                RegionType::Ram,
-            ));
-        } else {
-            mem_regions.push((
-                HIGH_RAM_START,
-                MEM_32BIT_RESERVED_START.0 as usize - HIGH_RAM_START.0 as usize,
-                RegionType::Ram,
-            ));
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if mem_size < MEM_32BIT_DEVICES_START.0 as usize {
+                mem_regions.push((
+                    HIGH_RAM_START,
+                    mem_size - HIGH_RAM_START.0 as usize,
+                    RegionType::Ram,
+                ));
+            } else {
+                mem_regions.push((
+                    HIGH_RAM_START,
+                    MEM_32BIT_RESERVED_START.0 as usize - HIGH_RAM_START.0 as usize,
+                    RegionType::Ram,
+                ));
+                mem_regions.push((
+                    MEM_32BIT_DEVICES_START,
+                    MEM_32BIT_DEVICES_SIZE as usize,
+                    RegionType::Reserved,
+                ));
+                mem_regions.push((
+                    PCI_MMCONFIG_START,
+                    PCI_MMCONFIG_SIZE as usize,
+                    RegionType::Reserved,
+                ));
+            }
+        }
+
+        if mem_size >= MEM_32BIT_DEVICES_START.0 as usize {
+            #[cfg(target_arch = "aarch64")]
             mem_regions.push((
                 RAM_64BIT_START,
                 mem_size - (MEM_32BIT_DEVICES_START.0 as usize),
                 RegionType::Ram,
             ));
+
+            #[cfg(target_arch = "x86_64")]
+            mem_regions.push((
+                RAM_64BIT_START,
+                mem_size - (MEM_32BIT_DEVICES_START.0 as usize),
+                E820_RAM,
+            ));
         }
+
         let mut bytes = vec![];
-        for (addr, size, region) in mem_regions.iter() {
-            let type_ = match region {
+        for (addr, size, type_) in mem_regions.iter() {
+            #[cfg(target_arch = "aarch64")]
+            let type_ = match type_ {
                 RegionType::Ram => E820_RAM,
                 RegionType::Reserved => E820_RESERVED,
                 RegionType::SubRegion => continue,
             };
+            #[cfg(target_arch = "x86_64")]
+            let type_ = *type_;
+            info!(
+                "fw_cfg: e820 addr={:#x} size={:#x} type={}",
+                addr.0, size, type_
+            );
             let mut entry = BootE820Entry {
                 addr: addr.0,
                 size: *size as u64,
@@ -537,20 +740,142 @@ impl FwCfg {
         self.file_dir_mut()[0..4].copy_from_slice(header.as_mut_bytes());
     }
 
+    fn rebuild_file_dir(&mut self) -> Result<()> {
+        let mut file_buf = Vec::from(
+            FwCfgFilesHeader {
+                count_be: (self.items.len() as u32).to_be(),
+            }
+            .as_mut_bytes(),
+        );
+
+        for (index, item) in self.items.iter().enumerate() {
+            let c_name = create_file_name(&item.name);
+            let size = item.content.size()?;
+            let mut cfg_file = FwCfgFile {
+                size_be: size.to_be(),
+                select_be: (FW_CFG_FILE_FIRST + index as u16).to_be(),
+                _reserved: 0,
+                name: c_name,
+            };
+            file_buf.extend_from_slice(cfg_file.as_mut_bytes());
+        }
+
+        self.known_items[FW_CFG_FILE_DIR as usize] = FwCfgContent::Bytes(file_buf);
+        Ok(())
+    }
+
     pub fn add_item(&mut self, item: FwCfgItem) -> Result<()> {
-        let index = self.items.len();
-        let c_name = create_file_name(&item.name);
         let size = item.content.size()?;
-        let mut cfg_file = FwCfgFile {
-            size_be: size.to_be(),
-            select_be: (FW_CFG_FILE_FIRST + index as u16).to_be(),
-            _reserved: 0,
-            name: c_name,
-        };
-        self.file_dir_mut()
-            .extend_from_slice(cfg_file.as_mut_bytes());
-        self.items.push(item);
-        self.update_count();
+        if self.items.iter().any(|existing| existing.name == item.name) {
+            return Err(ErrorKind::AlreadyExists.into());
+        }
+        let index = self
+            .items
+            .partition_point(|existing| existing.name.as_str() < item.name.as_str());
+        info!(
+            "fw_cfg: add file selector={:#x} size={:#x} name={}",
+            FW_CFG_FILE_FIRST + index as u16,
+            size,
+            item.name
+        );
+        self.items.insert(index, item);
+        self.rebuild_file_dir()
+    }
+
+    fn has_item(&self, name: &str) -> bool {
+        self.items.iter().any(|item| item.name == name)
+    }
+
+    fn add_item_if_missing(&mut self, name: &str, content: FwCfgContent) -> Result<()> {
+        if self.has_item(name) {
+            return Ok(());
+        }
+
+        self.add_item(FwCfgItem {
+            name: name.to_string(),
+            content,
+        })
+    }
+
+    fn known_content(&self, selector: u16) -> Option<&FwCfgContent> {
+        self.known_items
+            .get(selector as usize)
+            .or_else(|| self.arch_known_items.get(&selector))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn add_qemu_compat_files(&mut self) -> Result<()> {
+        const KVMVAPIC_ROM: &str = "/usr/share/qemu/kvmvapic.bin";
+        const KVMVAPIC_FW_CFG: &str = "genroms/kvmvapic.bin";
+
+        self.add_item_if_missing("bios-geometry", FwCfgContent::Bytes(Vec::new()))?;
+        self.add_item_if_missing(
+            "etc/boot-fail-wait",
+            FwCfgContent::Bytes((-1i32).to_le_bytes().to_vec()),
+        )?;
+        let (smbios_anchor, smbios_tables) = build_qemu_compat_smbios();
+        self.add_item_if_missing(
+            "etc/smbios/smbios-anchor",
+            FwCfgContent::Bytes(smbios_anchor),
+        )?;
+        self.add_item_if_missing(
+            "etc/smbios/smbios-tables",
+            FwCfgContent::Bytes(smbios_tables),
+        )?;
+        self.add_item_if_missing("etc/smi/features-ok", FwCfgContent::Bytes(vec![1]))?;
+        self.add_item_if_missing(
+            "etc/smi/requested-features",
+            FwCfgContent::Bytes(0u64.to_le_bytes().to_vec()),
+        )?;
+        self.add_item_if_missing(
+            "etc/smi/supported-features",
+            FwCfgContent::Bytes(7u64.to_le_bytes().to_vec()),
+        )?;
+        self.add_item_if_missing(
+            "etc/system-states",
+            FwCfgContent::Bytes(vec![128, 0, 0, 129, 128, 128]),
+        )?;
+        self.add_item_if_missing("etc/tpm/log", FwCfgContent::Bytes(Vec::new()))?;
+        if !self.has_item(KVMVAPIC_FW_CFG) {
+            match File::open(KVMVAPIC_ROM) {
+                Ok(file) => self.add_item(FwCfgItem {
+                    name: KVMVAPIC_FW_CFG.to_string(),
+                    content: FwCfgContent::File(0, file),
+                })?,
+                Err(e) => {
+                    info!("Skipping kvmvapic option ROM {KVMVAPIC_ROM}: {e}");
+                    self.add_item(FwCfgItem {
+                        name: KVMVAPIC_FW_CFG.to_string(),
+                        content: FwCfgContent::Bytes(Vec::new()),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn add_linuxboot_option_rom(&mut self) -> Result<()> {
+        const LINUXBOOT_DMA_ROM: &str = "/usr/share/qemu/linuxboot_dma.bin";
+        const LINUXBOOT_DMA_FW_CFG: &str = "genroms/linuxboot_dma.bin";
+        const LINUXBOOT_DMA_BOOT_PATH: &[u8] = b"/rom@genroms/linuxboot_dma.bin\0";
+
+        match File::open(LINUXBOOT_DMA_ROM) {
+            Ok(file) => {
+                self.add_item(FwCfgItem {
+                    name: LINUXBOOT_DMA_FW_CFG.to_string(),
+                    content: FwCfgContent::File(0, file),
+                })?;
+                self.add_item(FwCfgItem {
+                    name: "bootorder".to_string(),
+                    content: FwCfgContent::Bytes(LINUXBOOT_DMA_BOOT_PATH.to_vec()),
+                })?;
+            }
+            Err(e) => {
+                info!("Skipping linuxboot option ROM {LINUXBOOT_DMA_ROM}: {e}");
+            }
+        }
+
         Ok(())
     }
 
@@ -580,7 +905,7 @@ impl FwCfg {
     }
 
     fn dma_read(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
-        let op_size = if let Some(content) = self.known_items.get(selector as usize) {
+        let op_size = if let Some(content) = self.known_content(selector) {
             self.dma_read_content(content, self.data_offset, len, address)
         } else if let Some(item) = self.items.get((selector - FW_CFG_FILE_FIRST) as usize) {
             self.dma_read_content(&item.content, self.data_offset, len, address)
@@ -592,8 +917,50 @@ impl FwCfg {
         Ok(())
     }
 
+    fn selector_name(&self, selector: u16) -> &str {
+        self.items
+            .get(selector.wrapping_sub(FW_CFG_FILE_FIRST) as usize)
+            .map(|item| item.name.as_str())
+            .unwrap_or(match selector {
+                FW_CFG_SIGNATURE => "signature",
+                FW_CFG_ID => "id",
+                FW_CFG_UUID => "uuid",
+                FW_CFG_RAM_SIZE => "ram_size",
+                FW_CFG_NOGRAPHIC => "nographic",
+                FW_CFG_NB_CPUS => "nb_cpus",
+                FW_CFG_KERNEL_ADDR => "kernel_addr",
+                FW_CFG_KERNEL_SIZE => "kernel_size",
+                FW_CFG_BOOT_DEVICE => "boot_device",
+                FW_CFG_NUMA => "numa",
+                FW_CFG_BOOT_MENU => "boot_menu",
+                FW_CFG_MAX_CPUS => "max_cpus",
+                FW_CFG_KERNEL_ENTRY => "kernel_entry",
+                FW_CFG_INITRD_ADDR => "initrd_addr",
+                FW_CFG_INITRD_SIZE => "initrd_size",
+                FW_CFG_KERNEL_DATA => "kernel_data",
+                FW_CFG_INITRD_DATA => "initrd_data",
+                FW_CFG_CMDLINE_ADDR => "cmdline_addr",
+                FW_CFG_CMDLINE_SIZE => "cmdline_size",
+                FW_CFG_CMDLINE_DATA => "cmdline_data",
+                FW_CFG_SETUP_ADDR => "setup_addr",
+                FW_CFG_SETUP_SIZE => "setup_size",
+                FW_CFG_SETUP_DATA => "setup_data",
+                FW_CFG_FILE_DIR => "file_dir",
+                #[cfg(target_arch = "x86_64")]
+                FW_CFG_ACPI_TABLES => "acpi_tables",
+                #[cfg(target_arch = "x86_64")]
+                FW_CFG_IRQ0_OVERRIDE => "irq0_override",
+                #[cfg(target_arch = "x86_64")]
+                FW_CFG_HPET => "hpet",
+                _ => "unknown",
+            })
+    }
+
     fn do_dma(&mut self) {
         let dma_address = self.dma_address;
+        if let Some(hook) = &self.dma_pre_hook {
+            hook(dma_address, std::mem::size_of::<FwCfgDmaAccess>() as u64);
+        }
         let mut access = FwCfgDmaAccess::new_zeroed();
         let dma_access = match self
             .memory
@@ -608,10 +975,21 @@ impl FwCfg {
         };
         let control = AccessControl(u32::from_be(dma_access.control_be));
         if control.select() {
-            self.selector = control.select() as u16;
+            self.selector = control.selector();
+            self.data_offset = 0;
         }
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
+        let name = self.selector_name(self.selector);
+        info!(
+            "fw_cfg: dma selector={:#x} name={} control={:#x} len={:#x} addr={:#x} desc={:#x}",
+            self.selector,
+            name,
+            u32::from_be(dma_access.control_be),
+            len,
+            addr,
+            dma_address
+        );
         if let Some(hook) = &self.dma_pre_hook {
             hook(addr, len as u64);
         }
@@ -639,18 +1017,45 @@ impl FwCfg {
     }
 
     pub fn add_kernel_data(&mut self, file: &File) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        const FW_CFG_SETUP_LOAD_ADDR: u32 = 0x0001_0000;
+        #[cfg(target_arch = "x86_64")]
+        const FW_CFG_KERNEL_LOAD_ADDR: u32 = 0x0010_0000;
+
         let mut buffer = vec![0u8; size_of::<boot_params>()];
         file.read_exact_at(&mut buffer, 0)?;
         let bp = boot_params::from_mut_slice(&mut buffer).unwrap();
         #[cfg(target_arch = "x86_64")]
         {
+            const FW_CFG_CMDLINE_LOAD_ADDR: u32 = 0x0002_0000;
             // must set to 4 for backwards compatibility
             // https://docs.kernel.org/arch/x86/boot.html#the-real-mode-kernel-header
             if bp.hdr.setup_sects == 0 {
                 bp.hdr.setup_sects = 4;
             }
-            // wildcard boot loader type
-            bp.hdr.type_of_loader = 0xff;
+            // Match QEMU's x86_load_linux() fw_cfg boot parameters.
+            bp.hdr.type_of_loader = 0xb0;
+            bp.hdr.loadflags |= 0x80;
+            bp.hdr.heap_end_ptr =
+                (FW_CFG_CMDLINE_LOAD_ADDR - FW_CFG_SETUP_LOAD_ADDR - 0x200) as u16;
+            bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
+            let version = bp.hdr.version;
+            let setup_sects = bp.hdr.setup_sects;
+            let type_of_loader = bp.hdr.type_of_loader;
+            let loadflags = bp.hdr.loadflags;
+            let heap_end_ptr = bp.hdr.heap_end_ptr;
+            let cmd_line_ptr = bp.hdr.cmd_line_ptr;
+            let initrd_addr_max = bp.hdr.initrd_addr_max;
+            info!(
+                "fw_cfg: linux setup protocol={:#x} setup_sects={} type_of_loader={:#x} loadflags={:#x} heap_end_ptr={:#x} cmd_line_ptr={:#x} initrd_addr_max={:#x}",
+                version,
+                setup_sects,
+                type_of_loader,
+                loadflags,
+                heap_end_ptr,
+                cmd_line_ptr,
+                initrd_addr_max
+            );
         }
         #[cfg(target_arch = "aarch64")]
         let kernel_start = bp.text_offset;
@@ -668,27 +1073,47 @@ impl FwCfg {
             )?;
         }
 
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.known_items[FW_CFG_SETUP_ADDR as usize] =
+                FwCfgContent::U32(FW_CFG_SETUP_LOAD_ADDR);
+            self.known_items[FW_CFG_KERNEL_ADDR as usize] =
+                FwCfgContent::U32(FW_CFG_KERNEL_LOAD_ADDR);
+        }
         self.known_items[FW_CFG_SETUP_SIZE as usize] = FwCfgContent::U32(buffer.len() as u32);
         self.known_items[FW_CFG_SETUP_DATA as usize] = FwCfgContent::Bytes(buffer);
         self.known_items[FW_CFG_KERNEL_SIZE as usize] =
             FwCfgContent::U32(file.metadata()?.len() as u32 - kernel_start as u32);
         self.known_items[FW_CFG_KERNEL_DATA as usize] =
             FwCfgContent::File(kernel_start as u64, file.try_clone()?);
+        #[cfg(target_arch = "x86_64")]
+        self.add_linuxboot_option_rom()?;
         Ok(())
     }
 
     pub fn add_kernel_cmdline(&mut self, s: std::ffi::CString) {
+        #[cfg(target_arch = "x86_64")]
+        const FW_CFG_CMDLINE_LOAD_ADDR: u32 = 0x0002_0000;
+
         let bytes = s.into_bytes_with_nul();
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.known_items[FW_CFG_CMDLINE_ADDR as usize] =
+                FwCfgContent::U32(FW_CFG_CMDLINE_LOAD_ADDR);
+            self.update_setup_data(|bp| {
+                bp.hdr.cmd_line_ptr = FW_CFG_CMDLINE_LOAD_ADDR;
+            });
+        }
         self.known_items[FW_CFG_CMDLINE_SIZE as usize] = FwCfgContent::U32(bytes.len() as u32);
         self.known_items[FW_CFG_CMDLINE_DATA as usize] = FwCfgContent::Bytes(bytes);
     }
 
     pub fn add_acpi(
         &mut self,
-        rsdp: Rsdp,
+        rsdp: Vec<u8>,
         tables: Vec<u8>,
         table_checksums: Vec<(usize, usize)>,
-        table_pointers: Vec<usize>,
+        table_pointers: Vec<(usize, u8)>,
     ) -> Result<()> {
         let acpi_table = AcpiTable {
             rsdp,
@@ -702,8 +1127,34 @@ impl FwCfg {
         self.add_item(apci_tables)
     }
 
-    pub fn add_initramfs_data(&mut self, file: &File) -> Result<()> {
+    pub fn add_initramfs_data(&mut self, file: &File, mem_size: Option<usize>) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        const FW_CFG_INITRD_LOAD_END_FALLBACK: u32 = 0x1f00_0000;
+
         let initramfs_size = file.metadata()?.len();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let initrd_load_end = mem_size
+                .and_then(|size| {
+                    let below_4g = std::cmp::min(size as u64, MEM_32BIT_DEVICES_START.0);
+                    below_4g
+                        .checked_sub(Q35_ACPI_DATA_RESERVED_SIZE as u64)?
+                        .checked_sub(1)
+                })
+                .filter(|end| *end <= u32::MAX as u64)
+                .map(|end| end as u32)
+                .unwrap_or(FW_CFG_INITRD_LOAD_END_FALLBACK);
+            let initramfs_addr = (initrd_load_end - initramfs_size as u32) & !0xfff;
+            self.known_items[FW_CFG_INITRD_ADDR as usize] = FwCfgContent::U32(initramfs_addr);
+            self.update_setup_data(|bp| {
+                bp.hdr.ramdisk_image = initramfs_addr;
+                bp.hdr.ramdisk_size = initramfs_size as u32;
+            });
+            info!(
+                "fw_cfg: initrd addr={:#x} size={:#x} load_end={:#x}",
+                initramfs_addr, initramfs_size, initrd_load_end
+            );
+        }
         self.known_items[FW_CFG_INITRD_SIZE as usize] = FwCfgContent::U32(initramfs_size as _);
         self.known_items[FW_CFG_INITRD_DATA as usize] = FwCfgContent::File(0, file.try_clone()?);
         Ok(())
@@ -735,7 +1186,7 @@ impl FwCfg {
     }
 
     fn read_data(&mut self, data: &mut [u8], size: u32) -> u8 {
-        let ret = if let Some(content) = self.known_items.get(self.selector as usize) {
+        let ret = if let Some(content) = self.known_content(self.selector) {
             Self::read_content(content, self.data_offset, data, size)
         } else if let Some(item) = self.items.get((self.selector - FW_CFG_FILE_FIRST) as usize) {
             Self::read_content(&item.content, self.data_offset, data, size)
@@ -900,7 +1351,7 @@ mod unit_tests {
         let initram_content = b"this is the initramfs";
         let written = temp_file.write(initram_content);
         assert_eq!(written.unwrap(), 21);
-        let _ = fw_cfg.add_initramfs_data(temp_file);
+        let _ = fw_cfg.add_initramfs_data(temp_file, None);
 
         let mut data = vec![0u8];
 

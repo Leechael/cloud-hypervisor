@@ -284,30 +284,46 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
     let mut facp = Sdt::new(*b"FACP", 276, 6, *b"CLOUDH", *b"CHFACP  ", 1);
 
     {
-        if let Some(address) = device_manager.acpi_platform_addresses().reset_reg_address {
+        let addresses = device_manager.acpi_platform_addresses();
+
+        if let Some(address) = addresses.pm1_evt_address {
+            // PM1a_EVT_BLK / X_PM1a_EVT_BLK
+            facp.write(56, address.address as u32);
+            facp.write(148, address);
+            // PM1_EVT_LEN
+            facp.write(88, 4u8);
+        }
+
+        if let Some(address) = addresses.pm1_cnt_address {
+            // PM1a_CNT_BLK / X_PM1a_CNT_BLK
+            facp.write(64, address.address as u32);
+            facp.write(172, address);
+            // PM1_CNT_LEN
+            facp.write(89, 2u8);
+        }
+
+        if let Some(address) = addresses.reset_reg_address {
             // RESET_REG
             facp.write(116, address);
             // RESET_VALUE
             facp.write(128, 1u8);
         }
 
-        if let Some(address) = device_manager
-            .acpi_platform_addresses()
-            .sleep_control_reg_address
-        {
+        if let Some(address) = addresses.sleep_control_reg_address {
             // SLEEP_CONTROL_REG
             facp.write(244, address);
         }
 
-        if let Some(address) = device_manager
-            .acpi_platform_addresses()
-            .sleep_status_reg_address
-        {
+        if let Some(address) = addresses.sleep_status_reg_address {
             // SLEEP_STATUS_REG
             facp.write(256, address);
         }
 
-        if let Some(address) = device_manager.acpi_platform_addresses().pm_timer_address {
+        if let Some(address) = addresses.pm_timer_address {
+            // PM_TMR_BLK
+            facp.write(76, address.address as u32);
+            // PM_TMR_LEN
+            facp.write(91, 4u8);
             // X_PM_TMR_BLK
             facp.write(208, address);
         }
@@ -318,12 +334,23 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
     // ARM_BOOT_ARCH: enable PSCI with HVC enable-method
     facp.write(129, 3u16);
 
-    // Architecture common fields
-    // HW_REDUCED_ACPI, RESET_REG_SUP, TMR_VAL_EXT
-    let fadt_flags: u32 = (1 << 20) | (1 << 10) | (1 << 8);
+    // Architecture common fields.
+    // TMR_VAL_EXT is always set. HW_REDUCED_ACPI is only set when the
+    // platform exposes reduced sleep registers instead of q35 PM1 blocks.
+    let addresses = device_manager.acpi_platform_addresses();
+    let has_pm1 = addresses.pm1_evt_address.is_some() && addresses.pm1_cnt_address.is_some();
+    let mut fadt_flags: u32 = 1 << 8;
+    if addresses.reset_reg_address.is_some() {
+        fadt_flags |= 1 << 10;
+    }
+    if !has_pm1 {
+        fadt_flags |= 1 << 20;
+    }
     facp.write(112, fadt_flags);
     // FADT minor version
     facp.write(131, 3u8);
+    // SCI_INT
+    facp.write(46, 9u16);
     // X_DSDT
     facp.write(FACP_DSDT_OFFSET, dsdt_offset.0);
     // Hypervisor Vendor Identity
@@ -1045,43 +1072,48 @@ pub fn create_acpi_tables_for_fw_cfg(
         numa_nodes,
         tpm_enabled,
     );
-    let mut pointer_offsets: Vec<usize> = vec![];
-    let mut checksums: Vec<(usize, usize)> = vec![];
+    let mut pointer_offsets: Vec<(usize, u8)> = vec![];
 
     let xsdt_addr = rsdp.xsdt_addr.get() as usize;
-    let xsdt_checksum = (xsdt_addr, table_bytes.len() - xsdt_addr);
 
     // create pointer offsets (use location of pointers in XSDT table)
     // XSDT doesn't have a pointer to DSDT so we use FACP's pointer to DSDT
     let facp_offset = xsdt_table_pointers[0] as usize;
-    pointer_offsets.push(facp_offset + FACP_DSDT_OFFSET);
+    pointer_offsets.push((facp_offset + FACP_DSDT_OFFSET, 8));
     let mut current_offset = xsdt_addr + 36;
     for _ in 0..xsdt_table_pointers.len() {
-        pointer_offsets.push(current_offset);
+        pointer_offsets.push((current_offset, 8));
         current_offset += 8;
     }
 
-    // create (offset, len) pairs for firmware to calculate
-    // table checksums and verify ACPI tables
-    let mut i = 0;
-    while i < xsdt_table_pointers.len() - 1 {
-        let current_table_offset = xsdt_table_pointers[i];
-        let current_table_length = xsdt_table_pointers[i + 1] - current_table_offset;
-        checksums.push((current_table_offset as usize, current_table_length as usize));
-        i += 1;
-    }
-    checksums.push((
-        xsdt_table_pointers[xsdt_table_pointers.len() - 1] as usize,
-        0,
-    ));
-    checksums.push(xsdt_checksum);
+    let mut table_offsets = vec![0usize, xsdt_addr];
+    table_offsets.extend(xsdt_table_pointers.iter().map(|offset| *offset as usize));
+    table_offsets.sort_unstable();
+    table_offsets.dedup();
+    let checksums = table_offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, offset)| {
+            let end = table_offsets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(table_bytes.len());
+            let len = end.checked_sub(*offset)?;
+            (len >= 36).then_some((*offset, len))
+        })
+        .collect();
 
     device_manager
         .fw_cfg()
         .expect("fw_cfg must be present")
         .lock()
         .unwrap()
-        .add_acpi(rsdp, table_bytes, checksums, pointer_offsets)
+        .add_acpi(
+            rsdp.as_bytes().to_vec(),
+            table_bytes,
+            checksums,
+            pointer_offsets,
+        )
         .map_err(crate::vm::Error::CreatingAcpiTables)
 }
 
