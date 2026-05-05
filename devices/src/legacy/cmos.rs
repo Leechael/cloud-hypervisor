@@ -42,6 +42,18 @@ impl Cmos {
     ) -> Cmos {
         let mut data = [0u8; DATA_LEN];
 
+        // Base memory (first MiB), in KiB. Match QEMU's PC CMOS layout.
+        let base_mem = min(mem_below_4g / 1024, 640);
+        data[0x15] = base_mem as u8;
+        data[0x16] = (base_mem >> 8) as u8;
+
+        // Extended memory between 1 MiB and 64 MiB, in KiB.
+        let ext_mem_kib = min(0xFFFF, mem_below_4g.saturating_sub(1024 * 1024) / 1024);
+        data[0x17] = ext_mem_kib as u8;
+        data[0x18] = (ext_mem_kib >> 8) as u8;
+        data[0x30] = ext_mem_kib as u8;
+        data[0x31] = (ext_mem_kib >> 8) as u8;
+
         // Extended memory from 16 MB to 4 GB in units of 64 KB
         let ext_mem = min(
             0xFFFF,
