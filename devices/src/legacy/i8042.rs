@@ -28,9 +28,9 @@ impl I8042Device {
     }
 }
 
-// i8042 device is located at I/O port 0x61. We partially implement two 8-bit
-// registers: port 0x61 (I8042_PORT_B_REG, offset 0 from base of 0x61), and
-// port 0x64 (I8042_COMMAND_REG, offset 3 from base of 0x61).
+// device_manager registers this device at two I/O ports: 0x60 (data port) and
+// 0x64 (status / command port). The minimal model only needs to advertise an
+// empty data buffer and react to the 0xfe reset command.
 impl BusDevice for I8042Device {
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
         if data.len() != 1 {
