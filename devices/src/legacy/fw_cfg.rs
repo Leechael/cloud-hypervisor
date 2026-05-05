@@ -513,6 +513,20 @@ fn smbios_table(type_: u8, handle: u16, formatted: &[u8], strings: &[&str]) -> V
 }
 
 #[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_BIOS_VENDOR: &str = "Cloud Hypervisor";
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_BIOS_VERSION: &str = "Cloud Hypervisor";
+// Stable placeholder: CH does not produce a real BIOS image, so a fixed date
+// keeps measurements deterministic across builds. Format follows SMBIOS Type 0
+// "BIOS Release Date" requirement (MM/DD/YYYY).
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_BIOS_RELEASE_DATE: &str = "01/01/2024";
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_SYSTEM_MANUFACTURER: &str = "Cloud Hypervisor";
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_SYSTEM_PRODUCT: &str = "Cloud Hypervisor TDX VM";
+
+#[cfg(target_arch = "x86_64")]
 fn build_qemu_compat_smbios() -> (Vec<u8>, Vec<u8>) {
     let mut tables = Vec::new();
 
@@ -525,7 +539,11 @@ fn build_qemu_compat_smbios() -> (Vec<u8>, Vec<u8>) {
         0,
         0x0000,
         &bios_info,
-        &["EDK II", "QEMU", "01/01/2026"],
+        &[
+            CH_SMBIOS_BIOS_VENDOR,
+            CH_SMBIOS_BIOS_VERSION,
+            CH_SMBIOS_BIOS_RELEASE_DATE,
+        ],
     ));
 
     let mut system_info = vec![0u8; 0x1b - 4];
@@ -536,7 +554,7 @@ fn build_qemu_compat_smbios() -> (Vec<u8>, Vec<u8>) {
         1,
         0x0100,
         &system_info,
-        &["minimal-tdx", "payload-initramfs"],
+        &[CH_SMBIOS_SYSTEM_MANUFACTURER, CH_SMBIOS_SYSTEM_PRODUCT],
     ));
 
     tables.extend_from_slice(&smbios_table(127, 0x7f00, &[], &[]));
@@ -839,6 +857,14 @@ impl FwCfg {
             "etc/smbios/smbios-tables",
             FwCfgContent::Bytes(smbios_tables),
         )?;
+        // QEMU SMI handshake (hw/i386/fw_cfg.c::pc_build_smbios + hw/isa/lpc_ich9.c).
+        // OVMF reads `supported-features`, writes the subset it understands to
+        // `requested-features`, then writes `features-ok = 1` once the host has
+        // accepted the negotiation. CH does not emulate SMM, so the meaningful
+        // value here is `requested-features = 0`. `supported-features` mirrors
+        // QEMU's bit layout (ICH9_LPC_SMI_F_BROADCAST_BIT=0,
+        // ICH9_LPC_SMI_F_CPU_HOTPLUG_BIT=1, ICH9_LPC_SMI_F_CPU_HOT_UNPLUG_BIT=2)
+        // so OVMF's negotiation handshake completes; we never act on those bits.
         self.add_item_if_missing("etc/smi/features-ok", FwCfgContent::Bytes(vec![1]))?;
         self.add_item_if_missing(
             "etc/smi/requested-features",
@@ -848,6 +874,11 @@ impl FwCfg {
             "etc/smi/supported-features",
             FwCfgContent::Bytes(7u64.to_le_bytes().to_vec()),
         )?;
+        // QEMU `etc/system-states`: 6 bytes encoding (enabled << 7) | (slp_typ
+        // & 0x07) for S0..S5 (hw/acpi/core.c::acpi_pm1_cnt_init). CH supports
+        // S0 (always on) and S5 (poweroff via Q35Pm1Cnt), advertises S3 with
+        // slp_typ=1 to satisfy OVMF's wakeup discovery, and leaves S1/S2
+        // disabled. S4 is advertised but no actual hibernation backing exists.
         self.add_item_if_missing(
             "etc/system-states",
             FwCfgContent::Bytes(vec![128, 0, 0, 129, 128, 128]),
