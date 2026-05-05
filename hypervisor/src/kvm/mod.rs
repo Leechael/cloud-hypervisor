@@ -306,14 +306,27 @@ pub enum TdxExitStatus {
 const TDX_MAX_NR_CPUID_CONFIGS: usize = 256;
 
 #[cfg(feature = "tdx")]
-fn tdx_init_cpuid_entry(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
-    match entry.function {
-        0x1 | 0x8000_0008 => entry.index == 0,
-        0x4 => entry.index <= 3,
-        0x7 => entry.index <= 2,
-        0x1f => true,
-        _ => false,
+fn tdx_derive_xfam(cpuid: &[kvm_bindings::kvm_cpuid_entry2], supported_xfam: u64) -> u64 {
+    let mut xcr0 = 0;
+    let mut xss = 0;
+
+    for entry in cpuid {
+        if entry.function != 0xd {
+            continue;
+        }
+
+        match entry.index {
+            0 => {
+                xcr0 = entry.eax as u64 | ((entry.edx as u64) << 32);
+            }
+            1 => {
+                xss = entry.ecx as u64 | ((entry.edx as u64) << 32);
+            }
+            _ => {}
+        }
     }
+
+    (xcr0 | xss) & supported_xfam
 }
 
 #[cfg(feature = "tdx")]
@@ -2240,13 +2253,12 @@ impl vm::Vm for KvmVm {
         )
         .map_err(vm::HypervisorVmError::InitializeTdx)?;
 
-        let xfam = caps.supported_xfam;
-
+        let xfam = tdx_derive_xfam(&cpuid, caps.supported_xfam);
+        let caps_cpuid_nent = (caps.cpuid_nent as usize).min(TDX_MAX_NR_CPUID_CONFIGS);
         let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
             .into_iter()
-            .filter(tdx_init_cpuid_entry)
             .filter_map(|mut entry| {
-                caps.cpuid_configs[..caps.cpuid_nent as usize]
+                caps.cpuid_configs[..caps_cpuid_nent]
                     .iter()
                     .find(|mask| mask.function == entry.function && mask.index == entry.index)
                     .map(|mask| {
@@ -2278,8 +2290,8 @@ impl vm::Vm for KvmVm {
         }
         let attributes = TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
         info!(
-            "TDX init: attributes={:#x} xfam={:#x} cpuid_nent={}",
-            attributes, xfam, cpuid_nent
+            "TDX init: attributes={:#x} xfam={:#x} supported_xfam={:#x} caps_cpuid_nent={} cpuid_nent={}",
+            attributes, xfam, caps.supported_xfam, caps.cpuid_nent, cpuid_nent
         );
 
         let data = TdxInitVm {
