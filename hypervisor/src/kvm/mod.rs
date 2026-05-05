@@ -109,8 +109,6 @@ pub use kvm_bindings::{
     kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_pit_config, kvm_run,
     kvm_userspace_memory_region, kvm_userspace_memory_region2,
 };
-#[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_X86_TDX_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
     KVM_GUESTDBG_USE_HW, KVM_NR_SPSR, KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
@@ -120,6 +118,8 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, kvm_riscv_core};
+#[cfg(feature = "tdx")]
+use kvm_bindings::{KVM_X86_TDX_VM, KVMIO, kvm_run__bindgen_ty_1};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
@@ -150,6 +150,14 @@ const KVM_CAP_X86_NOTIFY_VMEXIT_RAW: u32 = 219;
 const KVM_CAP_MAX_VCPU_ID_RAW: u32 = 128;
 #[cfg(feature = "tdx")]
 const KVM_MEMORY_MAPPING_RAW: libc::c_ulong = 0xc020_aed5;
+#[cfg(feature = "tdx")]
+const KVM_X86_SETUP_MCE_RAW: libc::c_ulong = 0x4008_ae9c;
+#[cfg(feature = "tdx")]
+const KVM_X86_GET_MCE_CAP_SUPPORTED_RAW: libc::c_ulong = 0x8008_ae9d;
+#[cfg(feature = "tdx")]
+const MCG_CAP_BANKS_MASK: u64 = 0xff;
+#[cfg(feature = "tdx")]
+const DEFAULT_MCG_CAP: u64 = 0x100010a;
 #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 static TDX_IO_EXIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -306,6 +314,191 @@ pub enum TdxExitStatus {
 const TDX_MAX_NR_CPUID_CONFIGS: usize = 256;
 
 #[cfg(feature = "tdx")]
+const TDX_CPUID_NO_SUBLEAF: u32 = 0xffff_ffff;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_MSR: u32 = 1 << 5;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_PAE: u32 = 1 << 6;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_MCE: u32 = 1 << 7;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_APIC: u32 = 1 << 9;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_MTRR: u32 = 1 << 12;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_MCA: u32 = 1 << 14;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_CLFLUSH: u32 = 1 << 19;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_DTS: u32 = 1 << 21;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_ACPI: u32 = 1 << 22;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_IA64: u32 = 1 << 30;
+#[cfg(feature = "tdx")]
+const CPUID_1_EDX_PBE: u32 = 1 << 31;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_MONITOR: u32 = 1 << 3;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_VMX: u32 = 1 << 5;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_SMX: u32 = 1 << 6;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_EST: u32 = 1 << 7;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_TM2: u32 = 1 << 8;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_CX16: u32 = 1 << 13;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_XTPR: u32 = 1 << 14;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_PDCM: u32 = 1 << 15;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_DCA: u32 = 1 << 18;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_X2APIC: u32 = 1 << 21;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_AES: u32 = 1 << 25;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
+#[cfg(feature = "tdx")]
+const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
+#[cfg(feature = "tdx")]
+const CPUID_EXT2_NX: u32 = 1 << 20;
+#[cfg(feature = "tdx")]
+const CPUID_EXT2_PDPE1GB: u32 = 1 << 26;
+#[cfg(feature = "tdx")]
+const CPUID_EXT2_RDTSCP: u32 = 1 << 27;
+#[cfg(feature = "tdx")]
+const CPUID_EXT2_LM: u32 = 1 << 29;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_FSGSBASE: u32 = 1 << 0;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_TSC_ADJUST: u32 = 1 << 1;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_SGX: u32 = 1 << 2;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_RTM: u32 = 1 << 11;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_PQM: u32 = 1 << 12;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_MPX: u32 = 1 << 14;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_RDT_A: u32 = 1 << 15;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_RDSEED: u32 = 1 << 18;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_SMAP: u32 = 1 << 20;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_CLFLUSHOPT: u32 = 1 << 23;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_CLWB: u32 = 1 << 24;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_INTEL_PT: u32 = 1 << 25;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EBX_SHA_NI: u32 = 1 << 29;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_TME: u32 = 1 << 13;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_FZM: u32 = 1 << 15;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_MAWAU: u32 = 31 << 17;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_KEY_LOCKER: u32 = 1 << 23;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_BUS_LOCK_DETECT: u32 = 1 << 24;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_MOVDIR64B: u32 = 1 << 28;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_ENQCMD: u32 = 1 << 29;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_SGX_LC: u32 = 1 << 30;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_ECX_PKS: u32 = 1 << 31;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EDX_PCONFIG: u32 = 1 << 18;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EDX_SPEC_CTRL: u32 = 1 << 26;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EDX_CORE_CAPABILITY: u32 = 1 << 30;
+#[cfg(feature = "tdx")]
+const CPUID_7_0_EDX_SPEC_CTRL_SSBD: u32 = 1 << 31;
+#[cfg(feature = "tdx")]
+const CPUID_8000_0008_EBX_WBNOINVD: u32 = 1 << 9;
+#[cfg(feature = "tdx")]
+const CPUID_XSAVE_XSAVEOPT: u32 = 1 << 0;
+#[cfg(feature = "tdx")]
+const CPUID_XSAVE_XSAVEC: u32 = 1 << 1;
+#[cfg(feature = "tdx")]
+const CPUID_XSAVE_XSAVES: u32 = 1 << 3;
+#[cfg(feature = "tdx")]
+const CPUID_6_EAX_ARAT: u32 = 1 << 2;
+#[cfg(feature = "tdx")]
+const CPUID_XSTATE_XCR0_MASK: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 2)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 9)
+    | (1 << 17)
+    | (1 << 18);
+#[cfg(feature = "tdx")]
+const CPUID_XSTATE_XSS_MASK: u64 = 1 << 15;
+#[cfg(feature = "tdx")]
+const TDX_SUPPORTED_KVM_FEATURES_LEGACY: u32 =
+    (1 << 1) | (1 << 7) | (1 << 9) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 15);
+
+#[cfg(feature = "tdx")]
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct TdxCpuidConfigLegacy {
+    leaf: u32,
+    sub_leaf: u32,
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+#[cfg(feature = "tdx")]
+#[repr(C)]
+struct TdxCapabilitiesLegacy {
+    attrs_fixed0: u64,
+    attrs_fixed1: u64,
+    xfam_fixed0: u64,
+    xfam_fixed1: u64,
+    supported_gpaw: u32,
+    padding: u32,
+    reserved: [u64; 251],
+    nr_cpuid_configs: u32,
+    cpuid_configs: [TdxCpuidConfigLegacy; TDX_MAX_NR_CPUID_CONFIGS],
+}
+
+#[cfg(feature = "tdx")]
+impl Default for TdxCapabilitiesLegacy {
+    fn default() -> Self {
+        Self {
+            attrs_fixed0: 0,
+            attrs_fixed1: 0,
+            xfam_fixed0: 0,
+            xfam_fixed1: 0,
+            supported_gpaw: 0,
+            padding: 0,
+            reserved: [0; 251],
+            nr_cpuid_configs: TDX_MAX_NR_CPUID_CONFIGS as u32,
+            cpuid_configs: [TdxCpuidConfigLegacy::default(); TDX_MAX_NR_CPUID_CONFIGS],
+        }
+    }
+}
+
+#[cfg(feature = "tdx")]
 fn tdx_derive_xfam(cpuid: &[kvm_bindings::kvm_cpuid_entry2], supported_xfam: u64) -> u64 {
     let mut xcr0 = 0;
     let mut xss = 0;
@@ -330,271 +523,372 @@ fn tdx_derive_xfam(cpuid: &[kvm_bindings::kvm_cpuid_entry2], supported_xfam: u64
 }
 
 #[cfg(feature = "tdx")]
-fn tdx_legacy_cpuid_entries() -> Vec<kvm_bindings::kvm_cpuid_entry2> {
-    [
-        (
-            0x0000_0000,
-            0,
-            0,
-            0x0000_001f,
-            0x756e_6547,
-            0x6c65_746e,
-            0x4965_6e69,
-        ),
-        (
-            0x0000_0001,
-            0,
-            0,
-            0x000c_06f2,
-            0x0000_0800,
-            0xf7fa_3217,
-            0x2fab_fbff,
-        ),
-        (
-            0x0000_0002,
-            0,
-            0x0000_0006,
-            0x0000_0001,
-            0x0000_0000,
-            0x0000_004d,
-            0x002c_307d,
-        ),
-        (
-            0x0000_0004,
-            0,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0000_0121,
-            0x01c0_003f,
-            0x0000_003f,
-            0x0000_0001,
-        ),
-        (
-            0x0000_0004,
-            1,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0000_0122,
-            0x01c0_003f,
-            0x0000_003f,
-            0x0000_0001,
-        ),
-        (
-            0x0000_0004,
-            2,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0000_0143,
-            0x03c0_003f,
-            0x0000_0fff,
-            0x0000_0001,
-        ),
-        (
-            0x0000_0004,
-            3,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0000_0163,
-            0x03c0_003f,
-            0x0000_3fff,
-            0x0000_0006,
-        ),
-        (0x0000_0004, 4, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_0005, 0, 0, 0, 0, 3, 0),
-        (0x0000_0006, 0, 0, 4, 0, 0, 0),
-        (
-            0x0000_0007,
-            0,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            1,
-            0xf1bf_0fb9,
-            0x1b41_5f4e,
-            0xffc9_4410,
-        ),
-        (
-            0x0000_0007,
-            1,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x1c30,
-            0,
-            0,
-            0,
-        ),
-        (
-            0x0000_000b,
-            0,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0,
-            1,
-            0x100,
-            0,
-        ),
-        (
-            0x0000_000b,
-            1,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0,
-            1,
-            0x201,
-            0,
-        ),
-        (0x0000_000b, 2, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 2, 0),
-        (
-            0x0000_000d,
-            0,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0006_02e7,
-            0x2b00,
-            0x2b00,
-            0,
-        ),
-        (
-            0x0000_000d,
-            1,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x1f,
-            0x2cf0,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            2,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x100,
-            0x240,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            5,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x40,
-            0x440,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            6,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x200,
-            0x480,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            7,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x400,
-            0x680,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            9,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            8,
-            0xa80,
-            0,
-            0,
-        ),
-        (
-            0x0000_000d,
-            15,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x328,
-            0,
-            1,
-            0,
-        ),
-        (
-            0x0000_000d,
-            17,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x40,
-            0xac0,
-            2,
-            0,
-        ),
-        (
-            0x0000_000d,
-            18,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x2000,
-            0xb00,
-            6,
-            0,
-        ),
-        (0x0000_000d, 63, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_0012, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_0012, 1, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_0012, 2, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_0014, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 0, 0, 0, 0),
-        (0x0000_001d, 0, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, 1, 0, 0, 0),
-        (
-            0x0000_001d,
-            1,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0x0400_2000,
-            0x0008_0040,
-            0x10,
-            0,
-        ),
-        (
-            0x0000_001e,
-            0,
-            KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-            0,
-            0x4010,
-            0,
-            0,
-        ),
-        (
-            0x8000_0000,
-            0,
-            0,
-            0x8000_0008,
-            0x756e_6547,
-            0x6c65_746e,
-            0x4965_6e69,
-        ),
-        (0x8000_0001, 0, 0, 0x000c_06f2, 0, 0x121, 0x2c10_0800),
-        (
-            0x8000_0002,
-            0,
-            0,
-            0x4554_4e49,
-            0x2952_284c,
-            0x4f45_5820,
-            0x2952_284e,
-        ),
-        (0x8000_0003, 0, 0, 0x4c4f_4720, 0x3536_2044, 0x0059_3632, 0),
-        (
-            0x8000_0005,
-            0,
-            0,
-            0x01ff_01ff,
-            0x01ff_01ff,
-            0x4002_0140,
-            0x4002_0140,
-        ),
-        (0x8000_0006, 0, 0, 0, 0x4200_4200, 0x0200_8140, 0x0080_8140),
-        (0x8000_0008, 0, 0, 0x0034_3934, 0x200, 0, 0),
-    ]
-    .into_iter()
-    .map(
-        |(function, index, flags, eax, ebx, ecx, edx)| kvm_bindings::kvm_cpuid_entry2 {
-            function,
-            index,
-            flags,
-            eax,
-            ebx,
-            ecx,
-            edx,
-            ..Default::default()
-        },
+fn tdx_legacy_cpuid_leaf_allowed(function: u32) -> bool {
+    matches!(
+        function,
+        0x0000_0000
+            | 0x0000_0001
+            | 0x0000_0002
+            | 0x0000_0004
+            | 0x0000_0005
+            | 0x0000_0006
+            | 0x0000_0007
+            | 0x0000_000b
+            | 0x0000_000d
+            | 0x0000_0012
+            | 0x0000_0014
+            | 0x0000_001d
+            | 0x0000_001e
+            | 0x4000_0000
+            | 0x4000_0001
+            | 0x8000_0000
+            | 0x8000_0001
+            | 0x8000_0002
+            | 0x8000_0003
+            | 0x8000_0004
+            | 0x8000_0005
+            | 0x8000_0006
+            | 0x8000_0008
     )
-    .collect()
+}
+
+#[cfg(feature = "tdx")]
+fn tdx_legacy_cpuid_entry_allowed(entry: &kvm_bindings::kvm_cpuid_entry2) -> bool {
+    if !tdx_legacy_cpuid_leaf_allowed(entry.function) {
+        return false;
+    }
+
+    match entry.function {
+        0x0000_0007 => entry.index <= 1,
+        0x0000_000b => entry.index <= 2,
+        0x0000_000d => matches!(entry.index, 0 | 1 | 2 | 5 | 6 | 7 | 9 | 15 | 17 | 18 | 63),
+        _ => true,
+    }
+}
+
+#[cfg(feature = "tdx")]
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum TdxCpuidReg {
+    Eax,
+    Ebx,
+    Ecx,
+    Edx,
+}
+
+#[cfg(feature = "tdx")]
+#[derive(Copy, Clone)]
+struct TdxCpuidRule {
+    fixed0: u32,
+    fixed1: u32,
+    depends_on_vmm_cap: u32,
+    inducing_ve: bool,
+    supported_value_on_ve: u32,
+}
+
+#[cfg(feature = "tdx")]
+fn tdx_legacy_cap_cpuid_config(
+    caps: &TdxCapabilitiesLegacy,
+    function: u32,
+    index: u32,
+    reg: TdxCpuidReg,
+) -> u32 {
+    let mut value = 0;
+    let nent = (caps.nr_cpuid_configs as usize).min(TDX_MAX_NR_CPUID_CONFIGS);
+
+    for config in caps.cpuid_configs.iter().take(nent) {
+        if config.leaf == function
+            && (config.sub_leaf == TDX_CPUID_NO_SUBLEAF || config.sub_leaf == index)
+        {
+            value = match reg {
+                TdxCpuidReg::Eax => config.eax,
+                TdxCpuidReg::Ebx => config.ebx,
+                TdxCpuidReg::Ecx => config.ecx,
+                TdxCpuidReg::Edx => config.edx,
+            };
+        }
+    }
+
+    value
+}
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn tdx_host_cpuid_reg(function: u32, index: u32, reg: TdxCpuidReg) -> u32 {
+    // SAFETY: CPUID is supported on x86_64 and accepts arbitrary leaves.
+    let cpuid = unsafe { std::arch::x86_64::__cpuid_count(function, index) };
+    match reg {
+        TdxCpuidReg::Eax => cpuid.eax,
+        TdxCpuidReg::Ebx => cpuid.ebx,
+        TdxCpuidReg::Ecx => cpuid.ecx,
+        TdxCpuidReg::Edx => cpuid.edx,
+    }
+}
+
+#[cfg(feature = "tdx")]
+fn tdx_legacy_cpuid_rule(
+    caps: &TdxCapabilitiesLegacy,
+    function: u32,
+    index: u32,
+    reg: TdxCpuidReg,
+) -> Option<TdxCpuidRule> {
+    let mut rule = match (function, index, reg) {
+        (0x0000_0001, _, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: (1 << 10) | (1 << 20) | CPUID_1_EDX_IA64,
+            fixed1: CPUID_1_EDX_MSR
+                | CPUID_1_EDX_PAE
+                | CPUID_1_EDX_MCE
+                | CPUID_1_EDX_APIC
+                | CPUID_1_EDX_MTRR
+                | CPUID_1_EDX_MCA
+                | CPUID_1_EDX_CLFLUSH
+                | CPUID_1_EDX_DTS,
+            depends_on_vmm_cap: CPUID_1_EDX_ACPI | CPUID_1_EDX_PBE,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_0001, _, TdxCpuidReg::Ecx) => TdxCpuidRule {
+            fixed0: CPUID_1_ECX_VMX | CPUID_1_ECX_SMX | (1 << 16),
+            fixed1: CPUID_1_ECX_CX16
+                | CPUID_1_ECX_PDCM
+                | CPUID_1_ECX_X2APIC
+                | CPUID_1_ECX_AES
+                | CPUID_1_ECX_XSAVE
+                | CPUID_1_ECX_RDRAND
+                | CPUID_1_ECX_HYPERVISOR,
+            depends_on_vmm_cap: CPUID_1_ECX_EST
+                | CPUID_1_ECX_TM2
+                | CPUID_1_ECX_XTPR
+                | CPUID_1_ECX_DCA,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x8000_0001, _, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: CPUID_EXT2_NX | CPUID_EXT2_PDPE1GB | CPUID_EXT2_RDTSCP | CPUID_EXT2_LM,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_0007, 0, TdxCpuidReg::Ebx) => TdxCpuidRule {
+            fixed0: CPUID_7_0_EBX_TSC_ADJUST | CPUID_7_0_EBX_SGX | CPUID_7_0_EBX_MPX,
+            fixed1: CPUID_7_0_EBX_FSGSBASE
+                | CPUID_7_0_EBX_RTM
+                | CPUID_7_0_EBX_RDSEED
+                | CPUID_7_0_EBX_SMAP
+                | CPUID_7_0_EBX_CLFLUSHOPT
+                | CPUID_7_0_EBX_CLWB
+                | CPUID_7_0_EBX_SHA_NI,
+            depends_on_vmm_cap: CPUID_7_0_EBX_PQM | CPUID_7_0_EBX_RDT_A,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_0007, 0, TdxCpuidReg::Ecx) => TdxCpuidRule {
+            fixed0: CPUID_7_0_ECX_FZM
+                | CPUID_7_0_ECX_MAWAU
+                | CPUID_7_0_ECX_ENQCMD
+                | CPUID_7_0_ECX_SGX_LC,
+            fixed1: CPUID_7_0_ECX_MOVDIR64B | CPUID_7_0_ECX_BUS_LOCK_DETECT,
+            depends_on_vmm_cap: CPUID_7_0_ECX_TME,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_0007, 0, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: CPUID_7_0_EDX_SPEC_CTRL
+                | CPUID_7_0_EDX_ARCH_CAPABILITIES
+                | CPUID_7_0_EDX_CORE_CAPABILITY
+                | CPUID_7_0_EDX_SPEC_CTRL_SSBD,
+            depends_on_vmm_cap: CPUID_7_0_EDX_PCONFIG,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x8000_0008, _, TdxCpuidReg::Ebx) => TdxCpuidRule {
+            fixed0: !CPUID_8000_0008_EBX_WBNOINVD,
+            fixed1: CPUID_8000_0008_EBX_WBNOINVD,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_000d, 1, TdxCpuidReg::Eax) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: CPUID_XSAVE_XSAVEOPT | CPUID_XSAVE_XSAVEC | CPUID_XSAVE_XSAVES,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_0006, _, TdxCpuidReg::Eax) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: 0,
+            depends_on_vmm_cap: 0,
+            inducing_ve: true,
+            supported_value_on_ve: CPUID_6_EAX_ARAT,
+        },
+        (0x8000_0007, _, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: 0,
+            depends_on_vmm_cap: 0,
+            inducing_ve: true,
+            supported_value_on_ve: u32::MAX,
+        },
+        (0x4000_0001, _, TdxCpuidReg::Eax) => TdxCpuidRule {
+            fixed0: 0,
+            fixed1: 0,
+            depends_on_vmm_cap: 0,
+            inducing_ve: true,
+            supported_value_on_ve: TDX_SUPPORTED_KVM_FEATURES_LEGACY,
+        },
+        (0x0000_000d, 0, TdxCpuidReg::Eax) => TdxCpuidRule {
+            fixed0: (!caps.xfam_fixed0 & CPUID_XSTATE_XCR0_MASK) as u32,
+            fixed1: (caps.xfam_fixed1 & CPUID_XSTATE_XCR0_MASK) as u32,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_000d, 0, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: ((!caps.xfam_fixed0 & CPUID_XSTATE_XCR0_MASK) >> 32) as u32,
+            fixed1: ((caps.xfam_fixed1 & CPUID_XSTATE_XCR0_MASK) >> 32) as u32,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_000d, 1, TdxCpuidReg::Ecx) => TdxCpuidRule {
+            fixed0: (!caps.xfam_fixed0 & CPUID_XSTATE_XSS_MASK) as u32,
+            fixed1: (caps.xfam_fixed1 & CPUID_XSTATE_XSS_MASK) as u32,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        (0x0000_000d, 1, TdxCpuidReg::Edx) => TdxCpuidRule {
+            fixed0: ((!caps.xfam_fixed0 & CPUID_XSTATE_XSS_MASK) >> 32) as u32,
+            fixed1: ((caps.xfam_fixed1 & CPUID_XSTATE_XSS_MASK) >> 32) as u32,
+            depends_on_vmm_cap: 0,
+            inducing_ve: false,
+            supported_value_on_ve: 0,
+        },
+        _ => return None,
+    };
+
+    let config = tdx_legacy_cap_cpuid_config(caps, function, index, reg);
+    rule.fixed0 &= !config;
+    rule.fixed1 &= !config;
+
+    match (function, reg) {
+        (0x0000_0007, TdxCpuidReg::Ecx) => {
+            if caps.attrs_fixed0 & (1 << 30) == 0 {
+                rule.fixed0 |= CPUID_7_0_ECX_PKS;
+            }
+            if caps.attrs_fixed1 & (1 << 30) != 0 {
+                rule.fixed1 |= CPUID_7_0_ECX_PKS;
+            }
+            if caps.attrs_fixed0 & (1 << 31) == 0 {
+                rule.fixed0 |= CPUID_7_0_ECX_KEY_LOCKER;
+            }
+            if caps.attrs_fixed1 & (1 << 31) != 0 {
+                rule.fixed1 |= CPUID_7_0_ECX_KEY_LOCKER;
+            }
+        }
+        _ => {}
+    }
+
+    Some(rule)
+}
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn tdx_legacy_supported_cpuid_reg(
+    caps: &TdxCapabilitiesLegacy,
+    function: u32,
+    index: u32,
+    reg: TdxCpuidReg,
+    vmm_cap: u32,
+) -> u32 {
+    let Some(rule) = tdx_legacy_cpuid_rule(caps, function, index, reg) else {
+        return vmm_cap;
+    };
+
+    if rule.inducing_ve {
+        return vmm_cap & rule.supported_value_on_ve;
+    }
+
+    let mut value = vmm_cap | tdx_host_cpuid_reg(function, index, reg);
+    value |= rule.fixed1;
+    value &= !rule.fixed0;
+    value |= tdx_legacy_cap_cpuid_config(caps, function, index, reg);
+    value &= !(rule.depends_on_vmm_cap & !vmm_cap);
+
+    if function == 0x0000_0001 && reg == TdxCpuidReg::Ecx {
+        value &= !CPUID_1_ECX_MONITOR;
+    }
+    if function == 0x0000_0007 && reg == TdxCpuidReg::Ebx {
+        value &= !CPUID_7_0_EBX_INTEL_PT;
+    }
+
+    value
+}
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn tdx_legacy_filter_cpuid_entry(
+    caps: &TdxCapabilitiesLegacy,
+    entry: &mut kvm_bindings::kvm_cpuid_entry2,
+) {
+    entry.eax = tdx_legacy_supported_cpuid_reg(
+        caps,
+        entry.function,
+        entry.index,
+        TdxCpuidReg::Eax,
+        entry.eax,
+    );
+    entry.ebx = tdx_legacy_supported_cpuid_reg(
+        caps,
+        entry.function,
+        entry.index,
+        TdxCpuidReg::Ebx,
+        entry.ebx,
+    );
+    entry.ecx = tdx_legacy_supported_cpuid_reg(
+        caps,
+        entry.function,
+        entry.index,
+        TdxCpuidReg::Ecx,
+        entry.ecx,
+    );
+    entry.edx = tdx_legacy_supported_cpuid_reg(
+        caps,
+        entry.function,
+        entry.index,
+        TdxCpuidReg::Edx,
+        entry.edx,
+    );
+
+    match entry.function {
+        0x0000_000b => {
+            entry.ecx = (entry.ecx & !0xff) | entry.index;
+        }
+        0x0000_0012 | 0x0000_0014 => {
+            entry.eax = 0;
+            entry.ebx = 0;
+            entry.ecx = 0;
+            entry.edx = 0;
+        }
+        0x4000_0000 => {
+            entry.eax = 0x4000_0001;
+        }
+        _ => {}
+    }
+}
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn tdx_legacy_cpuid_entries(
+    caps: &TdxCapabilitiesLegacy,
+    cpuid: &[CpuIdEntry],
+) -> Vec<kvm_bindings::kvm_cpuid_entry2> {
+    cpuid
+        .iter()
+        .map(|entry| (*entry).into())
+        .filter(tdx_legacy_cpuid_entry_allowed)
+        .map(|mut entry| {
+            tdx_legacy_filter_cpuid_entry(caps, &mut entry);
+            entry
+        })
+        .collect()
 }
 
 #[cfg(feature = "tdx")]
@@ -1742,46 +2036,6 @@ impl vm::Vm for KvmVm {
         }
 
         if self.tdx_legacy_vm_type {
-            #[repr(C)]
-            #[derive(Copy, Clone, Default)]
-            struct TdxCpuidConfigLegacy {
-                leaf: u32,
-                sub_leaf: u32,
-                eax: u32,
-                ebx: u32,
-                ecx: u32,
-                edx: u32,
-            }
-
-            #[repr(C)]
-            struct TdxCapabilitiesLegacy {
-                attrs_fixed0: u64,
-                attrs_fixed1: u64,
-                xfam_fixed0: u64,
-                xfam_fixed1: u64,
-                supported_gpaw: u32,
-                padding: u32,
-                reserved: [u64; 251],
-                nr_cpuid_configs: u32,
-                cpuid_configs: [TdxCpuidConfigLegacy; TDX_MAX_NR_CPUID_CONFIGS],
-            }
-
-            impl Default for TdxCapabilitiesLegacy {
-                fn default() -> Self {
-                    Self {
-                        attrs_fixed0: 0,
-                        attrs_fixed1: 0,
-                        xfam_fixed0: 0,
-                        xfam_fixed1: 0,
-                        supported_gpaw: 0,
-                        padding: 0,
-                        reserved: [0; 251],
-                        nr_cpuid_configs: TDX_MAX_NR_CPUID_CONFIGS as u32,
-                        cpuid_configs: [TdxCpuidConfigLegacy::default(); TDX_MAX_NR_CPUID_CONFIGS],
-                    }
-                }
-            }
-
             let mut caps = TdxCapabilitiesLegacy::default();
             tdx_command(
                 &self.fd.as_raw_fd(),
@@ -1791,408 +2045,8 @@ impl vm::Vm for KvmVm {
             )
             .map_err(vm::HypervisorVmError::InitializeTdx)?;
 
-            let host_addr_bits = unsafe { std::arch::x86_64::__cpuid(0x8000_0008).eax };
-            let host_phys_bits = host_addr_bits & 0xff;
-            let legacy_addr_bits =
-                (host_addr_bits & 0x0000_ff00) | host_phys_bits | (host_phys_bits << 16);
-
-            let legacy_cpuid_entries = [
-                (
-                    0x4000_0000,
-                    0,
-                    0,
-                    0x4000_0001,
-                    0x4b4d_564b,
-                    0x564b_4d56,
-                    0x0000_004d,
-                ),
-                (
-                    0x4000_0001,
-                    0,
-                    0,
-                    0x0000_ba82,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0000,
-                    0,
-                    0,
-                    0x0000_001f,
-                    0x756e_6547,
-                    0x6c65_746e,
-                    0x4965_6e69,
-                ),
-                (
-                    0x0000_0001,
-                    0,
-                    0,
-                    0x000c_06f2,
-                    0x0000_0800,
-                    0xf7fa_3217,
-                    0x2fab_fbff,
-                ),
-                (
-                    0x0000_0002,
-                    0,
-                    0x0000_0006,
-                    0x0000_0001,
-                    0x0000_0000,
-                    0x0000_004d,
-                    0x002c_307d,
-                ),
-                (
-                    0x0000_0004,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0121,
-                    0x01c0_003f,
-                    0x0000_003f,
-                    0x0000_0001,
-                ),
-                (
-                    0x0000_0004,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0122,
-                    0x01c0_003f,
-                    0x0000_003f,
-                    0x0000_0001,
-                ),
-                (
-                    0x0000_0004,
-                    2,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0143,
-                    0x03c0_003f,
-                    0x0000_0fff,
-                    0x0000_0001,
-                ),
-                (
-                    0x0000_0004,
-                    3,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0163,
-                    0x03c0_003f,
-                    0x0000_3fff,
-                    0x0000_0006,
-                ),
-                (
-                    0x0000_0004,
-                    4,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0005,
-                    0,
-                    0,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0003,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0006,
-                    0,
-                    0,
-                    0x0000_0004,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0007,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0001,
-                    0xf1bf_0fb9,
-                    0x1b41_5f4e,
-                    0xffc9_4410,
-                ),
-                (
-                    0x0000_0007,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_1c30,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000b,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0001,
-                    0x0000_0100,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000b,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0001,
-                    0x0000_0201,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000b,
-                    2,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0002,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0006_02e7,
-                    0x0000_2b00,
-                    0x0000_2b00,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_001f,
-                    0x0000_2cf0,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    2,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0100,
-                    0x0000_0240,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    5,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0040,
-                    0x0000_0440,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    6,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0200,
-                    0x0000_0480,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    7,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0400,
-                    0x0000_0680,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    9,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0008,
-                    0x0000_0a80,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    15,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0328,
-                    0x0000_0000,
-                    0x0000_0001,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    17,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0040,
-                    0x0000_0ac0,
-                    0x0000_0002,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    18,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_2000,
-                    0x0000_0b00,
-                    0x0000_0006,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_000d,
-                    63,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0012,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0012,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0012,
-                    2,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_0014,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_001d,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0001,
-                    0x0000_0000,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_001d,
-                    1,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0400_2000,
-                    0x0008_0040,
-                    0x0000_0010,
-                    0x0000_0000,
-                ),
-                (
-                    0x0000_001e,
-                    0,
-                    KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
-                    0x0000_0000,
-                    0x0000_4010,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-                (
-                    0x8000_0000,
-                    0,
-                    0,
-                    0x8000_0008,
-                    0x756e_6547,
-                    0x6c65_746e,
-                    0x4965_6e69,
-                ),
-                (
-                    0x8000_0001,
-                    0,
-                    0,
-                    0x000c_06f2,
-                    0x0000_0000,
-                    0x0000_0121,
-                    0x2c10_0800,
-                ),
-                (
-                    0x8000_0002,
-                    0,
-                    0,
-                    0x4554_4e49,
-                    0x2952_284c,
-                    0x4f45_5820,
-                    0x2952_284e,
-                ),
-                (
-                    0x8000_0003,
-                    0,
-                    0,
-                    0x4c4f_4720,
-                    0x3536_2044,
-                    0x0059_3632,
-                    0x0000_0000,
-                ),
-                (
-                    0x8000_0005,
-                    0,
-                    0,
-                    0x01ff_01ff,
-                    0x01ff_01ff,
-                    0x4002_0140,
-                    0x4002_0140,
-                ),
-                (
-                    0x8000_0006,
-                    0,
-                    0,
-                    0x0000_0000,
-                    0x4200_4200,
-                    0x0200_8140,
-                    0x0080_8140,
-                ),
-                (
-                    0x8000_0008,
-                    0,
-                    0,
-                    legacy_addr_bits,
-                    0x0000_0200,
-                    0x0000_0000,
-                    0x0000_0000,
-                ),
-            ];
-            let cpuid_nent = legacy_cpuid_entries.len();
-            let mut tdx_cpuid = Vec::with_capacity(cpuid_nent);
-
-            for (function, index, flags, eax, ebx, ecx, edx) in legacy_cpuid_entries {
-                let entry = kvm_bindings::kvm_cpuid_entry2 {
-                    function,
-                    index,
-                    flags,
-                    eax,
-                    ebx,
-                    ecx,
-                    edx,
-                    ..Default::default()
-                };
-
-                tdx_cpuid.push(entry);
-            }
+            let mut tdx_cpuid = tdx_legacy_cpuid_entries(&caps, cpuid);
+            let cpuid_nent = tdx_cpuid.len();
 
             tdx_cpuid.resize(
                 TDX_MAX_NR_CPUID_CONFIGS,
@@ -2468,6 +2322,11 @@ impl vm::Vm for KvmVm {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn tdx_init_uses_boot_vcpu_cpuid(&self) -> bool {
+        self.tdx_legacy_vm_type
     }
 
     /// Downcast to the underlying KvmVm type
@@ -3349,22 +3208,16 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
         #[cfg(feature = "tdx")]
         if self.tdx_legacy_cpuid {
-            let mut cpuid = vec![
-                kvm_bindings::kvm_cpuid_entry2 {
-                    function: 0x4000_0000,
-                    eax: 0x4000_0001,
-                    ebx: 0x4b4d_564b,
-                    ecx: 0x564b_4d56,
-                    edx: 0x0000_004d,
-                    ..Default::default()
-                },
-                kvm_bindings::kvm_cpuid_entry2 {
-                    function: 0x4000_0001,
-                    eax: 0x0000_ba82,
-                    ..Default::default()
-                },
-            ];
-            cpuid.extend(tdx_legacy_cpuid_entries());
+            let mut caps = TdxCapabilitiesLegacy::default();
+            tdx_command(
+                &self.vm_fd.as_raw_fd(),
+                TdxCommand::Capabilities,
+                0,
+                &mut caps as *mut _ as *const _,
+            )
+            .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()))?;
+
+            let cpuid = tdx_legacy_cpuid_entries(&caps, cpuid);
             let kvm_cpuid = <CpuId>::from_entries(&cpuid).map_err(|_| {
                 cpu::HypervisorCpuError::SetCpuid(anyhow!("failed to create CpuId"))
             })?;
@@ -3374,7 +3227,7 @@ impl cpu::Vcpu for KvmVcpu {
             let ret = unsafe {
                 libc::ioctl(
                     self.kvm_fd,
-                    0xffff_ffff_8008_ae9d as libc::c_ulong,
+                    KVM_X86_GET_MCE_CAP_SUPPORTED_RAW,
                     &mut supported_mcg_cap,
                 )
             };
@@ -3384,15 +3237,10 @@ impl cpu::Vcpu for KvmVcpu {
                 ));
             }
 
-            let mut mcg_cap: u64 = 0x100010a;
+            let mut mcg_cap = DEFAULT_MCG_CAP & (supported_mcg_cap | MCG_CAP_BANKS_MASK);
             // SAFETY: KVM_X86_SETUP_MCE takes a pointer to a u64 MCG capability value.
-            let ret = unsafe {
-                libc::ioctl(
-                    self.fd.as_raw_fd(),
-                    0x4008ae9c as libc::c_ulong,
-                    &mut mcg_cap,
-                )
-            };
+            let ret =
+                unsafe { libc::ioctl(self.fd.as_raw_fd(), KVM_X86_SETUP_MCE_RAW, &mut mcg_cap) };
             if ret < 0 {
                 return Err(cpu::HypervisorCpuError::SetCpuid(
                     std::io::Error::last_os_error().into(),

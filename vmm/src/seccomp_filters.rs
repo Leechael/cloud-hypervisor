@@ -108,6 +108,9 @@ mod kvm {
     pub const KVM_CREATE_DEVICE: u64 = 0xc00c_aee0;
     pub const KVM_GET_REG_LIST: u64 = 0xc008_aeb0;
     pub const KVM_MEMORY_ENCRYPT_OP: u64 = 0xc008_aeba;
+    pub const KVM_X86_SETUP_MCE: u64 = 0x4008_ae9c;
+    pub const KVM_X86_GET_MCE_CAP_SUPPORTED: u64 = 0x8008_ae9d;
+    pub const KVM_MEMORY_MAPPING: u64 = 0xc020_aed5;
     pub const KVM_NMI: u64 = 0xae9a;
     pub const KVM_GET_NESTED_STATE: u64 = 3229658814;
     pub const KVM_SET_NESTED_STATE: u64 = 1082175167;
@@ -251,6 +254,7 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_ENCRYPT_OP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_MAPPING)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_HAS_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING)?],
@@ -470,6 +474,12 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_LAPIC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSR_INDEX_LIST)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_X86_GET_MCE_CAP_SUPPORTED
+        )?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_SREGS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_TSC_KHZ)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XCRS,)?],
@@ -479,6 +489,7 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CLOCK)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CPUID2)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_FPU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_X86_SETUP_MCE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_IDENTITY_MAP_ADDR)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_LAPIC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_SREGS)?],
@@ -775,6 +786,14 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_GUEST_MEMFD,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MEMORY_ATTRIBUTES,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_MAPPING)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_X86_GET_MCE_CAP_SUPPORTED
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_X86_SETUP_MCE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_NESTED_STATE)?],

@@ -810,6 +810,13 @@ impl Vm {
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
     ) -> Result<()> {
         if config.lock().unwrap().is_tdx_enabled() {
+            #[cfg(target_arch = "x86_64")]
+            let cpuid = if vm.tdx_init_uses_boot_vcpu_cpuid() {
+                cpu_manager.lock().unwrap().tdx_init_cpuid()
+            } else {
+                cpu_manager.lock().unwrap().common_cpuid()
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let cpuid = cpu_manager.lock().unwrap().common_cpuid();
             let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
             vm.tdx_init(&cpuid, max_vcpus)

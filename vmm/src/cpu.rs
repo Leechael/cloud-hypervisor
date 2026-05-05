@@ -1198,7 +1198,18 @@ impl CpuManager {
         #[cfg(feature = "tdx")] tdx: bool,
     ) -> Result<()> {
         self.cpuid = {
-            let phys_bits = physical_bits(hypervisor, self.config.max_phys_bits);
+            let phys_bits = {
+                #[cfg(feature = "tdx")]
+                if tdx {
+                    arch::get_host_cpu_phys_bits(hypervisor)
+                } else {
+                    physical_bits(hypervisor, self.config.max_phys_bits)
+                }
+                #[cfg(not(feature = "tdx"))]
+                {
+                    physical_bits(hypervisor, self.config.max_phys_bits)
+                }
+            };
             arch::generate_common_cpuid(
                 hypervisor,
                 &arch::CpuidConfig {
@@ -1213,6 +1224,30 @@ impl CpuManager {
         };
 
         Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+    fn tdx_shared_gpa_mask(&self) -> u64 {
+        let guest_phys_bits = self
+            .cpuid
+            .iter()
+            .find(|entry| entry.function == 0x8000_0008 && entry.index == 0)
+            .map(|entry| {
+                let guest_phys_bits = ((entry.eax >> 16) & 0xff) as u8;
+                if guest_phys_bits == 0 {
+                    (entry.eax & 0xff) as u8
+                } else {
+                    guest_phys_bits
+                }
+            })
+            .filter(|bits| *bits != 0)
+            .unwrap_or_else(|| arch::get_host_cpu_phys_bits(self.hypervisor.as_ref()));
+
+        if guest_phys_bits > 48 {
+            1u64 << 51
+        } else {
+            1u64 << 47
+        }
     }
 
     fn create_vcpu(
@@ -1410,12 +1445,7 @@ impl CpuManager {
         let vm_debug_evt = self.vm_debug_evt.try_clone().unwrap();
         #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
         let tdx_shared_gpa_mask = if self.tdx_enabled {
-            let phys_bits = physical_bits(self.hypervisor.as_ref(), self.config.max_phys_bits);
-            if phys_bits > 48 {
-                1u64 << 51
-            } else {
-                1u64 << 47
-            }
+            self.tdx_shared_gpa_mask()
         } else {
             1u64 << u32::from(physical_bits(
                 self.hypervisor.as_ref(),
@@ -1988,6 +2018,38 @@ impl CpuManager {
     pub fn common_cpuid(&self) -> Vec<CpuIdEntry> {
         assert!(!self.cpuid.is_empty());
         self.cpuid.clone()
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+    pub fn tdx_init_cpuid(&self) -> Vec<CpuIdEntry> {
+        assert!(!self.cpuid.is_empty());
+
+        let topology = self.config.topology.clone().map_or_else(
+            || {
+                (
+                    1_u16,
+                    u16::try_from(self.boot_vcpus()).unwrap(),
+                    1_u16,
+                    1_u16,
+                )
+            },
+            |t| {
+                (
+                    t.threads_per_core,
+                    t.cores_per_die,
+                    t.dies_per_package,
+                    t.packages,
+                )
+            },
+        );
+
+        arch::x86_64::configure_vcpu_cpuid(
+            self.cpuid.clone(),
+            0,
+            self.hypervisor.get_cpu_vendor(),
+            topology,
+            self.config.nested,
+        )
     }
 
     /// Locks the vCPU states and calls [`Self::active_vcpus`].

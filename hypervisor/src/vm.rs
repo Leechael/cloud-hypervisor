@@ -417,6 +417,11 @@ pub trait Vm: Send + Sync + Any {
         unimplemented!()
     }
     #[cfg(feature = "tdx")]
+    /// Whether TDX INIT_VM must use the boot vCPU CPUID instead of common CPUID.
+    fn tdx_init_uses_boot_vcpu_cpuid(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "tdx")]
     /// Finalize the configuration of TDX on this VM
     fn tdx_finalize(&self) -> Result<()> {
         unimplemented!()

@@ -55,6 +55,21 @@ const AMX_INT8: u8 = 25; // AMX tile computation on 8-bit integers
 const AMX_FP16: u8 = 21; // AMX tile computation on fp16 numbers
 const AMX_COMPLEX: u8 = 8; // AMX tile computation on complex numbers
 
+#[cfg(feature = "tdx")]
+const SMX_ECX_BIT: u8 = 6;
+#[cfg(feature = "tdx")]
+const SGX_EBX_BIT: u8 = 2;
+#[cfg(feature = "tdx")]
+const MPX_EBX_BIT: u8 = 14;
+#[cfg(feature = "tdx")]
+const TSC_ADJUST_EBX_BIT: u8 = 1;
+#[cfg(feature = "tdx")]
+const INTEL_PT_EBX_BIT: u8 = 25;
+#[cfg(feature = "tdx")]
+const ENQCMD_ECX_BIT: u8 = 29;
+#[cfg(feature = "tdx")]
+const SGX_LC_ECX_BIT: u8 = 30;
+
 // KVM feature bits
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_CLOCKSOURCE_BIT: u8 = 0;
@@ -68,6 +83,15 @@ const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
 const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
+
+#[cfg(feature = "tdx")]
+const TDX_SUPPORTED_KVM_FEATURES: u32 = (1 << 1)
+    | (1 << 7)
+    | (1 << 9)
+    | (1 << 11)
+    | (1 << 12)
+    | (1 << 13)
+    | (1 << KVM_FEATURE_MSI_EXT_DEST_ID);
 
 const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 
@@ -646,6 +670,24 @@ pub fn generate_common_cpuid(
                     entry.edx &= !(1 << AMX_COMPLEX);
                 }
             }
+            0x1 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.ecx &= !((1 << VMX_ECX_BIT) | (1 << SMX_ECX_BIT) | (1 << 16));
+                }
+            }
+            0x7 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx && entry.index == 0 {
+                    entry.ebx &= !((1 << TSC_ADJUST_EBX_BIT)
+                        | (1 << SGX_EBX_BIT)
+                        | (1 << MPX_EBX_BIT)
+                        | (1 << INTEL_PT_EBX_BIT));
+                    entry.ecx &= !((1 << ENQCMD_ECX_BIT) | (1 << SGX_LC_ECX_BIT));
+                }
+            }
             0xd =>
             {
                 #[cfg(feature = "tdx")]
@@ -674,6 +716,16 @@ pub fn generate_common_cpuid(
                 entry.ebx = 0;
                 entry.ecx = 0;
                 entry.edx = 0;
+            }
+            0x12 | 0x14 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax = 0;
+                    entry.ebx = 0;
+                    entry.ecx = 0;
+                    entry.edx = 0;
+                }
             }
 
             // Copy host L1 cache details if not populated by KVM
@@ -731,6 +783,14 @@ pub fn generate_common_cpuid(
                         | (1 << KVM_FEATURE_ASYNC_PF_BIT)
                         | (1 << KVM_FEATURE_ASYNC_PF_VMEXIT_BIT)
                         | (1 << KVM_FEATURE_STEAL_TIME_BIT));
+                    entry.eax &= TDX_SUPPORTED_KVM_FEATURES;
+                }
+            }
+            0x4000_0000 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax = 0x4000_0001;
                 }
             }
             _ => {}
@@ -816,47 +876,22 @@ pub fn configure_vcpu(
     #[cfg(feature = "tdx")] tdx_enabled: bool,
     setup_registers: bool,
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id, Some(topology));
-
-    // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
-    let mut cpuid = cpuid;
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, x2apic_id);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, x2apic_id);
-    if matches!(cpu_vendor, CpuVendor::AMD) {
-        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_001e, Some(0), CpuidReg::EAX, x2apic_id);
-    }
-
-    // Set ApicId in cpuid for each vcpu - found in cpuid ebx when eax = 1
-    let mut apic_id_patched = false;
-    for entry in &mut cpuid {
-        if entry.function == 1 {
-            entry.ebx &= 0xffffff;
-            entry.ebx |= x2apic_id << 24;
-            apic_id_patched = true;
-            if matches!(cpu_vendor, CpuVendor::Intel) {
-                if !nested {
-                    // Disable nested virtualization for Intel
-                    entry.ecx &= !(1 << VMX_ECX_BIT);
-                }
-                break;
-            }
-        }
-        if entry.function == 0x8000_0001 {
-            if !nested {
-                // Disable the nested virtualization for AMD
-                entry.ecx &= !(1 << SVM_ECX_BIT);
-            }
-            break;
-        }
-    }
-    assert!(apic_id_patched);
-
-    update_cpuid_topology(
-        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
-    );
+    let mut cpuid = configure_vcpu_cpuid(cpuid, id, cpu_vendor, topology, nested);
 
     // The TSC frequency CPUID leaf should not be included when running with HyperV emulation
-    if !kvm_hyperv && let Some(tsc_khz) = vcpu.tsc_khz().map_err(Error::GetTscFrequency)? {
+    if !kvm_hyperv
+        && {
+            #[cfg(feature = "tdx")]
+            {
+                !tdx_enabled
+            }
+            #[cfg(not(feature = "tdx"))]
+            {
+                true
+            }
+        }
+        && let Some(tsc_khz) = vcpu.tsc_khz().map_err(Error::GetTscFrequency)?
+    {
         // Need to check that the TSC doesn't vary with dynamic frequency
         #[allow(unused_unsafe)]
         // SAFETY: cpuid called with valid leaves
@@ -909,6 +944,54 @@ pub fn configure_vcpu(
     #[cfg(not(feature = "tdx"))]
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
+}
+
+pub fn configure_vcpu_cpuid(
+    mut cpuid: Vec<CpuIdEntry>,
+    id: u32,
+    cpu_vendor: CpuVendor,
+    topology: (u16, u16, u16, u16),
+    nested: bool,
+) -> Vec<CpuIdEntry> {
+    let x2apic_id = get_x2apic_id(id, Some(topology));
+
+    // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, x2apic_id);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, x2apic_id);
+    if matches!(cpu_vendor, CpuVendor::AMD) {
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_001e, Some(0), CpuidReg::EAX, x2apic_id);
+    }
+
+    // Set ApicId in cpuid for each vcpu - found in cpuid ebx when eax = 1
+    let mut apic_id_patched = false;
+    for entry in &mut cpuid {
+        if entry.function == 1 {
+            entry.ebx &= 0xffffff;
+            entry.ebx |= x2apic_id << 24;
+            apic_id_patched = true;
+            if matches!(cpu_vendor, CpuVendor::Intel) {
+                if !nested {
+                    // Disable nested virtualization for Intel
+                    entry.ecx &= !(1 << VMX_ECX_BIT);
+                }
+                break;
+            }
+        }
+        if entry.function == 0x8000_0001 {
+            if !nested {
+                // Disable the nested virtualization for AMD
+                entry.ecx &= !(1 << SVM_ECX_BIT);
+            }
+            break;
+        }
+    }
+    assert!(apic_id_patched);
+
+    update_cpuid_topology(
+        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
+    );
+
+    cpuid
 }
 
 /// Returns a Vec of the valid memory addresses.
@@ -992,11 +1075,9 @@ pub fn tdx_q35_arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
         // 3072 MiB ~ 4 GiB: remaining firmware/platform reserved space.
         (
             layout::Q35_PCI_MMCONFIG_START.unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
-            layout::RAM_64BIT_START
-                .unchecked_offset_from(
-                    layout::Q35_PCI_MMCONFIG_START
-                        .unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
-                ) as usize,
+            layout::RAM_64BIT_START.unchecked_offset_from(
+                layout::Q35_PCI_MMCONFIG_START.unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
+            ) as usize,
             RegionType::Reserved,
         ),
     ]
