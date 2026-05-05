@@ -2065,13 +2065,20 @@ impl vm::Vm for KvmVm {
                 cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
             }
 
-            let attributes =
-                (TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE & caps.attrs_fixed0) | caps.attrs_fixed1;
             info!(
-                "TDX legacy init: attrs_fixed0={:#x} attrs_fixed1={:#x} attributes={:#x} cpuid_nent={}",
-                caps.attrs_fixed0, caps.attrs_fixed1, attributes, cpuid_nent
+                "TDX legacy caps: attrs_fixed0={:#x} attrs_fixed1={:#x} \
+                 xfam_fixed0={:#x} xfam_fixed1={:#x} supported_gpaw={:#x} \
+                 nr_cpuid_configs={}",
+                caps.attrs_fixed0,
+                caps.attrs_fixed1,
+                caps.xfam_fixed0,
+                caps.xfam_fixed1,
+                caps.supported_gpaw,
+                caps.nr_cpuid_configs,
             );
 
+            let attributes =
+                (TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE & caps.attrs_fixed0) | caps.attrs_fixed1;
             let data = TdxInitVmLegacy {
                 attributes,
                 mrconfigid: [0; 6],
@@ -2083,13 +2090,25 @@ impl vm::Vm for KvmVm {
                 cpuid_entries: tdx_cpuid.as_slice().try_into().unwrap(),
             };
 
-            return tdx_command(
+            info!(
+                "TDX legacy KVM_TDX_INIT_VM: attributes={:#x} cpuid_nent={} \
+                 mrconfigid={:?} mrowner={:?} mrownerconfig={:?}",
+                data.attributes,
+                data.cpuid_nent,
+                data.mrconfigid,
+                data.mrowner,
+                data.mrownerconfig,
+            );
+
+            tdx_command(
                 &self.fd.as_raw_fd(),
                 TdxCommand::InitVm,
                 0,
                 &data as *const _ as *const _,
             )
-            .map_err(vm::HypervisorVmError::InitializeTdx);
+            .map_err(vm::HypervisorVmError::InitializeTdx)?;
+            info!("TDX legacy KVM_TDX_INIT_VM: success");
+            return Ok(());
         }
 
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
@@ -2106,6 +2125,20 @@ impl vm::Vm for KvmVm {
             &mut caps as *mut _ as *const _,
         )
         .map_err(vm::HypervisorVmError::InitializeTdx)?;
+
+        info!(
+            "TDX caps: supported_attrs={:#x} supported_xfam={:#x} \
+             kernel_tdvmcallinfo_1_r11={:#x} kernel_tdvmcallinfo_1_r12={:#x} \
+             user_tdvmcallinfo_1_r11={:#x} user_tdvmcallinfo_1_r12={:#x} \
+             cpuid_nent={}",
+            caps.supported_attrs,
+            caps.supported_xfam,
+            caps.kernel_tdvmcallinfo_1_r11,
+            caps.kernel_tdvmcallinfo_1_r12,
+            caps.user_tdvmcallinfo_1_r11,
+            caps.user_tdvmcallinfo_1_r12,
+            caps.cpuid_nent,
+        );
 
         let xfam = tdx_derive_xfam(&cpuid, caps.supported_xfam);
         let caps_cpuid_nent = (caps.cpuid_nent as usize).min(TDX_MAX_NR_CPUID_CONFIGS);
@@ -2143,11 +2176,6 @@ impl vm::Vm for KvmVm {
             cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
         let attributes = TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
-        info!(
-            "TDX init: attributes={:#x} xfam={:#x} supported_xfam={:#x} caps_cpuid_nent={} cpuid_nent={}",
-            attributes, xfam, caps.supported_xfam, caps.cpuid_nent, cpuid_nent
-        );
-
         let data = TdxInitVm {
             attributes,
             xfam,
@@ -2160,13 +2188,26 @@ impl vm::Vm for KvmVm {
             cpuid_entries: tdx_cpuid.as_slice().try_into().unwrap(),
         };
 
+        info!(
+            "TDX KVM_TDX_INIT_VM: attributes={:#x} xfam={:#x} cpuid_nent={} \
+             mrconfigid={:?} mrowner={:?} mrownerconfig={:?}",
+            data.attributes,
+            data.xfam,
+            data.cpuid_nent,
+            data.mrconfigid,
+            data.mrowner,
+            data.mrownerconfig,
+        );
+
         tdx_command(
             &self.fd.as_raw_fd(),
             TdxCommand::InitVm,
             0,
             &data as *const _ as *const _,
         )
-        .map_err(vm::HypervisorVmError::InitializeTdx)
+        .map_err(vm::HypervisorVmError::InitializeTdx)?;
+        info!("TDX KVM_TDX_INIT_VM: success");
+        Ok(())
     }
 
     ///
