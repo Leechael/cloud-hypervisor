@@ -177,11 +177,6 @@ pub enum Error {
     #[error("Error getting CPU TSC frequency")]
     GetTscFrequency(#[source] HypervisorCpuError),
 
-    /// Error retrieving TDX capabilities through the hypervisor (kvm/mshv) API
-    #[cfg(feature = "tdx")]
-    #[error("Error retrieving TDX capabilities through the hypervisor API")]
-    TdxCapabilities(#[source] HypervisorError),
-
     /// Failed to configure E820 map for bzImage
     #[error("Failed to configure E820 map for bzImage")]
     E820Configuration,
@@ -652,10 +647,6 @@ pub fn generate_common_cpuid(
 
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
-    #[cfg(feature = "tdx")]
-    let tdx_capabilities: Option<hypervisor::kvm::TdxCapabilities> =
-        if config.tdx { None } else { None };
-
     // Update some existing CPUID
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
@@ -686,21 +677,6 @@ pub fn generate_common_cpuid(
                         | (1 << MPX_EBX_BIT)
                         | (1 << INTEL_PT_EBX_BIT));
                     entry.ecx &= !((1 << ENQCMD_ECX_BIT) | (1 << SGX_LC_ECX_BIT));
-                }
-            }
-            0xd =>
-            {
-                #[cfg(feature = "tdx")]
-                if let Some(caps) = &tdx_capabilities {
-                    let xcr0_mask: u64 = 0x82ff;
-                    let xss_mask: u64 = !xcr0_mask;
-                    if entry.index == 0 {
-                        entry.eax &= (caps.supported_xfam as u32) & (xcr0_mask as u32);
-                        entry.edx &= ((caps.supported_xfam & xcr0_mask) >> 32) as u32;
-                    } else if entry.index == 1 {
-                        entry.ecx &= (caps.supported_xfam as u32) & (xss_mask as u32);
-                        entry.edx &= ((caps.supported_xfam & xss_mask) >> 32) as u32;
-                    }
                 }
             }
             // Tile Information (purely AMX related).
