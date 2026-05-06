@@ -2370,14 +2370,6 @@ impl DeviceManager {
             .insert(apm, 0xb2, 0x2)
             .map_err(DeviceManagerError::BusError)?;
 
-        let com2 = Arc::new(Mutex::new(devices::legacy::ComPortStub::new()));
-        self.bus_devices
-            .push(Arc::clone(&com2) as Arc<dyn BusDeviceSync>);
-        info!("Adding COM2 io ports 0x2f8-0x2ff");
-        self.address_manager
-            .io_bus
-            .insert(com2, 0x2f8, 0x8)
-            .map_err(DeviceManagerError::BusError)?;
         {
             // Add a CMOS emulated device
             let guest_memory = self.memory_manager.lock().unwrap().guest_memory().memory();

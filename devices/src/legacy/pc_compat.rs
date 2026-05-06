@@ -433,32 +433,3 @@ impl BusDevice for ApmStub {
         None
     }
 }
-
-/// Minimal 16550-compatible scratch register stub for absent COM2 probing.
-pub struct ComPortStub {
-    regs: [u8; 8],
-}
-
-impl ComPortStub {
-    pub fn new() -> Self {
-        Self { regs: [0; 8] }
-    }
-}
-
-impl BusDevice for ComPortStub {
-    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
-        for (index, byte) in data.iter_mut().enumerate() {
-            *byte = self.regs.get(offset as usize + index).copied().unwrap_or(0);
-        }
-    }
-
-    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        for (index, byte) in data.iter().enumerate() {
-            if let Some(reg) = self.regs.get_mut(offset as usize + index) {
-                *reg = *byte;
-            }
-        }
-
-        None
-    }
-}

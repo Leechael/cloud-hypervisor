@@ -186,9 +186,10 @@ impl PciLpcBridge {
         config.set_reg(ICH9_LPC_PIRQE_ROUT_REG, 0x8080_8080);
         config.set_writable_bits(ICH9_LPC_PIRQA_ROUT_REG, 0xffff_ffff);
         config.set_writable_bits(ICH9_LPC_PIRQE_ROUT_REG, 0xffff_ffff);
-        // QEMU marks COM1 as decoded in ICH9 LPC config byte 0x82 when an
-        // ISA serial device is present at 0x3f8. OVMF consults this q35 LPC
-        // state while building its console path.
+        // QEMU marks an ISA serial port as decoded in ICH9 LPC config byte
+        // 0x82 only when the corresponding I/O region is present. Cloud
+        // Hypervisor exposes the primary serial device at 0x3f8 and does not
+        // install an absent COM2 stub at 0x2f8.
         config.set_reg(ICH9_LPC_IO_DEC_REG, 0x0001_0000);
         config.set_reg(ICH9_LPC_RCBA_REG, 0);
         config.set_writable_bits(ICH9_LPC_RCBA_REG, 0xffff_c001);

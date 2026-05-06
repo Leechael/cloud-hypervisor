@@ -45,7 +45,7 @@ pub use self::i8042::I8042Device;
 pub use self::ich9_lpc::{ICH9_PMIO_GPE0_BLK_LEN, ICH9_PMIO_GPE0_STS, ICH9_PM_BLOCK_LEN, ICH9_PM_BLOCK_OFFSET, Ich9Pm};
 #[cfg(target_arch = "x86_64")]
 pub use self::pc_compat::{
-    ApmStub, ComPortStub, PicStub, PitStub, Port61, Port92, Q35Pm1Cnt, Q35Pm1Evt,
+    ApmStub, PicStub, PitStub, Port61, Port92, Q35Pm1Cnt, Q35Pm1Evt,
 };
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::Rtc;
