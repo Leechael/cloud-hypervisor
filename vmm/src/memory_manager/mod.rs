@@ -2308,6 +2308,14 @@ impl MemoryManager {
         if size == 0 {
             return;
         }
+        // KVM applies set_memory_attributes across the entire guest
+        // address space, which includes regions outside guest RAM (PCIe
+        // MMIO hole, ACPI reserved, etc.). Listeners and the bitmap only
+        // model RAM-backed pages, so silently ignore non-RAM ranges.
+        let host_va = match self.gpa_to_hva(gpa) {
+            Some(hva) => hva,
+            None => return,
+        };
         if private {
             // Notify discard first (listener tears down DMA mappings)
             // then mark pages private in the bitmap. The hypervisor
@@ -2318,24 +2326,17 @@ impl MemoryManager {
                 region.set_private(gpa, size);
             }
         } else {
-            // Mark shared first, then resolve HVA and notify populate.
+            // Mark shared first, then notify populate with the resolved HVA.
             {
                 let mut attrs = self.ram_block_attributes.lock().unwrap();
                 for region in attrs.iter_mut() {
                     region.set_shared(gpa, size);
                 }
             }
-            if let Some(host_va) = self.gpa_to_hva(gpa) {
-                if let Err(e) = self.ram_discard_registry.notify_populate(gpa, host_va, size) {
-                    error!(
-                        "ram-discard listener notify_populate failed: gpa={gpa:#x} \
-                         size={size:#x} hva={host_va:#x}: {e}"
-                    );
-                }
-            } else {
+            if let Err(e) = self.ram_discard_registry.notify_populate(gpa, host_va, size) {
                 error!(
-                    "ram-discard notify_populate skipped: no host mapping for gpa={gpa:#x} \
-                     size={size:#x}"
+                    "ram-discard listener notify_populate failed: gpa={gpa:#x} \
+                     size={size:#x} hva={host_va:#x}: {e}"
                 );
             }
         }
