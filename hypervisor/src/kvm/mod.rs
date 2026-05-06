@@ -82,6 +82,8 @@ use crate::{
     USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
     UserMemoryRegion, VmOps, cpu, hypervisor, vm,
 };
+#[cfg(feature = "tdx")]
+use crate::vm::TdxAttributes;
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
@@ -135,7 +137,11 @@ const KVM_CAP_VM_TYPES_RAW: libc::c_ulong = 235;
 #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 const KVM_X86_TDX_VM_LEGACY: u64 = 2;
 #[cfg(feature = "tdx")]
+const TDX_TD_ATTRIBUTES_DEBUG: u64 = 1 << 0;
+#[cfg(feature = "tdx")]
 const TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE: u64 = 1 << 28;
+#[cfg(feature = "tdx")]
+const TDX_TD_ATTRIBUTES_PERFMON: u64 = 1 << 63;
 #[cfg(feature = "tdx")]
 const KVM_CAP_MAX_VCPUS_RAW: u32 = 66;
 #[cfg(feature = "tdx")]
@@ -496,6 +502,38 @@ impl Default for TdxCapabilitiesLegacy {
             cpuid_configs: [TdxCpuidConfigLegacy::default(); TDX_MAX_NR_CPUID_CONFIGS],
         }
     }
+}
+
+/// Convert a 48-byte measurement seed (mr* field) into the `[u64; 6]` shape
+/// expected on the KVM_TDX_INIT_VM wire. Bytes are read as native (little-
+/// endian on x86) so that the on-wire byte sequence is `mr[0..47]` exactly,
+/// matching QEMU's `memcpy(init_vm->mrconfigid, data, data_len)` (raw byte
+/// copy, no endianness conversion).
+#[cfg(feature = "tdx")]
+fn tdx_mr_seed_to_u64x6(seed: &[u8; 48]) -> [u64; 6] {
+    let mut out = [0u64; 6];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut chunk = [0u8; 8];
+        chunk.copy_from_slice(&seed[i * 8..(i + 1) * 8]);
+        *slot = u64::from_ne_bytes(chunk);
+    }
+    out
+}
+
+/// Compose the requested TDX attribute mask from `TdxAttributes` flags.
+#[cfg(feature = "tdx")]
+fn tdx_requested_attributes(attrs: &TdxAttributes) -> u64 {
+    let mut requested = 0u64;
+    if attrs.sept_ve_disable {
+        requested |= TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
+    }
+    if attrs.debug {
+        requested |= TDX_TD_ATTRIBUTES_DEBUG;
+    }
+    if attrs.perfmon {
+        requested |= TDX_TD_ATTRIBUTES_PERFMON;
+    }
+    requested
 }
 
 #[cfg(feature = "tdx")]
@@ -2047,7 +2085,12 @@ impl vm::Vm for KvmVm {
     /// Initialize TDX for this VM
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_init(&self, cpuid: &[CpuIdEntry], max_vcpus: u32) -> vm::Result<()> {
+    fn tdx_init(
+        &self,
+        cpuid: &[CpuIdEntry],
+        max_vcpus: u32,
+        attrs: &TdxAttributes,
+    ) -> vm::Result<()> {
         if self.tdx_legacy_vm_type {
             for (cap, arg0) in [
                 (KVM_CAP_EXCEPTION_PAYLOAD_RAW, 1),
@@ -2126,13 +2169,55 @@ impl vm::Vm for KvmVm {
                 caps.nr_cpuid_configs,
             );
 
-            let attributes =
-                (TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE & caps.attrs_fixed0) | caps.attrs_fixed1;
+            // Mirrors QEMU `tdx_validate_attributes` against legacy KVM TDX
+            // caps. Legacy ABI exposes `attrs_fixed0` (mask of bits *allowed*
+            // to be variable) and `attrs_fixed1` (mask of bits *forced to 1*),
+            // so the actual TD attributes are
+            //   `(requested & attrs_fixed0) | attrs_fixed1`.
+            let requested_attrs = tdx_requested_attributes(attrs);
+            let attributes = (requested_attrs & caps.attrs_fixed0) | caps.attrs_fixed1;
+            if attributes != requested_attrs {
+                info!(
+                    "TDX legacy attributes adjusted by caps: requested={:#x} \
+                     actual={:#x} fixed0={:#x} fixed1={:#x}",
+                    requested_attrs, attributes, caps.attrs_fixed0, caps.attrs_fixed1,
+                );
+            }
+
+            // xfam: explicit override goes through `xfam_fixed0/1` validation,
+            // otherwise derive from CPUID (legacy path historically omitted
+            // the xfam field — KVM treats the absent struct slot as zero,
+            // which matches how `tdx_legacy_cpuid_entries` shaped CPUID 0xd
+            // before this commit; preserve that for the no-override case to
+            // keep byte-for-byte compatibility with `9263242fc`).
+            let xfam_legacy: Option<u64> = match attrs.xfam {
+                Some(v) => {
+                    if (v & !caps.xfam_fixed0) != 0 {
+                        warn!(
+                            "TDX xfam request {:#x} contains bits forbidden by xfam_fixed0={:#x}",
+                            v, caps.xfam_fixed0,
+                        );
+                    }
+                    if (v & caps.xfam_fixed1) != caps.xfam_fixed1 {
+                        warn!(
+                            "TDX xfam request {:#x} missing bits required by xfam_fixed1={:#x}",
+                            v, caps.xfam_fixed1,
+                        );
+                    }
+                    Some(v)
+                }
+                None => None,
+            };
+
+            let mrconfigid = tdx_mr_seed_to_u64x6(&attrs.mrconfigid);
+            let mrowner = tdx_mr_seed_to_u64x6(&attrs.mrowner);
+            let mrownerconfig = tdx_mr_seed_to_u64x6(&attrs.mrownerconfig);
+
             let data = TdxInitVmLegacy {
                 attributes,
-                mrconfigid: [0; 6],
-                mrowner: [0; 6],
-                mrownerconfig: [0; 6],
+                mrconfigid,
+                mrowner,
+                mrownerconfig,
                 reserved: [0; 1004],
                 cpuid_nent: cpuid_nent as u32,
                 cpuid_padding: 0,
@@ -2140,9 +2225,12 @@ impl vm::Vm for KvmVm {
             };
 
             info!(
-                "TDX legacy KVM_TDX_INIT_VM: attributes={:#x} cpuid_nent={} \
+                "TDX legacy KVM_TDX_INIT_VM: requested_attributes={:#x} \
+                 attributes={:#x} xfam_override={:?} cpuid_nent={} \
                  mrconfigid={:?} mrowner={:?} mrownerconfig={:?}",
+                requested_attrs,
                 data.attributes,
+                xfam_legacy,
                 data.cpuid_nent,
                 data.mrconfigid,
                 data.mrowner,
@@ -2189,7 +2277,39 @@ impl vm::Vm for KvmVm {
             caps.cpuid_nent,
         );
 
-        let xfam = tdx_derive_xfam(&cpuid, caps.supported_xfam);
+        // QEMU `tdx_validate_attributes` (new ABI) only checks
+        // `requested & ~supported_attrs == 0`. We mask defensively as well
+        // (matches `let attributes = requested & caps.supported_attrs`) and
+        // log when caps trimmed any bit so attestation reviewers can spot the
+        // adjustment without re-running the VM.
+        let requested_attrs = tdx_requested_attributes(attrs);
+        let attributes = requested_attrs & caps.supported_attrs;
+        if attributes != requested_attrs {
+            info!(
+                "TDX attributes adjusted by caps: requested={:#x} actual={:#x} \
+                 supported_attrs={:#x}",
+                requested_attrs, attributes, caps.supported_attrs,
+            );
+        }
+
+        // xfam: user override goes through `supported_xfam` mask only (legacy
+        // had `xfam_fixed0/1`, new ABI collapses to a single `supported_xfam`
+        // — see QEMU `setup_td_xfam`). Derive from CPUID when no override.
+        let xfam = match attrs.xfam {
+            Some(v) => {
+                let masked = v & caps.supported_xfam;
+                if masked != v {
+                    info!(
+                        "TDX xfam adjusted by caps: requested={:#x} actual={:#x} \
+                         supported_xfam={:#x}",
+                        v, masked, caps.supported_xfam,
+                    );
+                }
+                masked
+            }
+            None => tdx_derive_xfam(&cpuid, caps.supported_xfam),
+        };
+
         let caps_cpuid_nent = (caps.cpuid_nent as usize).min(TDX_MAX_NR_CPUID_CONFIGS);
         let mut tdx_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> = cpuid
             .into_iter()
@@ -2224,13 +2344,15 @@ impl vm::Vm for KvmVm {
             cpuid_padding: u32,
             cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
         }
-        let attributes = TDX_TD_ATTRIBUTES_SEPT_VE_DISABLE;
+        let mrconfigid = tdx_mr_seed_to_u64x6(&attrs.mrconfigid);
+        let mrowner = tdx_mr_seed_to_u64x6(&attrs.mrowner);
+        let mrownerconfig = tdx_mr_seed_to_u64x6(&attrs.mrownerconfig);
         let data = TdxInitVm {
             attributes,
             xfam,
-            mrconfigid: [0; 6],
-            mrowner: [0; 6],
-            mrownerconfig: [0; 6],
+            mrconfigid,
+            mrowner,
+            mrownerconfig,
             reserved: [0; 12],
             cpuid_nent: cpuid_nent as u32,
             cpuid_padding: 0,
@@ -2238,8 +2360,10 @@ impl vm::Vm for KvmVm {
         };
 
         info!(
-            "TDX KVM_TDX_INIT_VM: attributes={:#x} xfam={:#x} cpuid_nent={} \
-             mrconfigid={:?} mrowner={:?} mrownerconfig={:?}",
+            "TDX KVM_TDX_INIT_VM: requested_attributes={:#x} attributes={:#x} \
+             xfam={:#x} cpuid_nent={} mrconfigid={:?} mrowner={:?} \
+             mrownerconfig={:?}",
+            requested_attrs,
             data.attributes,
             data.xfam,
             data.cpuid_nent,

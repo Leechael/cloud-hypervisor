@@ -61,6 +61,8 @@ pub use vm::{
     DataMatch, HypervisorVmError, InterruptSourceConfig, LegacyIrqSourceConfig, MsiIrqSourceConfig,
     Vm, VmOps,
 };
+#[cfg(feature = "tdx")]
+pub use vm::TdxAttributes;
 
 pub use crate::hypervisor::{Hypervisor, HypervisorError};
 

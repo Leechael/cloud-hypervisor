@@ -322,6 +322,10 @@ pub enum Error {
     TdxFirmwareMissing,
 
     #[cfg(feature = "tdx")]
+    #[error("Invalid TDX attribute: {0}")]
+    InvalidTdxAttribute(String),
+
+    #[cfg(feature = "tdx")]
     #[error("Invalid TDX payload type")]
     InvalidPayloadType,
 
@@ -838,10 +842,68 @@ impl Vm {
             #[cfg(not(target_arch = "x86_64"))]
             let cpuid = cpu_manager.lock().unwrap().common_cpuid();
             let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
-            vm.tdx_init(&cpuid, max_vcpus)
+
+            let tdx_attrs = {
+                let cfg = config.lock().unwrap();
+                Self::build_tdx_attributes(cfg.tdx.as_ref())?
+            };
+
+            vm.tdx_init(&cpuid, max_vcpus, &tdx_attrs)
                 .map_err(Error::InitializeTdxVm)?;
         }
         Ok(())
+    }
+
+    /// Build a `hypervisor::TdxAttributes` from the optional `vmm` `TdxConfig`.
+    ///
+    /// When `cfg` is `None` this returns the defaults that match the pre-P1.2
+    /// hard-coded behaviour (sept_ve_disable on, mr* zero, xfam derived) so
+    /// the byte payload to `KVM_TDX_INIT_VM` is unchanged for callers that
+    /// only set `--platform tdx=on --firmware <path>`.
+    #[cfg(feature = "tdx")]
+    fn build_tdx_attributes(
+        cfg: Option<&crate::vm_config::TdxConfig>,
+    ) -> Result<hypervisor::TdxAttributes> {
+        use crate::vm_config::TdxConfig;
+        fn parse_seed(name: &str, hex: &str) -> Result<[u8; 48]> {
+            let stripped: String = hex
+                .chars()
+                .filter(|c| !matches!(*c, '-' | ':' | ' ' | '_'))
+                .collect();
+            if stripped.len() != 96 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::InvalidTdxAttribute(format!(
+                    "{name}: expected 96 hex chars, got {}",
+                    stripped.len()
+                )));
+            }
+            let mut out = [0u8; 48];
+            for (i, byte) in out.iter_mut().enumerate() {
+                let hi = u8::from_str_radix(&stripped[i * 2..i * 2 + 1], 16)
+                    .map_err(|e| Error::InvalidTdxAttribute(format!("{name}: {e}")))?;
+                let lo = u8::from_str_radix(&stripped[i * 2 + 1..i * 2 + 2], 16)
+                    .map_err(|e| Error::InvalidTdxAttribute(format!("{name}: {e}")))?;
+                *byte = (hi << 4) | lo;
+            }
+            Ok(out)
+        }
+        let mut attrs = hypervisor::TdxAttributes::default();
+        let Some(cfg): Option<&TdxConfig> = cfg else {
+            return Ok(attrs);
+        };
+        attrs.sept_ve_disable = cfg.sept_ve_disable.unwrap_or(true);
+        attrs.debug = cfg.debug;
+        attrs.perfmon = cfg.perfmon;
+        if let Some(s) = cfg.mrconfigid.as_deref() {
+            attrs.mrconfigid = parse_seed("mrconfigid", s)?;
+        }
+        if let Some(s) = cfg.mrowner.as_deref() {
+            attrs.mrowner = parse_seed("mrowner", s)?;
+        }
+        if let Some(s) = cfg.mrownerconfig.as_deref() {
+            attrs.mrownerconfig = parse_seed("mrownerconfig", s)?;
+        }
+        attrs.xfam = cfg.xfam;
+        Ok(attrs)
     }
 
     /// Create and configure the device manager.

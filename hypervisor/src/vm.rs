@@ -51,6 +51,46 @@ impl From<DataMatch> for u64 {
     }
 }
 
+/// TDX-specific knobs forwarded from `vmm::vm_config::TdxConfig` into the
+/// hypervisor backend.
+///
+/// Mirrors QEMU's `-object tdx-guest,...` surface but kept hypervisor-side so
+/// the `vmm` crate doesn't leak into trait signatures here. Defaults match
+/// pre-P1.2 hard-coded behaviour: SEPT_VE_DISABLE on, debug/perfmon off,
+/// `mr*` zeroed, `xfam` derived from CPUID 0xd.
+#[cfg(feature = "tdx")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TdxAttributes {
+    /// `bit 28` (`SEPT_VE_DISABLE`).
+    pub sept_ve_disable: bool,
+    /// `bit 0` (`DEBUG`).
+    pub debug: bool,
+    /// `bit 63` (`PERFMON`).
+    pub perfmon: bool,
+    /// 48-byte measurement seeds passed verbatim to `KVM_TDX_INIT_VM`.
+    pub mrconfigid: [u8; 48],
+    pub mrowner: [u8; 48],
+    pub mrownerconfig: [u8; 48],
+    /// Explicit XFAM override; `None` means derive from CPUID 0xd masked by
+    /// `caps.supported_xfam`.
+    pub xfam: Option<u64>,
+}
+
+#[cfg(feature = "tdx")]
+impl Default for TdxAttributes {
+    fn default() -> Self {
+        Self {
+            sept_ve_disable: true,
+            debug: false,
+            perfmon: false,
+            mrconfigid: [0u8; 48],
+            mrowner: [0u8; 48],
+            mrownerconfig: [0u8; 48],
+            xfam: None,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 ///
 /// Enum for VM error
@@ -419,7 +459,12 @@ pub trait Vm: Send + Sync + Any {
     fn sev_snp_init(&self, guest_policy: SnpPolicy) -> Result<()>;
     #[cfg(feature = "tdx")]
     /// Initialize TDX on this VM
-    fn tdx_init(&self, _cpuid: &[CpuIdEntry], _max_vcpus: u32) -> Result<()> {
+    fn tdx_init(
+        &self,
+        _cpuid: &[CpuIdEntry],
+        _max_vcpus: u32,
+        _attrs: &TdxAttributes,
+    ) -> Result<()> {
         unimplemented!()
     }
     #[cfg(feature = "tdx")]
