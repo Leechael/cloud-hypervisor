@@ -413,6 +413,177 @@ impl Aml for PciDevSlotMethods {
     }
 }
 
+/// PCIe Native HotPlug control bit advertised through `_OSC`.
+const PCIE_OSC_CTRL_HOTPLUG: u32 = 1 << 0;
+/// PCIe Native PME control bit.
+const PCIE_OSC_CTRL_PME: u32 = 1 << 2;
+/// PCIe AER control bit.
+const PCIE_OSC_CTRL_AER: u32 = 1 << 3;
+/// PCIe Capability Structure control bit.
+const PCIE_OSC_CTRL_CAP_STRUCT: u32 = 1 << 4;
+/// Mask of OS-controllable PCIe features we are willing to grant to the OS.
+/// Mirrors what QEMU's q35 advertises in `build_q35_osc`, so OVMF and Linux
+/// pick up native PCIe hot-plug, PME, AER, and capability access.
+const PCIE_OSC_CTRL_MASK: u32 =
+    PCIE_OSC_CTRL_HOTPLUG | PCIE_OSC_CTRL_PME | PCIE_OSC_CTRL_AER | PCIE_OSC_CTRL_CAP_STRUCT;
+
+/// `_OSC` (Operating System Capabilities) method for the PCIe root complex.
+///
+/// The method follows the standard ACPI v6.3 §6.2.11.3 / PCI Firmware Spec
+/// §4.5.1 control negotiation pattern. It declares to firmware (OVMF) and the
+/// OS (Linux) which PCIe features the platform supports and grants control
+/// over native hot-plug, PME, AER, and capability access. Without this,
+/// Linux's `acpi_pci_root_create` cannot transition the host bridge into
+/// native PCIe mode and the existing CH pio hotplug path would not be usable
+/// for OS-driven slot rescans.
+///
+/// Equivalent ASL (per QEMU `build_q35_osc`):
+/// ```asl
+/// Method (_OSC, 4, NotSerialized) {
+///     CreateDWordField (Arg3, 0x00, CDW1)
+///     If (Arg0 == ToUUID ("33db4d5b-1ff7-401c-9657-7441c03dd766")) {
+///         CreateDWordField (Arg3, 0x04, CDW2)
+///         CreateDWordField (Arg3, 0x08, CDW3)
+///         Store (CDW2, SUPP)
+///         Store (CDW3, CTRL)
+///         And  (CTRL, 0x1d, CTRL)        /* keep HotPlug | PME | AER | CapStruct */
+///         If (LNotEqual (Arg1, One)) {
+///             Or (CDW1, 0x08, CDW1)      /* unknown revision */
+///         }
+///         If (LNotEqual (CDW3, CTRL)) {
+///             Or (CDW1, 0x10, CDW1)      /* capability mismatch */
+///         }
+///         Store (CTRL, CDW3)
+///         Return (Arg3)
+///     }
+///     Or (CDW1, 0x04, CDW1)              /* unrecognized UUID */
+///     Return (Arg3)
+/// }
+/// ```
+struct PciOscMethod {}
+
+impl Aml for PciOscMethod {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        // PCI Express Base Specification _OSC UUID, ACPI v6.3 §6.2.11.3.
+        // Mixed-endian per ACPI: d1/d2/d3 little endian, d4 big endian.
+        let uuid = Uuid::parse_str("33DB4D5B-1FF7-401C-9657-7441C03DD766").unwrap();
+        let (d1, d2, d3, d4) = uuid.as_fields();
+        let mut uuid_buf = Vec::with_capacity(16);
+        uuid_buf.extend(d1.to_le_bytes());
+        uuid_buf.extend(d2.to_le_bytes());
+        uuid_buf.extend(d3.to_le_bytes());
+        uuid_buf.extend(d4);
+
+        let cdw1_path = aml::Path::new("CDW1");
+        let cdw2_path = aml::Path::new("CDW2");
+        let cdw3_path = aml::Path::new("CDW3");
+        let supp_path = aml::Path::new("SUPP");
+        let ctrl_path = aml::Path::new("CTRL");
+        let arg3 = aml::Arg(3);
+        let arg1 = aml::Arg(1);
+        let arg0 = aml::Arg(0);
+        let one = aml::ONE;
+        // Bit 2: unrecognized UUID. Bit 3: unknown revision. Bit 4: capability mismatch.
+        let osc_unrecognised_uuid = 0x04u32;
+        let osc_unknown_revision = 0x08u32;
+        let osc_capabilities_mismatch = 0x10u32;
+        let ctrl_mask = PCIE_OSC_CTRL_MASK;
+
+        // CreateDWordField(Arg3, 0, CDW1)
+        let create_cdw1 = aml::CreateDWordField::new(&cdw1_path, &arg3, &0u8);
+        // Inside-If: CreateDWordField(Arg3, 4, CDW2)
+        let create_cdw2 = aml::CreateDWordField::new(&cdw2_path, &arg3, &4u8);
+        let create_cdw3 = aml::CreateDWordField::new(&cdw3_path, &arg3, &8u8);
+
+        let store_supp = aml::Store::new(&supp_path, &cdw2_path);
+        let store_ctrl = aml::Store::new(&ctrl_path, &cdw3_path);
+        let mask_ctrl = aml::And::new(&ctrl_path, &ctrl_path, &ctrl_mask);
+
+        let revision_pred = aml::NotEqual::new(&arg1, &one);
+        let revision_or = aml::Or::new(&cdw1_path, &cdw1_path, &osc_unknown_revision);
+        let revision_check = aml::If::new(&revision_pred, vec![&revision_or]);
+
+        let mismatch_pred = aml::NotEqual::new(&cdw3_path, &ctrl_path);
+        let mismatch_or = aml::Or::new(&cdw1_path, &cdw1_path, &osc_capabilities_mismatch);
+        let mismatch_check = aml::If::new(&mismatch_pred, vec![&mismatch_or]);
+
+        let write_back_ctrl = aml::Store::new(&cdw3_path, &ctrl_path);
+        let return_arg3 = aml::Return::new(&arg3);
+        let return_arg3_outer = aml::Return::new(&arg3);
+
+        let uuid_buffer = aml::BufferData::new(uuid_buf);
+        let uuid_pred = aml::Equal::new(&arg0, &uuid_buffer);
+        let if_uuid = aml::If::new(
+            &uuid_pred,
+            vec![
+                &create_cdw2,
+                &create_cdw3,
+                &store_supp,
+                &store_ctrl,
+                &mask_ctrl,
+                &revision_check,
+                &mismatch_check,
+                &write_back_ctrl,
+                &return_arg3,
+            ],
+        );
+        let unrecognised = aml::Or::new(&cdw1_path, &cdw1_path, &osc_unrecognised_uuid);
+
+        aml::Method::new(
+            "_OSC".into(),
+            4,
+            false,
+            vec![&create_cdw1, &if_uuid, &unrecognised, &return_arg3_outer],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
+/// PCI INTx link device (`LNKA`/`LNKB`/`LNKC`/`LNKD`) backed by a single
+/// IOAPIC GSI. PCI INTx is level-triggered, active-low, and shareable; the
+/// IRQ value comes from the same pool that `device_manager` already wires up
+/// for legacy PCI interrupts via `LegacyIrqGroupConfig`, so the routing
+/// presented through `_PRT` is consistent with what the VMM actually injects.
+struct PciLinkDevice {
+    name: &'static str,
+    irq: u32,
+}
+
+impl Aml for PciLinkDevice {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        aml::Device::new(
+            self.name.into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C0F")),
+                &aml::Name::new("_UID".into(), &(self.irq)),
+                &aml::Name::new("_STA".into(), &0x0Bu8),
+                &aml::Name::new(
+                    "_PRS".into(),
+                    &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
+                        true, false, true, true, self.irq,
+                    )]),
+                ),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
+                        true, false, true, true, self.irq,
+                    )]),
+                ),
+                // _SRS is required by some OSes for link devices but the
+                // routing is fixed in this VMM, so accept and ignore.
+                &aml::Method::new("_SRS".into(), 1, false, vec![]),
+                &aml::Method::new(
+                    "_DIS".into(),
+                    0,
+                    false,
+                    vec![&aml::Store::new(&aml::Path::new("_STA"), &0x09u8)],
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
+    }
+}
+
 struct PciDsmMethod {}
 
 impl Aml for PciDsmMethod {
@@ -491,13 +662,21 @@ impl Aml for PciSegment {
         pci_dsdt_inner_data.push(&uid);
         let cca = aml::Name::new("_CCA".into(), &aml::ONE);
         pci_dsdt_inner_data.push(&cca);
+        // Scratch slots used by `_OSC` to mirror the OS' supported / control
+        // capability words back to the caller. Initialised to zero; written
+        // by `_OSC` on each invocation.
         let supp = aml::Name::new("SUPP".into(), &aml::ZERO);
         pci_dsdt_inner_data.push(&supp);
+        let ctrl = aml::Name::new("CTRL".into(), &aml::ZERO);
+        pci_dsdt_inner_data.push(&ctrl);
 
         let proximity_domain = self.proximity_domain;
         let pxm_return = aml::Return::new(&proximity_domain);
         let pxm = aml::Method::new("_PXM".into(), 0, false, vec![&pxm_return]);
         pci_dsdt_inner_data.push(&pxm);
+
+        let pci_osc = PciOscMethod {};
+        pci_dsdt_inner_data.push(&pci_osc);
 
         let pci_dsm = PciDsmMethod {};
         pci_dsdt_inner_data.push(&pci_dsm);
@@ -576,22 +755,73 @@ impl Aml for PciSegment {
         let pci_device_methods = PciDevSlotMethods {};
         pci_dsdt_inner_data.push(&pci_device_methods);
 
-        // Build PCI routing table, listing IRQs assigned to PCI devices.
-        let prt_package_list: Vec<(u32, u32)> = self
-            .pci_irq_slots
-            .iter()
-            .enumerate()
-            .map(|(i, irq)| (((((i as u32) & 0x1fu32) << 16) | 0xffffu32), *irq as u32))
+        // PCI INTx link devices LNKA..LNKD. Each pins one of the four IRQs
+        // reserved by `reserve_legacy_interrupts_for_pci_devices`, so the
+        // _PRT routing matches the IOAPIC entries the VMM actually injects.
+        let link_irqs: [u32; 4] = [
+            self.pci_irq_slots[0] as u32,
+            self.pci_irq_slots[1] as u32,
+            self.pci_irq_slots[2] as u32,
+            self.pci_irq_slots[3] as u32,
+        ];
+        let lnk_devices: [PciLinkDevice; 4] = [
+            PciLinkDevice {
+                name: "LNKA",
+                irq: link_irqs[0],
+            },
+            PciLinkDevice {
+                name: "LNKB",
+                irq: link_irqs[1],
+            },
+            PciLinkDevice {
+                name: "LNKC",
+                irq: link_irqs[2],
+            },
+            PciLinkDevice {
+                name: "LNKD",
+                irq: link_irqs[3],
+            },
+        ];
+        for lnk in &lnk_devices {
+            pci_dsdt_inner_data.push(lnk);
+        }
+
+        // Build the full PCI Routing Table: 32 device slots × 4 INTx pins
+        // (INTA..INTD). Pin P on device N rotates onto LNK[(N+P) % 4],
+        // matching QEMU's q35 convention so guests with shared expectations
+        // (OVMF, Linux) route INTx consistently with what we declare.
+        let lnk_paths: [aml::Path; 4] = [
+            aml::Path::new("LNKA"),
+            aml::Path::new("LNKB"),
+            aml::Path::new("LNKC"),
+            aml::Path::new("LNKD"),
+        ];
+        // Pre-compute the (bdf, pin) literals so their storage outlives the
+        // packages that reference them.
+        let prt_indices: Vec<(u32, u32, usize)> = (0..32u32)
+            .flat_map(|device_id| {
+                (0..4u32).map(move |pin| {
+                    let bdf = (device_id << 16) | 0xffffu32;
+                    let lnk_idx = ((device_id + pin) & 0x3) as usize;
+                    (bdf, pin, lnk_idx)
+                })
+            })
             .collect();
-        let prt_package_list: Vec<aml::Package> = prt_package_list
+        let prt_zero: u32 = 0;
+        let prt_entries: Vec<aml::Package> = prt_indices
             .iter()
-            .map(|(bdf, irq)| aml::Package::new(vec![bdf, &0u8, &0u8, irq]))
+            .map(|(bdf, pin, lnk_idx)| {
+                aml::Package::new(vec![
+                    bdf as &dyn Aml,
+                    pin as &dyn Aml,
+                    &lnk_paths[*lnk_idx] as &dyn Aml,
+                    &prt_zero as &dyn Aml,
+                ])
+            })
             .collect();
-        let prt_package_list: Vec<&dyn Aml> = prt_package_list
-            .iter()
-            .map(|item| item as &dyn Aml)
-            .collect();
-        let prt = aml::Name::new("_PRT".into(), &aml::Package::new(prt_package_list));
+        let prt_entry_refs: Vec<&dyn Aml> =
+            prt_entries.iter().map(|item| item as &dyn Aml).collect();
+        let prt = aml::Name::new("_PRT".into(), &aml::Package::new(prt_entry_refs));
         pci_dsdt_inner_data.push(&prt);
 
         let pci_name = if self.id == 0 {
