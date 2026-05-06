@@ -220,6 +220,11 @@ pub enum Error {
     ParseFwCfgItem(#[source] OptionParserError),
     #[error("Error parsing common PCI device config")]
     ParsePciDeviceCommonConfig(#[source] OptionParserError),
+    /// Invalid SMBIOS system_uuid
+    #[error(
+        "Invalid smbios.system_uuid '{0}': expected 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    )]
+    InvalidSmbiosUuid(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -323,11 +328,6 @@ pub enum ValidationError {
     /// Invalid option ROM specification
     #[error("Invalid option_roms entry '{0}': expected NAME:PATH and the file must exist")]
     InvalidOptionRom(String),
-    /// Invalid SMBIOS system_uuid
-    #[error(
-        "Invalid smbios.system_uuid '{0}': expected 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
-    )]
-    InvalidSmbiosUuid(String),
     /// Balloon too big
     #[error("Ballon size ({0}) greater than RAM ({1})")]
     BalloonLargerThanRam(u64, u64),
