@@ -1233,8 +1233,27 @@ impl FwCfg {
     }
 
     pub fn add_initramfs_data(&mut self, file: &File, mem_size: Option<usize>) -> Result<()> {
+        // When mem_size is known we already compute a precise ceiling
+        // from `min(size, MEM_32BIT_DEVICES_START) - Q35_ACPI_DATA_RESERVED_SIZE`.
+        // Only the `mem_size = None` path uses this fallback, which
+        // historically pinned the load_end at 0x1f00_0000 (~496 MiB)
+        // — fine for the original 512 MiB TDX test images but too low
+        // for production initramfs blobs (Phala host stacks, NixOS
+        // rescue images, dracut+kmods on Ubuntu cloud images), which
+        // routinely exceed 480 MiB and silently overflow.
+        //
+        // Replace the constant with `Q35_LOWMEM_END - 4 MiB`. That is
+        // the architectural ceiling for any q35 lowmem allocation:
+        // beyond `Q35_LOWMEM_END` the address space belongs to PCI
+        // MMIO and the PCI MMCFG window, where the initramfs cannot
+        // live regardless of guest RAM size. A 4 MiB headroom is
+        // generous enough for page alignment and trailing zero-page
+        // bookkeeping while still leaving ~2 GiB of usable load space.
+        // The minimal-tdx-image path (512 MiB RAM) hits the
+        // `mem_size = Some(...)` branch, so this fallback only matters
+        // for callers that genuinely lack mem_size information.
         #[cfg(target_arch = "x86_64")]
-        const FW_CFG_INITRD_LOAD_END_FALLBACK: u32 = 0x1f00_0000;
+        const FW_CFG_INITRD_LOAD_END_HEADROOM: u64 = 4 << 20;
 
         let initramfs_size = file.metadata()?.len();
         #[cfg(target_arch = "x86_64")]
@@ -1248,7 +1267,16 @@ impl FwCfg {
                 })
                 .filter(|end| *end <= u32::MAX as u64)
                 .map(|end| end as u32)
-                .unwrap_or(FW_CFG_INITRD_LOAD_END_FALLBACK);
+                .unwrap_or_else(|| {
+                    // mem_size unknown: derive from Q35_LOWMEM_END so
+                    // we get a usable ~2 GiB ceiling instead of the
+                    // legacy 496 MiB constant.
+                    let q35_lowmem_top = arch::layout::Q35_LOWMEM_END.0;
+                    let end = q35_lowmem_top.saturating_sub(FW_CFG_INITRD_LOAD_END_HEADROOM);
+                    let end = end.saturating_sub(1);
+                    debug_assert!(end <= u32::MAX as u64);
+                    end as u32
+                });
             let initramfs_addr = (initrd_load_end - initramfs_size as u32) & !0xfff;
             self.known_items[FW_CFG_INITRD_ADDR as usize] = FwCfgContent::U32(initramfs_addr);
             if self.patch_linux_setup_header {
