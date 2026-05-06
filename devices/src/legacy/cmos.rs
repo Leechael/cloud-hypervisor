@@ -23,6 +23,21 @@ const DATA_OFFSET: u64 = 0x1;
 const DATA_LEN: usize = 128;
 
 /// A CMOS/RTC device commonly seen on x86 I/O port 0x70/0x71.
+///
+/// Periodic interrupt delivery (the legacy MC146818 IRQ8 path through
+/// register A/B) is intentionally not implemented here. Since the q35
+/// rework added an emulated HPET (`devices::legacy::hpet`), Linux
+/// programs the HPET into legacy-replacement mode on boot, which
+/// re-routes the RTC clock interrupt through HPET timer 1 instead of
+/// the CMOS chip. The kernel boot log shows this as
+/// `rtc_cmos: ... hpet irqs`. Driving IRQ8 from a userspace timer here
+/// would race the HPET-driven path and produce duplicated ticks, so
+/// the CMOS device is kept timer-free on purpose.
+///
+/// All this device is responsible for is exposing date/time and
+/// memory-size scratch registers to firmware/Linux on reads, plus the
+/// `0x8f` reset shortcut on writes. The HPET (and the LAPIC timer when
+/// HPET is unavailable) provide the actual periodic tick.
 pub struct Cmos {
     index: u8,
     data: [u8; DATA_LEN],
