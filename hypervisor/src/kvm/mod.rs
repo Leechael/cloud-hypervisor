@@ -76,14 +76,14 @@ use crate::arch::x86::{
     CpuIdEntry, FpuState, LapicState, MTRR_MSR_INDICES, MsrEntry, NUM_IOAPIC_PINS,
     SpecialRegisters, XsaveState,
 };
+#[cfg(feature = "tdx")]
+use crate::vm::TdxAttributes;
 use crate::{
     CpuState, HypervisorType, HypervisorVmConfig, InterruptSourceConfig, IoEventAddress,
     IrqRoutingEntry, MpState, StandardRegisters, USER_MEMORY_REGION_GUEST_MEMFD,
     USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
     UserMemoryRegion, VmOps, cpu, hypervisor, vm,
 };
-#[cfg(feature = "tdx")]
-use crate::vm::TdxAttributes;
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
@@ -134,6 +134,8 @@ use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
 
 #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 const KVM_CAP_VM_TYPES_RAW: libc::c_ulong = 235;
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+const KVM_CAP_GUEST_MEMFD_FLAGS_RAW: libc::c_ulong = 244;
 #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 const KVM_X86_TDX_VM_LEGACY: u64 = 2;
 #[cfg(feature = "tdx")]
@@ -1274,8 +1276,8 @@ const KVM_GUEST_MEMFD_ALLOW_HUGEPAGE_RAW: u64 = 1 << 0;
 const KVM_GUEST_MEMFD_HUGEPAGE_SIZE: u64 = 2 * 1024 * 1024;
 
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-fn guest_memfd_create_flags(size: u64) -> u64 {
-    if size % KVM_GUEST_MEMFD_HUGEPAGE_SIZE == 0 {
+fn guest_memfd_create_flags(size: u64, legacy_hugepage: bool) -> u64 {
+    if legacy_hugepage && size % KVM_GUEST_MEMFD_HUGEPAGE_SIZE == 0 {
         KVM_GUEST_MEMFD_ALLOW_HUGEPAGE_RAW
     } else {
         0
@@ -1283,8 +1285,12 @@ fn guest_memfd_create_flags(size: u64) -> u64 {
 }
 
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
-fn create_guest_memfd(vm_fd: &VmFd, size: u64) -> result::Result<OwnedFd, kvm_ioctls::Error> {
-    let flags = guest_memfd_create_flags(size);
+fn create_guest_memfd(
+    vm_fd: &VmFd,
+    size: u64,
+    legacy_hugepage: bool,
+) -> result::Result<OwnedFd, kvm_ioctls::Error> {
+    let flags = guest_memfd_create_flags(size, legacy_hugepage);
     let create = |flags| {
         vm_fd.create_guest_memfd(kvm_create_guest_memfd {
             size,
@@ -1316,6 +1322,8 @@ pub struct KvmVm {
     sev_fd: Option<x86_64::sev::SevFd>,
     dirty_log_slots: RwLock<HashMap<u32, KvmDirtyLogSlot>>,
     guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    guest_memfd_legacy_hugepage: bool,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
     #[cfg(feature = "tdx")]
@@ -1640,6 +1648,8 @@ impl vm::Vm for KvmVm {
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             guest_memfds: self.guest_memfds.clone(),
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            guest_memfd_legacy_hugepage: self.guest_memfd_legacy_hugepage,
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             guest_mem_slots: self.guest_mem_slots.clone(),
             #[cfg(feature = "tdx")]
             tdx_legacy_cpuid: self.tdx_legacy_vm_type,
@@ -1820,8 +1830,12 @@ impl vm::Vm for KvmVm {
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
         let guest_memfd = if let Some(memfds) = &self.guest_memfds {
-            let fd = create_guest_memfd(&self.fd, memory_size as u64)
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+            let fd = create_guest_memfd(
+                &self.fd,
+                memory_size as u64,
+                self.guest_memfd_legacy_hugepage,
+            )
+            .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
             let raw_fd = fd.as_raw_fd() as u32;
             memfds.write().unwrap().insert(slot, fd);
             raw_fd
@@ -2798,6 +2812,12 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             let mut guest_memfds = None;
             #[cfg(any(feature = "sev_snp", feature = "tdx"))]
             let mut guest_mem_slots = None;
+            #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+            // Upstream kernels advertise KVM_CAP_GUEST_MEMFD_FLAGS, where bit 0
+            // is GUEST_MEMFD_FLAG_MMAP. Older tdxlab kernels return 0 here and
+            // use bit 0 as KVM_GUEST_MEMFD_ALLOW_HUGEPAGE instead.
+            let guest_memfd_legacy_hugepage = _config.tdx_enabled
+                && self.kvm.check_extension_raw(KVM_CAP_GUEST_MEMFD_FLAGS_RAW) == 0;
             if (_config.tdx_enabled || {
                 #[cfg(feature = "sev_snp")]
                 {
@@ -2877,6 +2897,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 sev_fd,
                 guest_memfds,
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+                guest_memfd_legacy_hugepage,
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 guest_mem_slots,
                 #[cfg(feature = "tdx")]
                 tdx_legacy_vm_type: _config.tdx_enabled && vm_type == KVM_X86_TDX_VM_LEGACY,
@@ -2889,6 +2911,8 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 fd: Arc::new(fd),
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 guest_memfds: None,
+                #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+                guest_memfd_legacy_hugepage: false,
                 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
                 guest_mem_slots: None,
             }))
@@ -2986,6 +3010,8 @@ pub struct KvmVcpu {
     vm_fd: Arc<VmFd>,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_memfds: Option<Arc<RwLock<HashMap<u32, OwnedFd>>>>,
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    guest_memfd_legacy_hugepage: bool,
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]
     guest_mem_slots: Option<Arc<RwLock<HashMap<u32, KvmGuestMemSlot>>>>,
     #[cfg(feature = "tdx")]
@@ -3533,7 +3559,11 @@ impl cpu::Vcpu for KvmVcpu {
             for slot in &slots {
                 let mut slot = *slot;
                 if let Some(guest_memfds) = &self.guest_memfds {
-                    let fd = match create_guest_memfd(&self.vm_fd, slot.memory_size) {
+                    let fd = match create_guest_memfd(
+                        &self.vm_fd,
+                        slot.memory_size,
+                        self.guest_memfd_legacy_hugepage,
+                    ) {
                         Ok(fd) => fd,
                         Err(e) => {
                             restore_result = Err(cpu::HypervisorCpuError::SetCpuid(e.into()));
