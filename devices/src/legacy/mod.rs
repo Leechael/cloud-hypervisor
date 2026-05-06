@@ -14,6 +14,8 @@ pub mod fw_cfg;
 mod fwdebug;
 #[cfg(target_arch = "aarch64")]
 mod gpio_pl061;
+#[cfg(target_arch = "x86_64")]
+mod hpet;
 mod i8042;
 #[cfg(target_arch = "x86_64")]
 mod pc_compat;
@@ -34,6 +36,8 @@ pub use self::fwdebug::FwDebugDevice;
 pub use self::gpio_pl061::Error as GpioDeviceError;
 #[cfg(target_arch = "aarch64")]
 pub use self::gpio_pl061::Gpio;
+#[cfg(target_arch = "x86_64")]
+pub use self::hpet::{HPET_BASE, HPET_LEN, HPET_NUM_TIMERS, Hpet, hpet_block_id};
 pub use self::i8042::I8042Device;
 #[cfg(target_arch = "x86_64")]
 pub use self::pc_compat::{

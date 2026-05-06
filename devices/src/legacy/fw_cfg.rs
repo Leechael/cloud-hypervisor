@@ -615,8 +615,17 @@ impl FwCfg {
         let mut arch_known_items = BTreeMap::new();
         #[cfg(target_arch = "x86_64")]
         {
+            // Per QEMU `hw/i386/fw_cfg.c::fw_cfg_init_hpet`: byte 0 is
+            // the count/event-mask (0 = first instance present), bytes
+            // 1..5 are the timer block ID (LE u32), bytes 5..13 are the
+            // MMIO base address (LE u64), the trailing min_tick / page
+            // protection bytes stay zero.
             let mut hpet_config = vec![0; HPET_FW_CONFIG_SIZE];
-            hpet_config[0] = u8::MAX;
+            hpet_config[0] = 0;
+            let block_id = crate::legacy::hpet_block_id().to_le_bytes();
+            hpet_config[1..5].copy_from_slice(&block_id);
+            let address = crate::legacy::HPET_BASE.to_le_bytes();
+            hpet_config[5..13].copy_from_slice(&address);
 
             arch_known_items.insert(FW_CFG_ACPI_TABLES, FwCfgContent::Bytes(Vec::new()));
             arch_known_items.insert(

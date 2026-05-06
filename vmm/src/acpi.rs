@@ -395,6 +395,36 @@ fn create_tpm2_table() -> Sdt {
     tpm
 }
 
+#[cfg(target_arch = "x86_64")]
+fn create_hpet_table(hpet_id: u32) -> Sdt {
+    // ACPI 2.0 HPET Description Table (IA-PC HPET spec 1.0a §3.2.4)
+    // Length = 36 (header) + 4 (block id) + 12 (GAS) + 1 + 2 + 1 = 56.
+    let mut hpet = Sdt::new(*b"HPET", 56, 1, *b"CLOUDH", *b"CHHPET  ", 1);
+
+    // Event Timer Block ID at offset 36.
+    hpet.write(36, hpet_id);
+
+    // BaseAddress as a Generic Address Structure starting at offset 40.
+    // QEMU emits {space=0, bit_width=0, bit_offset=0, access_size=0,
+    // address=0xfed0_0000} on the wire, so build the struct manually
+    // rather than using `GenericAddress::mmio_address::<u64>()` (which
+    // would set bit_width=64 and access_size=4).
+    hpet.write(40, 0u8); // address_space_id (system memory)
+    hpet.write(41, 0u8); // register_bit_width
+    hpet.write(42, 0u8); // register_bit_offset
+    hpet.write(43, 0u8); // access_size
+    hpet.write(44, devices::legacy::HPET_BASE);
+
+    hpet.write(52, 0u8); // HPET Number
+    // Main Counter Minimum Clock Tick (Periodic Mode). QEMU's
+    // hw/i386/acpi-build.c emits 0; verified in the reference tree.
+    hpet.write(53, 0u16);
+    hpet.write(55, 0u8); // Page Protection And OEM Attribute
+
+    hpet.update_checksum();
+    hpet
+}
+
 fn create_srat_table(
     numa_nodes: &NumaNodes,
     device_manager: &DeviceManager,
@@ -949,6 +979,17 @@ fn create_acpi_tables_internal(
     prev_tbl_len = mcfg.len() as u64;
     prev_tbl_addr = mcfg_addr;
 
+    // HPET
+    #[cfg(target_arch = "x86_64")]
+    {
+        let hpet = create_hpet_table(devices::legacy::hpet_block_id());
+        let hpet_addr = prev_tbl_addr.checked_add(prev_tbl_len).unwrap();
+        tables_bytes.extend_from_slice(hpet.as_slice());
+        xsdt_table_pointers.push(hpet_addr.0);
+        prev_tbl_len = hpet.len() as u64;
+        prev_tbl_addr = hpet_addr;
+    }
+
     // SPCR and DBG2
     #[cfg(target_arch = "aarch64")]
     {
@@ -1182,6 +1223,9 @@ pub fn create_acpi_tables_tdx(
 
     // MCFG
     tables.push(create_mcfg_table(device_manager.pci_segments()));
+
+    // HPET
+    tables.push(create_hpet_table(devices::legacy::hpet_block_id()));
 
     // SRAT and SLIT
     // Only created if the NUMA nodes list is not empty.

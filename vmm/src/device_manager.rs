@@ -2303,6 +2303,43 @@ impl DeviceManager {
             .insert(debug_port, 0x80, 0x1)
             .map_err(DeviceManagerError::BusError)?;
 
+        // HPET MMIO at 0xfed0_0000 with 5 interrupt groups: timer 0/1/2
+        // wired to IO-APIC IRQ 2/8/11 plus PIT (IRQ2) and RTC (IRQ8)
+        // aliases for legacy replacement routing.
+        let hpet_t0 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 2 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_t1 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 8 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_t2 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 11 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_legacy_pit = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 2 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_legacy_rtc = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 8 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet = Arc::new(Mutex::new(devices::legacy::Hpet::new(vec![
+            hpet_t0,
+            hpet_t1,
+            hpet_t2,
+            hpet_legacy_pit,
+            hpet_legacy_rtc,
+        ])));
+        self.bus_devices
+            .push(Arc::clone(&hpet) as Arc<dyn BusDeviceSync>);
+        info!(
+            "Adding HPET MMIO at {:#x} ({} bytes)",
+            devices::legacy::HPET_BASE,
+            devices::legacy::HPET_LEN
+        );
+        self.address_manager
+            .mmio_bus
+            .insert(hpet, devices::legacy::HPET_BASE, devices::legacy::HPET_LEN)
+            .map_err(DeviceManagerError::BusError)?;
+
         Ok(())
     }
 
