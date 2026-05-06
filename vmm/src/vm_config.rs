@@ -141,6 +141,14 @@ pub struct PlatformConfig {
     pub iommufd: bool,
     #[serde(default = "default_platformconfig_vfio_p2p_dma")]
     pub vfio_p2p_dma: bool,
+    /// Optional fw_cfg option ROM mappings of the form `NAME:PATH`.
+    ///
+    /// Empty by default, so deployments are not coupled to QEMU's package
+    /// layout. Typical entries:
+    ///   - `genroms/kvmvapic.bin:/path/to/kvmvapic.bin`
+    ///   - `genroms/linuxboot_dma.bin:/path/to/linuxboot_dma.bin`
+    #[serde(default)]
+    pub option_roms: Option<Vec<String>>,
 }
 
 pub const DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT: u32 = 1;

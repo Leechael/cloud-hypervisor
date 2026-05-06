@@ -17,6 +17,7 @@ use std::{
     io::{ErrorKind, Read, Result, Seek, SeekFrom},
     mem::offset_of,
     os::unix::fs::FileExt,
+    path::PathBuf,
     sync::{Arc, Barrier},
 };
 
@@ -221,6 +222,16 @@ pub struct FwCfg {
     pub dma_pre_hook: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     linuxboot_option_rom_enabled: bool,
     patch_linux_setup_header: bool,
+    /// Optional list of (fw_cfg name, host path) pairs for option ROMs.
+    ///
+    /// Typical entries used by OVMF/SeaBIOS:
+    ///   ("genroms/kvmvapic.bin",       "/usr/share/qemu/kvmvapic.bin")
+    ///   ("genroms/linuxboot_dma.bin",  "/usr/share/qemu/linuxboot_dma.bin")
+    ///
+    /// Empty by default: callers must opt in explicitly. When the list does
+    /// not contain `genroms/linuxboot_dma.bin`, no `bootorder` entry is
+    /// emitted either.
+    option_roms: Vec<(String, PathBuf)>,
 }
 
 impl std::fmt::Debug for FwCfg {
@@ -239,6 +250,7 @@ impl std::fmt::Debug for FwCfg {
                 &self.linuxboot_option_rom_enabled,
             )
             .field("patch_linux_setup_header", &self.patch_linux_setup_header)
+            .field("option_roms", &self.option_roms)
             .finish()
     }
 }
@@ -589,13 +601,14 @@ impl FwCfg {
     }
 
     pub fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> FwCfg {
-        Self::new_with_options(memory, true, true)
+        Self::new_with_options(memory, true, true, Vec::new())
     }
 
     pub fn new_with_options(
         memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
         linuxboot_option_rom_enabled: bool,
         patch_linux_setup_header: bool,
+        option_roms: Vec<(String, PathBuf)>,
     ) -> FwCfg {
         const DEFAULT_ITEM: FwCfgContent = FwCfgContent::Slice(&[]);
         let mut known_items = [DEFAULT_ITEM; FW_CFG_KNOWN_ITEMS];
@@ -646,6 +659,7 @@ impl FwCfg {
             dma_pre_hook: None,
             linuxboot_option_rom_enabled,
             patch_linux_setup_header,
+            option_roms,
         }
     }
 
@@ -849,7 +863,9 @@ impl FwCfg {
 
     #[cfg(target_arch = "x86_64")]
     fn add_qemu_compat_files(&mut self) -> Result<()> {
-        const KVMVAPIC_ROM: &str = "/usr/share/qemu/kvmvapic.bin";
+        // Historical QEMU layout for reference only; we no longer hard-code
+        // these paths. Operators that want OVMF's kvmvapic option ROM must
+        // pass `--platform option_rom=genroms/kvmvapic.bin=/path/to/kvmvapic.bin`.
         const KVMVAPIC_FW_CFG: &str = "genroms/kvmvapic.bin";
 
         self.add_item_if_missing("bios-geometry", FwCfgContent::Bytes(Vec::new()))?;
@@ -893,48 +909,63 @@ impl FwCfg {
             FwCfgContent::Bytes(vec![128, 0, 0, 129, 128, 128]),
         )?;
         self.add_item_if_missing("etc/tpm/log", FwCfgContent::Bytes(Vec::new()))?;
-        if !self.has_item(KVMVAPIC_FW_CFG) {
-            match File::open(KVMVAPIC_ROM) {
-                Ok(file) => self.add_item(FwCfgItem {
-                    name: KVMVAPIC_FW_CFG.to_string(),
-                    content: FwCfgContent::File(0, file),
-                })?,
-                Err(e) => {
-                    info!("Skipping kvmvapic option ROM {KVMVAPIC_ROM}: {e}");
-                    self.add_item(FwCfgItem {
-                        name: KVMVAPIC_FW_CFG.to_string(),
-                        content: FwCfgContent::Bytes(Vec::new()),
-                    })?;
-                }
-            }
-        }
+        // The kvmvapic ROM is only emitted when the operator explicitly
+        // configures it. If unset we deliberately leave the entry absent so
+        // OVMF falls back to its built-in handling rather than reading an
+        // empty blob. Pre-existing logic that registered an empty
+        // `genroms/kvmvapic.bin` item only existed to mirror QEMU's package
+        // layout and is no longer required.
+        let _ = KVMVAPIC_FW_CFG; // documentation anchor only
         Ok(())
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn add_linuxboot_option_rom(&mut self) -> Result<()> {
-        if !self.linuxboot_option_rom_enabled {
-            return Ok(());
-        }
-
-        const LINUXBOOT_DMA_ROM: &str = "/usr/share/qemu/linuxboot_dma.bin";
+    fn add_configured_option_roms(&mut self) -> Result<()> {
+        // Operators opt in to option ROMs by passing
+        //   --platform option_roms=NAME:PATH[,NAME:PATH...]
+        // (see `vmm::config::PlatformConfig`). Without that, no QEMU
+        // package files are required at runtime — historically CH would
+        // silently look in `/usr/share/qemu/` which forced every host to
+        // ship the QEMU package.
+        //
+        // The linuxboot_option_rom_enabled flag still gates the emission of
+        // the auto-generated `bootorder` entry, since some firmware images
+        // (notably TDX-hardened OVMF with strict measured boot) do not want
+        // the boot path coerced to the option-ROM device.
         const LINUXBOOT_DMA_FW_CFG: &str = "genroms/linuxboot_dma.bin";
         const LINUXBOOT_DMA_BOOT_PATH: &[u8] = b"/rom@genroms/linuxboot_dma.bin\0";
 
-        match File::open(LINUXBOOT_DMA_ROM) {
-            Ok(file) => {
-                self.add_item(FwCfgItem {
-                    name: LINUXBOOT_DMA_FW_CFG.to_string(),
-                    content: FwCfgContent::File(0, file),
-                })?;
-                self.add_item(FwCfgItem {
-                    name: "bootorder".to_string(),
-                    content: FwCfgContent::Bytes(LINUXBOOT_DMA_BOOT_PATH.to_vec()),
-                })?;
+        if self.option_roms.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<(String, PathBuf)> = self.option_roms.clone();
+        let mut emitted_linuxboot = false;
+        for (name, path) in entries {
+            match File::open(&path) {
+                Ok(file) => {
+                    self.add_item(FwCfgItem {
+                        name: name.clone(),
+                        content: FwCfgContent::File(0, file),
+                    })?;
+                    if name == LINUXBOOT_DMA_FW_CFG {
+                        emitted_linuxboot = true;
+                    }
+                }
+                Err(e) => {
+                    info!(
+                        "Skipping option ROM {name} from {}: {e}",
+                        path.display()
+                    );
+                }
             }
-            Err(e) => {
-                info!("Skipping linuxboot option ROM {LINUXBOOT_DMA_ROM}: {e}");
-            }
+        }
+
+        if emitted_linuxboot && self.linuxboot_option_rom_enabled && !self.has_item("bootorder") {
+            self.add_item(FwCfgItem {
+                name: "bootorder".to_string(),
+                content: FwCfgContent::Bytes(LINUXBOOT_DMA_BOOT_PATH.to_vec()),
+            })?;
         }
 
         Ok(())
@@ -1159,7 +1190,7 @@ impl FwCfg {
             content: FwCfgContent::File(0, file.try_clone()?),
         })?;
         #[cfg(target_arch = "x86_64")]
-        self.add_linuxboot_option_rom()?;
+        self.add_configured_option_roms()?;
         Ok(())
     }
 

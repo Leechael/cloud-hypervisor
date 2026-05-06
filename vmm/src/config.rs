@@ -312,6 +312,9 @@ pub enum ValidationError {
         "IOMMU address width in bits ({0}) should be less than or equal to {MAX_IOMMU_ADDRESS_WIDTH_BITS}"
     )]
     InvalidIommuAddressWidthBits(u8),
+    /// Invalid option ROM specification
+    #[error("Invalid option_roms entry '{0}': expected NAME:PATH and the file must exist")]
+    InvalidOptionRom(String),
     /// Balloon too big
     #[error("Ballon size ({0}) greater than RAM ({1})")]
     BalloonLargerThanRam(u64, u64),
@@ -819,7 +822,8 @@ impl PlatformConfig {
             \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
             iommu_address_width=<bits>,serial_number=<dmi_device_serial_number>,\
             uuid=<dmi_device_uuid>,oem_strings=<list_of_strings>,iommufd=on|off,\
-            vfio_p2p_dma=on|off"
+            vfio_p2p_dma=on|off,\
+            option_roms=<list_of_NAME:PATH>"
                 .to_string();
 
             if cfg!(feature = "tdx") {
@@ -848,7 +852,8 @@ impl PlatformConfig {
             .add("uuid")
             .add("oem_strings")
             .add("iommufd")
-            .add("vfio_p2p_dma");
+            .add("vfio_p2p_dma")
+            .add("option_roms");
         #[cfg(feature = "tdx")]
         parser.add("tdx");
         #[cfg(feature = "sev_snp")]
@@ -885,6 +890,10 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
             .0;
+        let option_roms = parser
+            .convert::<StringList>("option_roms")
+            .map_err(Error::ParsePlatform)?
+            .map(|v| v.0);
         #[cfg(feature = "tdx")]
         let tdx = parser
             .convert::<Toggle>("tdx")
@@ -910,6 +919,7 @@ impl PlatformConfig {
             tdx,
             #[cfg(feature = "sev_snp")]
             sev_snp,
+            option_roms,
         })
     }
 
@@ -932,6 +942,20 @@ impl PlatformConfig {
             return Err(ValidationError::InvalidIommuAddressWidthBits(
                 self.iommu_address_width_bits,
             ));
+        }
+
+        if let Some(roms) = self.option_roms.as_ref() {
+            for entry in roms {
+                let mut parts = entry.splitn(2, ':');
+                let name = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                if name.is_empty() || path.is_empty() {
+                    return Err(ValidationError::InvalidOptionRom(entry.clone()));
+                }
+                if !std::path::Path::new(path).exists() {
+                    return Err(ValidationError::InvalidOptionRom(entry.clone()));
+                }
+            }
         }
 
         Ok(())
@@ -4874,6 +4898,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            option_roms: None,
         }
     }
 

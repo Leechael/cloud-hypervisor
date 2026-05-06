@@ -1682,10 +1682,34 @@ impl DeviceManager {
         #[cfg(not(feature = "tdx"))]
         let patch_linux_setup_header = true;
 
+        let option_roms: Vec<(String, std::path::PathBuf)> = self
+            .config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .and_then(|p| p.option_roms.as_ref())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let mut parts = entry.splitn(2, ':');
+                        let name = parts.next()?.to_string();
+                        let path = parts.next()?;
+                        if name.is_empty() || path.is_empty() {
+                            return None;
+                        }
+                        Some((name, std::path::PathBuf::from(path)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new_with_options(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
             linuxboot_option_rom_enabled,
             patch_linux_setup_header,
+            option_roms,
         )));
 
         self.fw_cfg = Some(fw_cfg.clone());
