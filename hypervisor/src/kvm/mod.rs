@@ -1268,6 +1268,43 @@ struct KvmGuestMemSlot {
     guest_memfd: u32,
 }
 
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+const KVM_GUEST_MEMFD_ALLOW_HUGEPAGE_RAW: u64 = 1 << 0;
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+const KVM_GUEST_MEMFD_HUGEPAGE_SIZE: u64 = 2 * 1024 * 1024;
+
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+fn guest_memfd_create_flags(size: u64) -> u64 {
+    if size % KVM_GUEST_MEMFD_HUGEPAGE_SIZE == 0 {
+        KVM_GUEST_MEMFD_ALLOW_HUGEPAGE_RAW
+    } else {
+        0
+    }
+}
+
+#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+fn create_guest_memfd(vm_fd: &VmFd, size: u64) -> result::Result<OwnedFd, kvm_ioctls::Error> {
+    let flags = guest_memfd_create_flags(size);
+    let create = |flags| {
+        vm_fd.create_guest_memfd(kvm_create_guest_memfd {
+            size,
+            flags,
+            ..Default::default()
+        })
+    };
+
+    match create(flags) {
+        // SAFETY: KVM returned a new owned file descriptor.
+        Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+        Err(e) if flags != 0 && e.errno() == libc::EINVAL => {
+            // Older kernels may expose guest_memfd without accepting the hugepage
+            // flag. Fall back to the baseline ABI in that case.
+            create(0).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
     fd: Arc<VmFd>,
@@ -1783,17 +1820,8 @@ impl vm::Vm for KvmVm {
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
         let guest_memfd = if let Some(memfds) = &self.guest_memfds {
-            // SAFETY: Safe because guest regions are guaranteed not to overlap.
-            let fd = unsafe {
-                OwnedFd::from_raw_fd(
-                    self.fd
-                        .create_guest_memfd(kvm_create_guest_memfd {
-                            size: memory_size as u64,
-                            ..Default::default()
-                        })
-                        .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?,
-                )
-            };
+            let fd = create_guest_memfd(&self.fd, memory_size as u64)
+                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
             let raw_fd = fd.as_raw_fd() as u32;
             memfds.write().unwrap().insert(slot, fd);
             raw_fd
@@ -3505,14 +3533,8 @@ impl cpu::Vcpu for KvmVcpu {
             for slot in &slots {
                 let mut slot = *slot;
                 if let Some(guest_memfds) = &self.guest_memfds {
-                    let fd = match self.vm_fd.create_guest_memfd(kvm_create_guest_memfd {
-                        size: slot.memory_size,
-                        ..Default::default()
-                    }) {
-                        Ok(fd) => {
-                            // SAFETY: KVM returned a new owned file descriptor.
-                            unsafe { OwnedFd::from_raw_fd(fd) }
-                        }
+                    let fd = match create_guest_memfd(&self.vm_fd, slot.memory_size) {
+                        Ok(fd) => fd,
                         Err(e) => {
                             restore_result = Err(cpu::HypervisorCpuError::SetCpuid(e.into()));
                             break;
