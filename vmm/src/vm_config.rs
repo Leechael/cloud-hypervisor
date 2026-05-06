@@ -1011,6 +1011,47 @@ impl ApplyLandlock for TpmConfig {
     }
 }
 
+/// Optional TDX-specific configuration consumed by the new `--tdx` CLI option.
+///
+/// Mirrors the knobs QEMU exposes via `-object tdx-guest,...`. Every field
+/// other than `firmware` is optional; defaults match the historical hard-coded
+/// behaviour (sept_ve_disable on, debug/perfmon off, mr* zeroed, xfam derived
+/// from CPUID) so that `--tdx firmware=<path>` alone is byte-equivalent to the
+/// legacy `--platform tdx=on --firmware <path>` invocation.
+#[cfg(feature = "tdx")]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TdxConfig {
+    pub firmware: PathBuf,
+    /// `bit 28` (`SEPT_VE_DISABLE`). Defaults to `Some(true)` when not set.
+    #[serde(default)]
+    pub sept_ve_disable: Option<bool>,
+    /// `bit 0` (`DEBUG`).
+    #[serde(default)]
+    pub debug: bool,
+    /// `bit 63` (`PERFMON`).
+    #[serde(default)]
+    pub perfmon: bool,
+    /// 48-byte measurement seed; raw hex (96 chars, optional dashes/colons).
+    #[serde(default)]
+    pub mrconfigid: Option<String>,
+    #[serde(default)]
+    pub mrowner: Option<String>,
+    #[serde(default)]
+    pub mrownerconfig: Option<String>,
+    /// Explicit XFAM override. `None` means derive from CPUID 0xd, masked by
+    /// `caps.supported_xfam`.
+    #[serde(default)]
+    pub xfam: Option<u64>,
+}
+
+#[cfg(feature = "tdx")]
+impl ApplyLandlock for TdxConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        landlock.add_rule_with_access(&self.firmware, "r")?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LandlockConfig {
     pub path: PathBuf,
@@ -1066,6 +1107,9 @@ pub struct VmConfig {
     pub gdb: bool,
     pub pci_segments: Option<Vec<PciSegmentConfig>>,
     pub platform: Option<PlatformConfig>,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx: Option<TdxConfig>,
     pub tpm: Option<TpmConfig>,
     // Preserved FDs are the ones that share the same life-time as its holding
     // VmConfig instance, such as FDs for creating TAP devices.
@@ -1164,6 +1208,11 @@ impl VmConfig {
 
         if let Some(tpm_config) = &self.tpm {
             tpm_config.apply_landlock(&mut landlock)?;
+        }
+
+        #[cfg(feature = "tdx")]
+        if let Some(tdx_config) = &self.tdx {
+            tdx_config.apply_landlock(&mut landlock)?;
         }
 
         if self.net.is_some() {

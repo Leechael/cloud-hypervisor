@@ -31,6 +31,8 @@ use vmm::vm_config;
 use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
 use vmm::vm_config::IvshmemConfig;
+#[cfg(feature = "tdx")]
+use vmm::vm_config::TdxConfig;
 use vmm::vm_config::{
     BalloonConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, LandlockConfig,
     NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig, RateLimiterGroupConfig,
@@ -445,6 +447,12 @@ fn get_cli_options_sorted(
             .help("Control serial port: off|null|pty|tty|file=</path/to/a/file>|socket=</path/to/a/file>")
             .default_value("null")
             .group("vm-config"),
+        #[cfg(feature = "tdx")]
+        Arg::new("tdx")
+            .long("tdx")
+            .num_args(1)
+            .help(TdxConfig::SYNTAX)
+            .group("vm-payload"),
         Arg::new("tpm")
             .long("tpm")
             .num_args(1)

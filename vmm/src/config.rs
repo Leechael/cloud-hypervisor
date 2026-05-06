@@ -168,6 +168,14 @@ pub enum Error {
     #[error("TDX firmware missing")]
     /// No TDX firmware
     FirmwarePathMissing,
+    #[cfg(feature = "tdx")]
+    #[error("Error parsing --tdx: {0}={1}: expected 96 hex chars (48 bytes)")]
+    /// Invalid measurement-seed hex string supplied to --tdx
+    InvalidTdxMeasurementHex(&'static str, String),
+    #[cfg(feature = "tdx")]
+    #[error("Error parsing --tdx: xfam: expected u64 (decimal or 0x-prefixed hex)")]
+    /// Invalid xfam u64 supplied to --tdx
+    InvalidTdxXfam,
     /// Failed parsing userspace device
     #[error("Error parsing --user-device")]
     ParseUserDevice(#[source] OptionParserError),
@@ -471,6 +479,8 @@ pub struct VmParams<'a> {
     pub gdb: bool,
     pub pci_segments: Option<Vec<&'a str>>,
     pub platform: Option<&'a str>,
+    #[cfg(feature = "tdx")]
+    pub tdx: Option<&'a str>,
     pub tpm: Option<&'a str>,
     #[cfg(feature = "igvm")]
     pub igvm: Option<&'a str>,
@@ -541,6 +551,8 @@ impl<'a> VmParams<'a> {
             .get_many::<String>("pci-segment")
             .map(|x| x.map(|y| y as &str).collect());
         let platform = args.get_one::<String>("platform").map(|x| x as &str);
+        #[cfg(feature = "tdx")]
+        let tdx = args.get_one::<String>("tdx").map(|x| x as &str);
         #[cfg(feature = "guest_debug")]
         let gdb = args.contains_id("gdb");
         let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
@@ -590,6 +602,8 @@ impl<'a> VmParams<'a> {
             gdb,
             pci_segments,
             platform,
+            #[cfg(feature = "tdx")]
+            tdx,
             tpm,
             #[cfg(feature = "igvm")]
             igvm,
@@ -2866,6 +2880,101 @@ impl TpmConfig {
     }
 }
 
+#[cfg(feature = "tdx")]
+fn parse_tdx_xfam(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    let (radix, body) = if let Some(stripped) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (16u32, stripped)
+    } else {
+        (10u32, trimmed)
+    };
+    u64::from_str_radix(body, radix).map_err(|_| Error::InvalidTdxXfam)
+}
+
+#[cfg(feature = "tdx")]
+fn validate_tdx_measurement_hex(field: &'static str, raw: &str) -> Result<String> {
+    // Strip optional separators commonly used by humans / paste sources.
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !matches!(*c, '-' | ':' | ' ' | '_'))
+        .collect();
+    if stripped.len() != 96 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::InvalidTdxMeasurementHex(field, raw.to_string()));
+    }
+    Ok(stripped)
+}
+
+#[cfg(feature = "tdx")]
+impl TdxConfig {
+    pub const SYNTAX: &'static str = "TDX guest configuration \
+        \"firmware=</path/to/tdvf>,sept_ve_disable=on|off,debug=on|off,\
+        perfmon=on|off,mrconfigid=<96 hex chars>,mrowner=<96 hex chars>,\
+        mrownerconfig=<96 hex chars>,xfam=<u64 (0x prefix accepted)>\"";
+
+    pub fn parse(tdx: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser
+            .add("firmware")
+            .add("sept_ve_disable")
+            .add("debug")
+            .add("perfmon")
+            .add("mrconfigid")
+            .add("mrowner")
+            .add("mrownerconfig")
+            .add("xfam");
+        parser.parse(tdx).map_err(Error::ParseTdx)?;
+
+        let firmware = parser
+            .get("firmware")
+            .map(PathBuf::from)
+            .ok_or(Error::FirmwarePathMissing)?;
+
+        let sept_ve_disable = parser
+            .convert::<Toggle>("sept_ve_disable")
+            .map_err(Error::ParseTdx)?
+            .map(|t| t.0);
+        let debug = parser
+            .convert::<Toggle>("debug")
+            .map_err(Error::ParseTdx)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let perfmon = parser
+            .convert::<Toggle>("perfmon")
+            .map_err(Error::ParseTdx)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        let mrconfigid = parser
+            .get("mrconfigid")
+            .map(|s| validate_tdx_measurement_hex("mrconfigid", &s))
+            .transpose()?;
+        let mrowner = parser
+            .get("mrowner")
+            .map(|s| validate_tdx_measurement_hex("mrowner", &s))
+            .transpose()?;
+        let mrownerconfig = parser
+            .get("mrownerconfig")
+            .map(|s| validate_tdx_measurement_hex("mrownerconfig", &s))
+            .transpose()?;
+
+        let xfam = parser.get("xfam").map(|s| parse_tdx_xfam(&s)).transpose()?;
+
+        Ok(TdxConfig {
+            firmware,
+            sept_ve_disable,
+            debug,
+            perfmon,
+            mrconfigid,
+            mrowner,
+            mrownerconfig,
+            xfam,
+        })
+    }
+}
+
 impl LandlockConfig {
     pub const SYNTAX: &'static str = "Landlock parameters \
         \"path=<path/to/{file/dir}>,access=[rw]\"";
@@ -2997,9 +3106,14 @@ impl VmConfig {
 
         #[cfg(feature = "tdx")]
         {
-            let tdx_enabled = self.platform.as_ref().is_some_and(|p| p.tdx);
-            // At this point we know payload isn't None.
-            if tdx_enabled && self.payload.as_ref().unwrap().firmware.is_none() {
+            let tdx_enabled = self.is_tdx_enabled();
+            // Firmware can come from either `--firmware` (PayloadConfig) or
+            // `--tdx firmware=...` (TdxConfig). Either is acceptable; the TD
+            // firmware loader prefers `payload.firmware` and falls back to
+            // `tdx.firmware` when only the latter is provided.
+            let firmware_present = self.payload.as_ref().is_some_and(|p| p.firmware.is_some())
+                || self.tdx.as_ref().is_some();
+            if tdx_enabled && !firmware_present {
                 return Err(ValidationError::TdxFirmwareMissing);
             }
             if tdx_enabled && (self.cpus.max_vcpus != self.cpus.boot_vcpus) {
@@ -3487,19 +3601,41 @@ impl VmConfig {
             numa = Some(numa_config_list);
         }
 
+        // Parse `--tdx` early so `payload.firmware` can fall back to the TDX
+        // firmware path when only `--tdx firmware=...` is supplied.
+        #[cfg(feature = "tdx")]
+        let tdx: Option<TdxConfig> = if let Some(tdx_str) = vm_params.tdx {
+            Some(TdxConfig::parse(tdx_str)?)
+        } else {
+            None
+        };
+
+        #[cfg(feature = "tdx")]
+        let tdx_firmware_fallback: Option<PathBuf> =
+            tdx.as_ref().map(|t| t.firmware.clone());
+        #[cfg(not(feature = "tdx"))]
+        let tdx_firmware_fallback: Option<PathBuf> = None;
+
         #[cfg(not(feature = "igvm"))]
-        let payload_present = vm_params.kernel.is_some() || vm_params.firmware.is_some();
+        let payload_present = vm_params.kernel.is_some()
+            || vm_params.firmware.is_some()
+            || tdx_firmware_fallback.is_some();
 
         #[cfg(feature = "igvm")]
-        let payload_present =
-            vm_params.kernel.is_some() || vm_params.firmware.is_some() || vm_params.igvm.is_some();
+        let payload_present = vm_params.kernel.is_some()
+            || vm_params.firmware.is_some()
+            || vm_params.igvm.is_some()
+            || tdx_firmware_fallback.is_some();
 
         let payload = if payload_present {
             Some(PayloadConfig {
                 kernel: vm_params.kernel.map(PathBuf::from),
                 initramfs: vm_params.initramfs.map(PathBuf::from),
                 cmdline: vm_params.cmdline.map(|s| s.to_string()),
-                firmware: vm_params.firmware.map(PathBuf::from),
+                firmware: vm_params
+                    .firmware
+                    .map(PathBuf::from)
+                    .or(tdx_firmware_fallback),
                 #[cfg(feature = "igvm")]
                 igvm: vm_params.igvm.map(PathBuf::from),
                 #[cfg(feature = "sev_snp")]
@@ -3570,6 +3706,8 @@ impl VmConfig {
             gdb,
             pci_segments,
             platform,
+            #[cfg(feature = "tdx")]
+            tdx,
             tpm,
             preserved_fds: None,
             landlock_enable: vm_params.landlock_enable,
@@ -3669,7 +3807,9 @@ impl VmConfig {
 
     #[cfg(feature = "tdx")]
     pub fn is_tdx_enabled(&self) -> bool {
-        self.platform.as_ref().is_some_and(|p| p.tdx)
+        // TDX is enabled if either the legacy `--platform tdx=on` toggle is set
+        // or the new `--tdx firmware=...` knob has been supplied.
+        self.platform.as_ref().is_some_and(|p| p.tdx) || self.tdx.is_some()
     }
 
     #[cfg(feature = "sev_snp")]
@@ -3705,6 +3845,8 @@ impl Clone for VmConfig {
             numa: self.numa.clone(),
             pci_segments: self.pci_segments.clone(),
             platform: self.platform.clone(),
+            #[cfg(feature = "tdx")]
+            tdx: self.tdx.clone(),
             tpm: self.tpm.clone(),
             preserved_fds: self
                 .preserved_fds
@@ -4909,6 +5051,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             gdb: false,
             pci_segments: None,
             platform: None,
+            #[cfg(feature = "tdx")]
+            tdx: None,
             tpm: None,
             preserved_fds: None,
             net: Some(vec![
@@ -5155,6 +5299,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             gdb: false,
             pci_segments: None,
             platform: None,
+            #[cfg(feature = "tdx")]
+            tdx: None,
             tpm: None,
             preserved_fds: None,
             landlock_enable: false,
