@@ -1705,12 +1705,58 @@ impl DeviceManager {
             })
             .unwrap_or_default();
 
-        let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new_with_options(
+        // Translate `PlatformConfig::smbios` into the `devices`-side
+        // `FwCfgSmbiosOverrides` (the `devices` crate does not depend on
+        // `vmm`, so we duplicate the struct shape and copy across). Total
+        // RAM size is fed in for the SMBIOS Type 17 Memory Device entry.
+        #[cfg(target_arch = "x86_64")]
+        let smbios_overrides: Option<devices::legacy::fw_cfg::FwCfgSmbiosOverrides> = self
+            .config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .and_then(|p| p.smbios.as_ref())
+            .map(|s| devices::legacy::fw_cfg::FwCfgSmbiosOverrides {
+                bios_vendor: s.bios_vendor.clone(),
+                bios_version: s.bios_version.clone(),
+                bios_release_date: s.bios_release_date.clone(),
+                system_manufacturer: s.system_manufacturer.clone(),
+                system_product: s.system_product.clone(),
+                system_version: s.system_version.clone(),
+                system_serial: s.system_serial.clone(),
+                system_uuid: s
+                    .system_uuid
+                    .as_deref()
+                    .and_then(crate::config::parse_smbios_uuid_hex),
+                system_sku: s.system_sku.clone(),
+                system_family: s.system_family.clone(),
+                chassis_manufacturer: s.chassis_manufacturer.clone(),
+                chassis_version: s.chassis_version.clone(),
+                chassis_serial: s.chassis_serial.clone(),
+                chassis_asset_tag: s.chassis_asset_tag.clone(),
+                processor_manufacturer: s.processor_manufacturer.clone(),
+                processor_version: s.processor_version.clone(),
+                oem_strings: s.oem_strings.clone(),
+            });
+        #[cfg(target_arch = "x86_64")]
+        let total_memory_size = self.config.lock().unwrap().memory.size;
+
+        #[allow(unused_mut)]
+        let mut fw_cfg_inner = devices::legacy::FwCfg::new_with_options(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
             linuxboot_option_rom_enabled,
             patch_linux_setup_header,
             option_roms,
-        )));
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            fw_cfg_inner = fw_cfg_inner.with_total_memory_size(total_memory_size);
+            if let Some(o) = smbios_overrides {
+                fw_cfg_inner = fw_cfg_inner.with_smbios_overrides(o);
+            }
+        }
+        let fw_cfg = Arc::new(Mutex::new(fw_cfg_inner));
 
         self.fw_cfg = Some(fw_cfg.clone());
 

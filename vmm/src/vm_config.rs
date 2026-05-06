@@ -117,6 +117,38 @@ pub fn default_platformconfig_vfio_p2p_dma() -> bool {
     true
 }
 
+/// SMBIOS string overrides plumbed from `--platform smbios.*` into the
+/// `etc/smbios/smbios-tables` blob built in `devices::legacy::fw_cfg`.
+///
+/// Each field maps 1:1 to a QEMU `-smbios type=N,...` knob (see
+/// `hw/smbios/smbios.c` Type 0/1/3/4/11/17 builders): when `None`, the
+/// SMBIOS emitter falls back to the historical Cloud Hypervisor defaults
+/// so attestation measurements stay stable for unconfigured guests.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SmbiosConfig {
+    pub bios_vendor: Option<String>,
+    pub bios_version: Option<String>,
+    /// Format must be `MM/DD/YYYY` per SMBIOS Type 0 spec.
+    pub bios_release_date: Option<String>,
+    pub system_manufacturer: Option<String>,
+    pub system_product: Option<String>,
+    pub system_version: Option<String>,
+    pub system_serial: Option<String>,
+    /// Accepts either 32 hex chars or canonical dashed form
+    /// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`); SMBIOS Type 1 stores
+    /// the first three fields little-endian per the 2.6+ wire format.
+    pub system_uuid: Option<String>,
+    pub system_sku: Option<String>,
+    pub system_family: Option<String>,
+    pub chassis_manufacturer: Option<String>,
+    pub chassis_version: Option<String>,
+    pub chassis_serial: Option<String>,
+    pub chassis_asset_tag: Option<String>,
+    pub processor_manufacturer: Option<String>,
+    pub processor_version: Option<String>,
+    pub oem_strings: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PlatformConfig {
     #[serde(default = "default_platformconfig_num_pci_segments")]
@@ -149,6 +181,13 @@ pub struct PlatformConfig {
     ///   - `genroms/linuxboot_dma.bin:/path/to/linuxboot_dma.bin`
     #[serde(default)]
     pub option_roms: Option<Vec<String>>,
+    /// Optional SMBIOS string overrides (see [`SmbiosConfig`]).
+    ///
+    /// `None` keeps the historical Cloud Hypervisor defaults so attestation
+    /// measurements built before this knob existed stay byte-for-byte
+    /// stable.
+    #[serde(default)]
+    pub smbios: Option<SmbiosConfig>,
 }
 
 pub const DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT: u32 = 1;

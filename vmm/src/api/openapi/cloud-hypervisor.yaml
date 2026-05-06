@@ -800,6 +800,56 @@ components:
         vfio_p2p_dma:
           type: boolean
           default: true
+        smbios:
+          $ref: "#/components/schemas/SmbiosConfig"
+
+    SmbiosConfig:
+      type: object
+      description: |
+        SMBIOS string overrides flowed into the `etc/smbios/smbios-tables`
+        blob built by the fw_cfg device. Every field is optional; when
+        omitted, the historical Cloud Hypervisor defaults are used so that
+        attestation measurements taken before this knob existed remain
+        byte-for-byte stable.
+      properties:
+        bios_vendor:
+          type: string
+        bios_version:
+          type: string
+        bios_release_date:
+          type: string
+          description: SMBIOS Type 0 release date in MM/DD/YYYY format.
+        system_manufacturer:
+          type: string
+        system_product:
+          type: string
+        system_version:
+          type: string
+        system_serial:
+          type: string
+        system_uuid:
+          type: string
+          description: 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+        system_sku:
+          type: string
+        system_family:
+          type: string
+        chassis_manufacturer:
+          type: string
+        chassis_version:
+          type: string
+        chassis_serial:
+          type: string
+        chassis_asset_tag:
+          type: string
+        processor_manufacturer:
+          type: string
+        processor_version:
+          type: string
+        oem_strings:
+          type: array
+          items:
+            type: string
 
     MemoryZoneConfig:
       required:

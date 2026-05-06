@@ -315,6 +315,11 @@ pub enum ValidationError {
     /// Invalid option ROM specification
     #[error("Invalid option_roms entry '{0}': expected NAME:PATH and the file must exist")]
     InvalidOptionRom(String),
+    /// Invalid SMBIOS system_uuid
+    #[error(
+        "Invalid smbios.system_uuid '{0}': expected 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    )]
+    InvalidSmbiosUuid(String),
     /// Balloon too big
     #[error("Ballon size ({0}) greater than RAM ({1})")]
     BalloonLargerThanRam(u64, u64),
@@ -815,6 +820,26 @@ impl PciSegmentConfig {
     }
 }
 
+/// Parse a 16-byte UUID from `smbios.system_uuid`.
+///
+/// Accepts either canonical dashed form
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or 32 contiguous hex chars.
+/// Returns the raw RFC 4122 big-endian bytes; the SMBIOS Type 1 wire-format
+/// byte-flip is applied later by `build_qemu_compat_smbios`.
+pub(crate) fn parse_smbios_uuid_hex(s: &str) -> Option<[u8; 16]> {
+    let stripped: String = s.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != 32 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let hi = u8::from_str_radix(&stripped[i * 2..i * 2 + 1], 16).ok()?;
+        let lo = u8::from_str_radix(&stripped[i * 2 + 1..i * 2 + 2], 16).ok()?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(bytes)
+}
+
 impl PlatformConfig {
     pub fn syntax() -> &'static str {
         static SYNTAX: LazyLock<String> = LazyLock::new(|| {
@@ -823,7 +848,17 @@ impl PlatformConfig {
             iommu_address_width=<bits>,serial_number=<dmi_device_serial_number>,\
             uuid=<dmi_device_uuid>,oem_strings=<list_of_strings>,iommufd=on|off,\
             vfio_p2p_dma=on|off,\
-            option_roms=<list_of_NAME:PATH>"
+            option_roms=<list_of_NAME:PATH>,\
+            smbios.bios_vendor=<str>,smbios.bios_version=<str>,\
+            smbios.bios_release_date=<MM/DD/YYYY>,\
+            smbios.system_manufacturer=<str>,smbios.system_product=<str>,\
+            smbios.system_version=<str>,smbios.system_serial=<str>,\
+            smbios.system_uuid=<uuid>,smbios.system_sku=<str>,\
+            smbios.system_family=<str>,\
+            smbios.chassis_manufacturer=<str>,smbios.chassis_version=<str>,\
+            smbios.chassis_serial=<str>,smbios.chassis_asset_tag=<str>,\
+            smbios.processor_manufacturer=<str>,smbios.processor_version=<str>,\
+            smbios.oem_strings=<colon_separated_list>"
                 .to_string();
 
             if cfg!(feature = "tdx") {
@@ -853,7 +888,27 @@ impl PlatformConfig {
             .add("oem_strings")
             .add("iommufd")
             .add("vfio_p2p_dma")
-            .add("option_roms");
+            .add("option_roms")
+            // SMBIOS string overrides — namespaced under `smbios.*` so they
+            // don't collide with the legacy `serial_number` / `uuid` /
+            // `oem_strings` aliases above.
+            .add("smbios.bios_vendor")
+            .add("smbios.bios_version")
+            .add("smbios.bios_release_date")
+            .add("smbios.system_manufacturer")
+            .add("smbios.system_product")
+            .add("smbios.system_version")
+            .add("smbios.system_serial")
+            .add("smbios.system_uuid")
+            .add("smbios.system_sku")
+            .add("smbios.system_family")
+            .add("smbios.chassis_manufacturer")
+            .add("smbios.chassis_version")
+            .add("smbios.chassis_serial")
+            .add("smbios.chassis_asset_tag")
+            .add("smbios.processor_manufacturer")
+            .add("smbios.processor_version")
+            .add("smbios.oem_strings");
         #[cfg(feature = "tdx")]
         parser.add("tdx");
         #[cfg(feature = "sev_snp")]
@@ -894,6 +949,117 @@ impl PlatformConfig {
             .convert::<StringList>("option_roms")
             .map_err(Error::ParsePlatform)?
             .map(|v| v.0);
+
+        // SMBIOS string overrides. Each `smbios.*` key is parsed
+        // independently and only present (`Some`) when the operator
+        // supplied it on the command line — `None` keeps the legacy
+        // `CH_SMBIOS_*` defaults baked into `build_qemu_compat_smbios`.
+        let smbios_bios_vendor = parser
+            .convert::<String>("smbios.bios_vendor")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_bios_version = parser
+            .convert::<String>("smbios.bios_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_bios_release_date = parser
+            .convert::<String>("smbios.bios_release_date")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_manufacturer = parser
+            .convert::<String>("smbios.system_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_product = parser
+            .convert::<String>("smbios.system_product")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_version = parser
+            .convert::<String>("smbios.system_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_serial = parser
+            .convert::<String>("smbios.system_serial")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_uuid = parser
+            .convert::<String>("smbios.system_uuid")
+            .map_err(Error::ParsePlatform)?;
+        if let Some(s) = smbios_system_uuid.as_deref()
+            && parse_smbios_uuid_hex(s).is_none()
+        {
+            return Err(Error::InvalidSmbiosUuid(s.to_string()));
+        }
+        let smbios_system_sku = parser
+            .convert::<String>("smbios.system_sku")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_family = parser
+            .convert::<String>("smbios.system_family")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_manufacturer = parser
+            .convert::<String>("smbios.chassis_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_version = parser
+            .convert::<String>("smbios.chassis_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_serial = parser
+            .convert::<String>("smbios.chassis_serial")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_asset_tag = parser
+            .convert::<String>("smbios.chassis_asset_tag")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_processor_manufacturer = parser
+            .convert::<String>("smbios.processor_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_processor_version = parser
+            .convert::<String>("smbios.processor_version")
+            .map_err(Error::ParsePlatform)?;
+        // SMBIOS OEM strings live inside a single `--platform` value, so the
+        // outer `,` separator is already taken by the option parser. We
+        // accept a colon-separated list here (mirroring how CH formats
+        // `cpus features` and other multi-valued option fields), which
+        // avoids the need for `[...]` quoting tricks for the common case.
+        let smbios_oem_strings = parser
+            .convert::<String>("smbios.oem_strings")
+            .map_err(Error::ParsePlatform)?
+            .map(|raw| {
+                raw.split(':')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            });
+        let smbios = if smbios_bios_vendor.is_some()
+            || smbios_bios_version.is_some()
+            || smbios_bios_release_date.is_some()
+            || smbios_system_manufacturer.is_some()
+            || smbios_system_product.is_some()
+            || smbios_system_version.is_some()
+            || smbios_system_serial.is_some()
+            || smbios_system_uuid.is_some()
+            || smbios_system_sku.is_some()
+            || smbios_system_family.is_some()
+            || smbios_chassis_manufacturer.is_some()
+            || smbios_chassis_version.is_some()
+            || smbios_chassis_serial.is_some()
+            || smbios_chassis_asset_tag.is_some()
+            || smbios_processor_manufacturer.is_some()
+            || smbios_processor_version.is_some()
+            || smbios_oem_strings.is_some()
+        {
+            Some(SmbiosConfig {
+                bios_vendor: smbios_bios_vendor,
+                bios_version: smbios_bios_version,
+                bios_release_date: smbios_bios_release_date,
+                system_manufacturer: smbios_system_manufacturer,
+                system_product: smbios_system_product,
+                system_version: smbios_system_version,
+                system_serial: smbios_system_serial,
+                system_uuid: smbios_system_uuid,
+                system_sku: smbios_system_sku,
+                system_family: smbios_system_family,
+                chassis_manufacturer: smbios_chassis_manufacturer,
+                chassis_version: smbios_chassis_version,
+                chassis_serial: smbios_chassis_serial,
+                chassis_asset_tag: smbios_chassis_asset_tag,
+                processor_manufacturer: smbios_processor_manufacturer,
+                processor_version: smbios_processor_version,
+                oem_strings: smbios_oem_strings,
+            })
+        } else {
+            None
+        };
         #[cfg(feature = "tdx")]
         let tdx = parser
             .convert::<Toggle>("tdx")
@@ -920,6 +1086,7 @@ impl PlatformConfig {
             #[cfg(feature = "sev_snp")]
             sev_snp,
             option_roms,
+            smbios,
         })
     }
 
@@ -4899,6 +5066,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
             option_roms: None,
+            smbios: None,
         }
     }
 

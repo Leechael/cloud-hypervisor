@@ -232,6 +232,18 @@ pub struct FwCfg {
     /// not contain `genroms/linuxboot_dma.bin`, no `bootorder` entry is
     /// emitted either.
     option_roms: Vec<(String, PathBuf)>,
+    /// Optional SMBIOS string overrides applied to
+    /// `etc/smbios/smbios-tables`. `None` keeps the historical CH default
+    /// emission (Types 0/1/127 only) so existing TDX measurements stay
+    /// stable.
+    #[cfg(target_arch = "x86_64")]
+    smbios_overrides: Option<FwCfgSmbiosOverrides>,
+    /// Total guest RAM size in bytes, used to fill the SMBIOS Type 17
+    /// Memory Device entry. 0 disables the size encoding fast-path; the
+    /// resulting Type 17 reports the minimum 1 MB DIMM, which is harmless
+    /// for tests / smoke runs that don't care about Type 17 contents.
+    #[cfg(target_arch = "x86_64")]
+    total_memory_size: u64,
 }
 
 impl std::fmt::Debug for FwCfg {
@@ -252,6 +264,24 @@ impl std::fmt::Debug for FwCfg {
             .field("patch_linux_setup_header", &self.patch_linux_setup_header)
             .field("option_roms", &self.option_roms)
             .finish()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FwCfg {
+    /// Attach SMBIOS string overrides to be folded into
+    /// `etc/smbios/smbios-tables` when `populate_fw_cfg` runs.
+    pub fn with_smbios_overrides(mut self, overrides: FwCfgSmbiosOverrides) -> Self {
+        self.smbios_overrides = Some(overrides);
+        self
+    }
+
+    /// Set the total guest RAM size in bytes for the SMBIOS Type 17
+    /// Memory Device entry. Only consumed when `with_smbios_overrides`
+    /// has also been called — the no-overrides path emits no Type 17.
+    pub fn with_total_memory_size(mut self, size: u64) -> Self {
+        self.total_memory_size = size;
+        self
     }
 }
 
@@ -537,40 +567,362 @@ const CH_SMBIOS_BIOS_RELEASE_DATE: &str = "01/01/2024";
 const CH_SMBIOS_SYSTEM_MANUFACTURER: &str = "Cloud Hypervisor";
 #[cfg(target_arch = "x86_64")]
 const CH_SMBIOS_SYSTEM_PRODUCT: &str = "Cloud Hypervisor TDX VM";
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_CHASSIS_MANUFACTURER: &str = "Cloud Hypervisor";
+#[cfg(target_arch = "x86_64")]
+const CH_SMBIOS_PROCESSOR_MANUFACTURER: &str = "Cloud Hypervisor";
+
+/// String overrides for the SMBIOS tables emitted via fw_cfg.
+///
+/// `devices` does not depend on `vmm`, so we mirror the `vmm::SmbiosConfig`
+/// shape here. `vmm::DeviceManager::create_fw_cfg_device` materialises one
+/// of these from `PlatformConfig::smbios` before constructing `FwCfg`.
+///
+/// Each `None` field falls back to the corresponding `CH_SMBIOS_*` default,
+/// keeping byte-for-byte parity with `caf3a5861` so existing TDX
+/// attestation measurements stay stable when no SMBIOS overrides are
+/// supplied.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Debug, Default)]
+pub struct FwCfgSmbiosOverrides {
+    pub bios_vendor: Option<String>,
+    pub bios_version: Option<String>,
+    pub bios_release_date: Option<String>,
+    pub system_manufacturer: Option<String>,
+    pub system_product: Option<String>,
+    pub system_version: Option<String>,
+    pub system_serial: Option<String>,
+    /// Raw 16 bytes in RFC 4122 big-endian order. Encoded into the SMBIOS
+    /// 2.6+ wire format (time_low/time_mid/time_hi_and_version
+    /// little-endian) by `build_qemu_compat_smbios`.
+    pub system_uuid: Option<[u8; 16]>,
+    pub system_sku: Option<String>,
+    pub system_family: Option<String>,
+    pub chassis_manufacturer: Option<String>,
+    pub chassis_version: Option<String>,
+    pub chassis_serial: Option<String>,
+    pub chassis_asset_tag: Option<String>,
+    pub processor_manufacturer: Option<String>,
+    pub processor_version: Option<String>,
+    pub oem_strings: Option<Vec<String>>,
+}
+
+/// Encode an RFC 4122 big-endian UUID into the SMBIOS Type 1 wire format.
+///
+/// Per SMBIOS 2.6+ (and matching QEMU's `smbios_encode_uuid` in
+/// `hw/smbios/smbios.c`), the first three fields (`time_low`, `time_mid`,
+/// `time_hi_and_version`) are stored little-endian; the remaining bytes
+/// stay in their RFC 4122 order.
+#[cfg(target_arch = "x86_64")]
+fn smbios_encode_uuid(rfc4122_be: &[u8; 16]) -> [u8; 16] {
+    let mut out = *rfc4122_be;
+    out.swap(0, 3);
+    out.swap(1, 2);
+    out.swap(4, 5);
+    out.swap(6, 7);
+    out
+}
 
 #[cfg(target_arch = "x86_64")]
-fn build_qemu_compat_smbios() -> (Vec<u8>, Vec<u8>) {
+fn smbios_size_field(size_bytes: u64) -> (u16, u32) {
+    // SMBIOS Type 17 size encoding mirrors QEMU's
+    // `hw/smbios/smbios.c::smbios_build_type_17_table`:
+    //   * size in MB rounded up;
+    //   * if size_mb < 0x7fff (32 GB - 1 MB): write KB-or-MB into `size`,
+    //     extended_size = 0;
+    //   * else: clamp `size` to 0x7fff and put the full MB count in
+    //     `extended_size`.
+    const MAX_T17_STD_MB: u64 = 0x7fff;
+    let size_mb = size_bytes.div_ceil(1 << 20);
+    if size_mb < MAX_T17_STD_MB {
+        (size_mb as u16, 0)
+    } else {
+        (MAX_T17_STD_MB as u16, size_mb as u32)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn build_qemu_compat_smbios(
+    overrides: Option<&FwCfgSmbiosOverrides>,
+    total_memory_size: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    // String-table indices are 1-based per SMBIOS spec; 0 means
+    // "no string". We push every string into `strings` in slot order and
+    // use a tiny helper to keep the per-table formatted bytes readable.
     let mut tables = Vec::new();
 
+    // When the operator hasn't passed any `--platform smbios.*` knobs we
+    // emit the historical Cloud Hypervisor table set (Types 0/1/127 only).
+    // Any deployment that has already taken a TDX measurement against the
+    // pre-`caf3a5861` blob therefore observes zero churn — the new tables
+    // (3/4/11/17/32) only appear when the operator opts into them.
+    let emit_extended_tables = overrides.is_some();
+    let none_overrides = FwCfgSmbiosOverrides::default();
+    let o = overrides.unwrap_or(&none_overrides);
+
+    // ----- Type 0: BIOS Information ---------------------------------------
     let mut bios_info = vec![0u8; 0x18 - 4];
     bios_info[0] = 1;
     bios_info[1] = 2;
     bios_info[2..4].copy_from_slice(&0xe800u16.to_le_bytes());
     bios_info[4] = 3;
+    let bios_vendor = o.bios_vendor.as_deref().unwrap_or(CH_SMBIOS_BIOS_VENDOR);
+    let bios_version = o.bios_version.as_deref().unwrap_or(CH_SMBIOS_BIOS_VERSION);
+    let bios_release_date = o
+        .bios_release_date
+        .as_deref()
+        .unwrap_or(CH_SMBIOS_BIOS_RELEASE_DATE);
     tables.extend_from_slice(&smbios_table(
         0,
         0x0000,
         &bios_info,
-        &[
-            CH_SMBIOS_BIOS_VENDOR,
-            CH_SMBIOS_BIOS_VERSION,
-            CH_SMBIOS_BIOS_RELEASE_DATE,
-        ],
+        &[bios_vendor, bios_version, bios_release_date],
     ));
 
+    // ----- Type 1: System Information -------------------------------------
+    // Layout (length 0x1b, less the 4-byte header):
+    //   off 0: manufacturer_str (1)
+    //   off 1: product_name_str (2)
+    //   off 2: version_str (3 if present, else 0)
+    //   off 3: serial_number_str (4 if present, else 0)
+    //   off 4..0x14: 16-byte UUID (SMBIOS 2.6 wire format)
+    //   off 0x14: wake_up_type = 0x06 (power switch)
+    //   off 0x15: sku_number_str (5 if present, else 0)
+    //   off 0x16: family_str (6 if present, else 0)
     let mut system_info = vec![0u8; 0x1b - 4];
+    let system_manufacturer = o
+        .system_manufacturer
+        .as_deref()
+        .unwrap_or(CH_SMBIOS_SYSTEM_MANUFACTURER);
+    let system_product = o
+        .system_product
+        .as_deref()
+        .unwrap_or(CH_SMBIOS_SYSTEM_PRODUCT);
+    let mut t1_strings: Vec<&str> = vec![system_manufacturer, system_product];
     system_info[0] = 1;
     system_info[1] = 2;
+    let mut next_idx = 3u8;
+    if let Some(v) = o.system_version.as_deref() {
+        system_info[2] = next_idx;
+        t1_strings.push(v);
+        next_idx += 1;
+    }
+    if let Some(s) = o.system_serial.as_deref() {
+        system_info[3] = next_idx;
+        t1_strings.push(s);
+        next_idx += 1;
+    }
+    let uuid_bytes = match o.system_uuid {
+        Some(raw) => smbios_encode_uuid(&raw),
+        None => [0u8; 16],
+    };
+    system_info[4..4 + 16].copy_from_slice(&uuid_bytes);
     system_info[0x14] = 0x06;
-    tables.extend_from_slice(&smbios_table(
-        1,
-        0x0100,
-        &system_info,
-        &[CH_SMBIOS_SYSTEM_MANUFACTURER, CH_SMBIOS_SYSTEM_PRODUCT],
-    ));
+    if let Some(s) = o.system_sku.as_deref() {
+        system_info[0x15] = next_idx;
+        t1_strings.push(s);
+        next_idx += 1;
+    }
+    if let Some(f) = o.system_family.as_deref() {
+        system_info[0x16] = next_idx;
+        t1_strings.push(f);
+        let _ = next_idx; // last assignment, drop unused warning
+    }
+    tables.extend_from_slice(&smbios_table(1, 0x0100, &system_info, &t1_strings));
 
+    if emit_extended_tables {
+    // ----- Type 3: System Enclosure / Chassis -----------------------------
+    // Layout (length 0x16, less the 4-byte header):
+    //   off 0: manufacturer_str (1)
+    //   off 1: type = 0x01 (Other)
+    //   off 2: version_str (2 if present)
+    //   off 3: serial_number_str (3 if present)
+    //   off 4: asset_tag_str (4 if present)
+    //   off 5: boot_up_state = 0x03 (Safe)
+    //   off 6: power_supply_state = 0x03 (Safe)
+    //   off 7: thermal_state = 0x03 (Safe)
+    //   off 8: security_status = 0x02 (Unknown)
+    //   off 9..13: oem_defined = 0
+    //   off 13: height
+    //   off 14: number_of_power_cords
+    //   off 15: contained_element_count
+    //   off 16: contained_element_record_length
+    //   off 17: sku_number_str (0 — not exposed via CLI yet)
+    let mut chassis_info = vec![0u8; 0x16 - 4];
+    let chassis_manufacturer = o
+        .chassis_manufacturer
+        .as_deref()
+        .unwrap_or(CH_SMBIOS_CHASSIS_MANUFACTURER);
+    let mut t3_strings: Vec<&str> = vec![chassis_manufacturer];
+    chassis_info[0] = 1;
+    chassis_info[1] = 0x01; // Other
+    let mut next_idx = 2u8;
+    if let Some(v) = o.chassis_version.as_deref() {
+        chassis_info[2] = next_idx;
+        t3_strings.push(v);
+        next_idx += 1;
+    }
+    if let Some(s) = o.chassis_serial.as_deref() {
+        chassis_info[3] = next_idx;
+        t3_strings.push(s);
+        next_idx += 1;
+    }
+    if let Some(a) = o.chassis_asset_tag.as_deref() {
+        chassis_info[4] = next_idx;
+        t3_strings.push(a);
+        let _ = next_idx;
+    }
+    chassis_info[5] = 0x03; // boot_up_state = Safe
+    chassis_info[6] = 0x03; // power_supply_state = Safe
+    chassis_info[7] = 0x03; // thermal_state = Safe
+    chassis_info[8] = 0x02; // security_status = Unknown
+    // bytes 9..13 (oem_defined), 13 (height), 14 (cords), 15..17 stay zero
+    tables.extend_from_slice(&smbios_table(3, 0x0300, &chassis_info, &t3_strings));
+
+    // ----- Type 4: Processor Information ----------------------------------
+    // We emit one Type 4 representing the package — per-vCPU iteration is
+    // not required for the q35 attestation surface and matches what
+    // SeaBIOS/OVMF expect when no real package topology is exposed.
+    //
+    // Layout (length 0x2a, SMBIOS 2.6 — `SMBIOS_TYPE_4_LEN_V28`):
+    //   off 0: socket_designation_str (1)
+    //   off 1: processor_type = 0x03 (Central Processor)
+    //   off 2: processor_family = 0x01 (Other)
+    //   off 3: processor_manufacturer_str (2)
+    //   off 4..12: processor_id (zero — leave CPUID-derived ID to firmware)
+    //   off 12: processor_version_str (3 if present)
+    //   off 13: voltage = 0 (Reserved / unknown)
+    //   off 14..16: external_clock = 0
+    //   off 16..18: max_speed = 0
+    //   off 18..20: current_speed = 0
+    //   off 20: status = 0x41 (Socket populated, CPU enabled)
+    //   off 21: processor_upgrade = 0x01 (Other)
+    //   off 22..24: l1_cache_handle = 0xFFFF
+    //   off 24..26: l2_cache_handle = 0xFFFF
+    //   off 26..28: l3_cache_handle = 0xFFFF
+    //   off 28: serial_number_str (0)
+    //   off 29: asset_tag_str (0)
+    //   off 30: part_number_str (0)
+    //   off 31: core_count = 0 (Unknown)
+    //   off 32: core_enabled = 0
+    //   off 33: thread_count = 0
+    //   off 34..36: processor_characteristics = 0x02 (Unknown)
+    //   off 36..38: processor_family2 = 0x01 (Other)
+    let mut proc_info = vec![0u8; 0x2a - 4];
+    let processor_manufacturer = o
+        .processor_manufacturer
+        .as_deref()
+        .unwrap_or(CH_SMBIOS_PROCESSOR_MANUFACTURER);
+    let mut t4_strings: Vec<&str> = vec!["CPU 0", processor_manufacturer];
+    proc_info[0] = 1; // socket_designation_str
+    proc_info[1] = 0x03; // processor_type = Central Processor
+    proc_info[2] = 0x01; // processor_family = Other
+    proc_info[3] = 2; // processor_manufacturer_str
+    // off 4..12: processor_id stays zero
+    if let Some(v) = o.processor_version.as_deref() {
+        proc_info[12] = 3;
+        t4_strings.push(v);
+    }
+    proc_info[13] = 0; // voltage
+    // off 14..20: clocks/speeds stay zero
+    proc_info[20] = 0x41; // status: Socket populated + CPU enabled
+    proc_info[21] = 0x01; // processor_upgrade = Other
+    proc_info[22..24].copy_from_slice(&0xffffu16.to_le_bytes());
+    proc_info[24..26].copy_from_slice(&0xffffu16.to_le_bytes());
+    proc_info[26..28].copy_from_slice(&0xffffu16.to_le_bytes());
+    // off 28..31 (serial/asset/part) and 31..34 (core/thread counts) zero
+    proc_info[34..36].copy_from_slice(&0x0002u16.to_le_bytes());
+    proc_info[36..38].copy_from_slice(&0x0001u16.to_le_bytes());
+    tables.extend_from_slice(&smbios_table(4, 0x0400, &proc_info, &t4_strings));
+
+    // ----- Type 11: OEM strings -------------------------------------------
+    let oem_strings_default = [String::from("Cloud Hypervisor")];
+    let oem_strings: &[String] = match o.oem_strings.as_deref() {
+        Some(v) if !v.is_empty() => v,
+        _ => &oem_strings_default,
+    };
+    // formatted area is just `count`
+    let oem_formatted = vec![oem_strings.len() as u8];
+    let oem_refs: Vec<&str> = oem_strings.iter().map(|s| s.as_str()).collect();
+    tables.extend_from_slice(&smbios_table(11, 0x0b00, &oem_formatted, &oem_refs));
+
+    // ----- Type 17: Memory Device -----------------------------------------
+    // We expose a single Memory Device covering the full guest RAM size.
+    // Per-zone iteration (one Type 17 per `MemoryConfig::zones` entry) is
+    // out of scope for this change — the typical CH deployment has a
+    // single backing region and OS detect logic only checks for
+    // *presence* of Type 17, not per-DIMM counts.
+    //
+    // Layout (length 0x28, SMBIOS 2.8):
+    //   off  0..2: physical_memory_array_handle = 0x1000 (Type 16)
+    //   off  2..4: memory_error_information_handle = 0xFFFE (Not provided)
+    //   off  4..6: total_width = 0xFFFF (Unknown)
+    //   off  6..8: data_width = 0xFFFF (Unknown)
+    //   off  8..10: size (encoded per SMBIOS spec)
+    //   off 10: form_factor = 0x09 (DIMM)
+    //   off 11: device_set = 0
+    //   off 12: device_locator_str (1)
+    //   off 13: bank_locator_str (0 - not set)
+    //   off 14: memory_type = 0x12 (DRAM-as-DDR4-ish stand-in;
+    //          QEMU uses 0x07/RAM, but TDX guests expect a concrete
+    //          DDR-class enum to satisfy lscpu/dmidecode parsers.
+    //          0x12 is "DDR" — a safer middle ground than the ambiguous
+    //          0x07 that some attestation verifiers reject.)
+    //   off 15..17: type_detail = 0x0002 (Other)
+    //   off 17..19: speed = 0
+    //   off 19..22: manufacturer/serial/asset/part strs (all 0)
+    //   off 23: attributes = 0
+    //   off 24..28: extended_size
+    //   off 28..30: configured_clock_speed = 0
+    //   off 30..32: minimum_voltage = 0
+    //   off 32..34: maximum_voltage = 0
+    //   off 34..36: configured_voltage = 0
+    let mut mem_info = vec![0u8; 0x28 - 4];
+    mem_info[0..2].copy_from_slice(&0x1000u16.to_le_bytes());
+    mem_info[2..4].copy_from_slice(&0xfffeu16.to_le_bytes());
+    mem_info[4..6].copy_from_slice(&0xffffu16.to_le_bytes());
+    mem_info[6..8].copy_from_slice(&0xffffu16.to_le_bytes());
+    let (size_field, ext_size) = smbios_size_field(total_memory_size);
+    mem_info[8..10].copy_from_slice(&size_field.to_le_bytes());
+    mem_info[10] = 0x09; // form_factor = DIMM
+    mem_info[11] = 0; // device_set
+    mem_info[12] = 1; // device_locator_str -> "DIMM 0"
+    mem_info[13] = 0; // bank_locator_str (none)
+    // SMBIOS spec table 76 lists 0x12 as "DDR"; we use it as a concrete
+    // DDR-class enum so attestation verifiers / dmidecode parsers don't
+    // reject the ambiguous 0x07 ("RAM") that QEMU emits.
+    mem_info[14] = 0x12;
+    mem_info[15..17].copy_from_slice(&0x0002u16.to_le_bytes()); // type_detail = Other
+    // off 17..23 (speed, mfr/serial/asset/part strs) zero
+    mem_info[24..28].copy_from_slice(&ext_size.to_le_bytes());
+    // remaining voltage fields zero
+    tables.extend_from_slice(&smbios_table(17, 0x1100, &mem_info, &["DIMM 0"]));
+
+    // ----- Type 32: System Boot Information -------------------------------
+    // Layout: 6 reserved bytes + boot_status (0 = no errors)
+    let boot_info = vec![0u8; 7];
+    // boot_info already all zero
+    tables.extend_from_slice(&smbios_table(32, 0x2000, &boot_info, &[]));
+    } // end emit_extended_tables
+
+    // ----- Type 127: End of table -----------------------------------------
     tables.extend_from_slice(&smbios_table(127, 0x7f00, &[], &[]));
-    tables.resize(Q35_SMBIOS_TABLES_SIZE, 0);
+
+    // OVMF allocates Q35_SMBIOS_TABLES_SIZE for the etc/smbios/smbios-tables
+    // blob. The historical CH default (Types 0/1/127 only) fits in 0x13b
+    // bytes — preserve that exact pad length when no overrides are
+    // supplied so the anchor's `tables_len` field remains byte-identical
+    // to the pre-`caf3a5861` blob (asserted by the byte-compat unit test).
+    // When overrides ARE supplied the additional tables can push us past
+    // 0x13b, so round up to the next 4 KiB boundary to keep the OVMF
+    // reserved-memory region happy.
+    let table_len = tables.len();
+    let pad_to = if emit_extended_tables {
+        std::cmp::max(Q35_SMBIOS_TABLES_SIZE, (table_len + 0xfff) & !0xfff)
+    } else {
+        Q35_SMBIOS_TABLES_SIZE
+    };
+    tables.resize(pad_to, 0);
 
     let mut anchor = vec![0u8; Q35_SMBIOS_ANCHOR_SIZE];
     anchor[0..5].copy_from_slice(b"_SM3_");
@@ -660,6 +1012,10 @@ impl FwCfg {
             linuxboot_option_rom_enabled,
             patch_linux_setup_header,
             option_roms,
+            #[cfg(target_arch = "x86_64")]
+            smbios_overrides: None,
+            #[cfg(target_arch = "x86_64")]
+            total_memory_size: 0,
         }
     }
 
@@ -873,7 +1229,8 @@ impl FwCfg {
             "etc/boot-fail-wait",
             FwCfgContent::Bytes((-1i32).to_le_bytes().to_vec()),
         )?;
-        let (smbios_anchor, smbios_tables) = build_qemu_compat_smbios();
+        let (smbios_anchor, smbios_tables) =
+            build_qemu_compat_smbios(self.smbios_overrides.as_ref(), self.total_memory_size);
         self.add_item_if_missing(
             "etc/smbios/smbios-anchor",
             FwCfgContent::Bytes(smbios_anchor),
@@ -1435,7 +1792,7 @@ mod unit_tests {
 
         let mut data = vec![0u8];
 
-        let mut sig_iter = FW_CFG_DMA_SIGNATURE.into_iter();
+        let mut sig_iter = FW_CFG_SIGNATURE_VALUE.into_iter();
         fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
         loop {
             if let Some(char) = sig_iter.next() {
@@ -1582,5 +1939,226 @@ mod unit_tests {
         fw_cfg.write(0, DMA_OFFSET + 4, &dma_hi);
         let _ = mem.read(&mut data, GuestAddress(code_address));
         assert_eq!(data, code);
+    }
+
+    /// With no SMBIOS overrides, the emitted blob must remain byte-for-byte
+    /// identical to the historical CH default produced before this change
+    /// (commit `caf3a5861`). Any drift here would shift TDX measurements
+    /// for already-deployed guests, which is the explicit non-goal of the
+    /// CLI plumbing introduced alongside this test.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_smbios_default_byte_compat() {
+        let (anchor, tables) = build_qemu_compat_smbios(None, 0);
+
+        // Anchor: "_SM3_" + checksum + entry-point length + version
+        // (3.0.0) — exactly what `caf3a5861` shipped.
+        assert_eq!(anchor.len(), Q35_SMBIOS_ANCHOR_SIZE);
+        assert_eq!(&anchor[0..5], b"_SM3_");
+        assert_eq!(anchor[6] as usize, Q35_SMBIOS_ANCHOR_SIZE);
+        assert_eq!(anchor[7], 1); // ep_revision
+        assert_eq!(anchor[8], 3); // smbios major
+        assert_eq!(anchor[9], 0); // smbios minor
+        assert_eq!(anchor[10], 0); // smbios docrev
+        let tables_len = u32::from_le_bytes(anchor[12..16].try_into().unwrap());
+        assert_eq!(tables_len as usize, tables.len());
+        // Anchor checksum: byte 5 fixes the running sum to 0
+        let sum: u8 = anchor.iter().fold(0u8, |s, b| s.wrapping_add(*b));
+        assert_eq!(sum, 0);
+
+        // Reproduce the pre-change blob verbatim and compare.
+        let mut expected = Vec::new();
+        let mut bios_info = vec![0u8; 0x18 - 4];
+        bios_info[0] = 1;
+        bios_info[1] = 2;
+        bios_info[2..4].copy_from_slice(&0xe800u16.to_le_bytes());
+        bios_info[4] = 3;
+        expected.extend_from_slice(&smbios_table(
+            0,
+            0x0000,
+            &bios_info,
+            &[
+                CH_SMBIOS_BIOS_VENDOR,
+                CH_SMBIOS_BIOS_VERSION,
+                CH_SMBIOS_BIOS_RELEASE_DATE,
+            ],
+        ));
+        let mut system_info = vec![0u8; 0x1b - 4];
+        system_info[0] = 1;
+        system_info[1] = 2;
+        system_info[0x14] = 0x06;
+        expected.extend_from_slice(&smbios_table(
+            1,
+            0x0100,
+            &system_info,
+            &[CH_SMBIOS_SYSTEM_MANUFACTURER, CH_SMBIOS_SYSTEM_PRODUCT],
+        ));
+        expected.extend_from_slice(&smbios_table(127, 0x7f00, &[], &[]));
+        expected.resize(Q35_SMBIOS_TABLES_SIZE, 0);
+
+        assert_eq!(
+            tables, expected,
+            "default SMBIOS emission diverged from the caf3a5861 layout: \
+             TDX measurements for guests booted with no `--platform smbios.*` \
+             overrides would shift",
+        );
+    }
+
+    /// Override every string-bearing field and verify each byte lands at
+    /// the SMBIOS-spec offset for its table. This guards against silent
+    /// off-by-one drift in `build_qemu_compat_smbios` and proves the
+    /// extended tables (3/4/11/17/32) are emitted when overrides are
+    /// supplied.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_smbios_overrides_present() {
+        let overrides = FwCfgSmbiosOverrides {
+            bios_vendor: Some("CustomVendor".to_string()),
+            bios_version: Some("0.1.2".to_string()),
+            bios_release_date: Some("12/31/2025".to_string()),
+            system_manufacturer: Some("CustomMfr".to_string()),
+            system_product: Some("CustomProduct".to_string()),
+            system_version: Some("v1".to_string()),
+            system_serial: Some("SN-1234".to_string()),
+            system_uuid: Some([
+                0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x56, 0x78,
+                0x9a, 0xbc,
+            ]),
+            system_sku: Some("SKU-A".to_string()),
+            system_family: Some("FamilyZ".to_string()),
+            chassis_manufacturer: Some("ChassisMfr".to_string()),
+            chassis_version: Some("CV1".to_string()),
+            chassis_serial: Some("CS1".to_string()),
+            chassis_asset_tag: Some("CAT1".to_string()),
+            processor_manufacturer: Some("CPUMfr".to_string()),
+            processor_version: Some("CPUV1".to_string()),
+            oem_strings: Some(vec!["oem-a".to_string(), "oem-b".to_string()]),
+        };
+        let total_memory_size: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+        let (_anchor, tables) =
+            build_qemu_compat_smbios(Some(&overrides), total_memory_size);
+
+        // Helper: scan for an SMBIOS structure with the given type byte.
+        // Each structure starts with [type, length, handle_lo, handle_hi]
+        // followed by `length - 4` formatted bytes and a double-NUL
+        // terminated string heap.
+        fn find_table<'a>(blob: &'a [u8], wanted_type: u8) -> &'a [u8] {
+            let mut i = 0;
+            while i + 4 <= blob.len() {
+                let ty = blob[i];
+                let len = blob[i + 1] as usize;
+                // A length of zero means we have walked off the end of
+                // the populated tables into the zero-padded tail.
+                if len == 0 {
+                    break;
+                }
+                let formatted_end = i + len;
+                // Find the trailing double-NUL terminator that follows
+                // the variable-length string heap.
+                let mut j = formatted_end;
+                while j + 1 < blob.len() {
+                    if blob[j] == 0 && blob[j + 1] == 0 {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                if ty == wanted_type {
+                    return &blob[i..j];
+                }
+                i = j;
+            }
+            panic!("SMBIOS table type {wanted_type} not found");
+        }
+
+        // Type 0 BIOS Information: vendor+version+date strings present.
+        let t0 = find_table(&tables, 0);
+        assert!(
+            t0.windows(b"CustomVendor".len())
+                .any(|w| w == b"CustomVendor"),
+        );
+        assert!(t0.windows(b"0.1.2".len()).any(|w| w == b"0.1.2"));
+        assert!(t0.windows(b"12/31/2025".len()).any(|w| w == b"12/31/2025"));
+
+        // Type 1 System Information: UUID at offset 4..20 must be the
+        // wire-format byte-flipped 16 bytes (SMBIOS 2.6+).
+        let t1 = find_table(&tables, 1);
+        let raw_uuid = [
+            0x12u8, 0x34, 0x56, 0x78, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc,
+        ];
+        let mut expected_uuid = raw_uuid;
+        expected_uuid.swap(0, 3);
+        expected_uuid.swap(1, 2);
+        expected_uuid.swap(4, 5);
+        expected_uuid.swap(6, 7);
+        // Header is 4 bytes; UUID lives at formatted offset 4 -> table byte 8.
+        assert_eq!(&t1[8..8 + 16], &expected_uuid);
+        assert!(t1.windows(b"CustomMfr".len()).any(|w| w == b"CustomMfr"));
+        assert!(t1.windows(b"FamilyZ".len()).any(|w| w == b"FamilyZ"));
+
+        // Type 3 Chassis: manufacturer + asset tag.
+        let t3 = find_table(&tables, 3);
+        assert!(
+            t3.windows(b"ChassisMfr".len())
+                .any(|w| w == b"ChassisMfr"),
+        );
+        assert!(t3.windows(b"CAT1".len()).any(|w| w == b"CAT1"));
+        // type byte at formatted offset 1 (table byte 5) = 0x01 (Other)
+        assert_eq!(t3[5], 0x01);
+
+        // Type 4 Processor: status byte at formatted offset 20 (table 24)
+        // must be 0x41 (socket populated, CPU enabled).
+        let t4 = find_table(&tables, 4);
+        assert_eq!(t4[24], 0x41);
+        assert!(t4.windows(b"CPUMfr".len()).any(|w| w == b"CPUMfr"));
+        assert!(t4.windows(b"CPUV1".len()).any(|w| w == b"CPUV1"));
+
+        // Type 11 OEM strings: count byte = 2, both strings present.
+        let t11 = find_table(&tables, 11);
+        assert_eq!(t11[4], 2);
+        assert!(t11.windows(b"oem-a".len()).any(|w| w == b"oem-a"));
+        assert!(t11.windows(b"oem-b".len()).any(|w| w == b"oem-b"));
+
+        // Type 17 Memory Device: 4 GB -> size_mb = 4096 fits in 16-bit
+        // standard field (4096 < 0x7fff), so size = 4096 LE, ext = 0.
+        let t17 = find_table(&tables, 17);
+        let size_field = u16::from_le_bytes([t17[12], t17[13]]);
+        assert_eq!(size_field, 4096);
+        let ext_size = u32::from_le_bytes([t17[28], t17[29], t17[30], t17[31]]);
+        assert_eq!(ext_size, 0);
+
+        // Type 32 Boot info: 6 reserved zero bytes + boot_status = 0.
+        let t32 = find_table(&tables, 32);
+        for byte in &t32[4..4 + 7] {
+            assert_eq!(*byte, 0);
+        }
+    }
+
+    /// `smbios.system_uuid` accepts both canonical dashed form and bare
+    /// 32 hex chars. After SMBIOS Wired-For-Management byte-flipping
+    /// (per SMBIOS 2.6+), the first three fields land little-endian.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_smbios_uuid_byte_flip() {
+        // RFC 4122 big-endian bytes for "12345678-1234-1234-1234-123456789abc"
+        let raw: [u8; 16] = [
+            0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x12, 0x34, 0x56, 0x78,
+            0x9a, 0xbc,
+        ];
+        let flipped = smbios_encode_uuid(&raw);
+        assert_eq!(
+            flipped,
+            [
+                // time_low (LE)
+                0x78, 0x56, 0x34, 0x12,
+                // time_mid (LE)
+                0x34, 0x12,
+                // time_hi_and_version (LE)
+                0x34, 0x12,
+                // clock_seq_hi/low + node (unchanged)
+                0x12, 0x34, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            ]
+        );
     }
 }
