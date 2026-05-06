@@ -330,6 +330,18 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
             // X_PM_TMR_BLK
             facp.write(208, address);
         }
+
+        if let Some(address) = addresses.gpe0_blk_address {
+            // ACPI 6.x FADT layout:
+            //   offset 80  GPE0_BLK     (u32)  -> status block I/O address
+            //   offset 92  GPE0_BLK_LEN (u8)   -> length of status+enable
+            //   offset 220 X_GPE0_BLK   (GAS)  -> 64-bit-capable form
+            facp.write(80, address.address as u32);
+            facp.write(220, address);
+            if let Some(len) = addresses.gpe0_blk_len {
+                facp.write(92, len);
+            }
+        }
     }
 
     // aarch64 specific fields

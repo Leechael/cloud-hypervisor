@@ -991,6 +991,13 @@ pub struct AcpiPlatformAddresses {
     pub reset_reg_address: Option<GenericAddress>,
     pub sleep_control_reg_address: Option<GenericAddress>,
     pub sleep_status_reg_address: Option<GenericAddress>,
+    /// GPE0 status block address (PMBASE + 0x20 on q35/ICH9). The
+    /// enable half follows at +(gpe0_blk_len/2). Length is reported
+    /// separately via [`Self::gpe0_blk_len`].
+    pub gpe0_blk_address: Option<GenericAddress>,
+    /// Combined length of the GPE0 status + enable halves, in bytes.
+    /// The ACPI FADT exposes this as a single `GPE0_BLK_LEN` field.
+    pub gpe0_blk_len: Option<u8>,
 }
 
 #[cfg(feature = "sev_snp")]
@@ -2159,6 +2166,44 @@ impl DeviceManager {
                 self.acpi_platform_addresses.pm1_cnt_address = Some(
                     GenericAddress::io_port_address::<u16>(shutdown_pio_address + 0x4),
                 );
+
+                // Ich9Pm fills the rest of the q35 PMBASE block (GPE0,
+                // SMI_*, TCO) starting at PMBASE+0x10. PM1_EVT/CNT and
+                // PM_TMR remain owned by their existing devices.
+                let ich9_pm_base: u16 =
+                    shutdown_pio_address + devices::legacy::ICH9_PM_BLOCK_OFFSET;
+                let ich9_pm_len: u64 = devices::legacy::ICH9_PM_BLOCK_LEN as u64;
+                self.address_manager
+                    .allocator
+                    .lock()
+                    .unwrap()
+                    .allocate_io_addresses(
+                        Some(GuestAddress(ich9_pm_base.into())),
+                        ich9_pm_len,
+                        None,
+                    )
+                    .ok_or(DeviceManagerError::AllocateIoPort)?;
+                let ich9_pm = Arc::new(Mutex::new(devices::legacy::Ich9Pm::new()));
+                self.bus_devices
+                    .push(Arc::clone(&ich9_pm) as Arc<dyn BusDeviceSync>);
+                info!(
+                    "Adding ICH9 PM block io ports {:#x}-{:#x} (GPE0/SMI/TCO)",
+                    ich9_pm_base,
+                    ich9_pm_base as u64 + ich9_pm_len - 1
+                );
+                self.address_manager
+                    .io_bus
+                    .insert(ich9_pm, ich9_pm_base.into(), ich9_pm_len)
+                    .map_err(DeviceManagerError::BusError)?;
+
+                // Advertise GPE0 to ACPI: the status block starts at
+                // PMBASE+ICH9_PMIO_GPE0_STS, total len is reported via
+                // GPE0_BLK_LEN (status + enable halves combined).
+                let gpe0_addr = shutdown_pio_address + devices::legacy::ICH9_PMIO_GPE0_STS;
+                self.acpi_platform_addresses.gpe0_blk_address =
+                    Some(GenericAddress::io_port_address::<u32>(gpe0_addr));
+                self.acpi_platform_addresses.gpe0_blk_len =
+                    Some(devices::legacy::ICH9_PMIO_GPE0_BLK_LEN);
             } else {
                 self.address_manager
                     .io_bus
