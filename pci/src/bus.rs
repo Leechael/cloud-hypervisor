@@ -9,6 +9,16 @@ use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::sync::{Arc, Barrier, Mutex};
 
+use arch::q35_pci_ids::{
+    DEVICE_ID_INTEL_ICH9_AHCI, DEVICE_ID_INTEL_ICH9_LPC, DEVICE_ID_INTEL_ICH9_SMBUS,
+    DEVICE_ID_INTEL_P35_MCH, DEVICE_ID_INTEL_VIRT_PCIE_HOST, ICH9_AHCI_MSI_CAP_REG,
+    ICH9_AHCI_SATA_CAP_REG, ICH9_LPC_ACPI_CTRL_REG, ICH9_LPC_IO_DEC_REG, ICH9_LPC_PIRQA_ROUT_REG,
+    ICH9_LPC_PIRQE_ROUT_REG, ICH9_LPC_PMBASE_REG, ICH9_LPC_RCBA_REG, PCI_BAR4_REG,
+    PCI_CAPABILITY_LIST_REG, PCI_COMMAND_STATUS_REG, PCI_HEADER_TYPE_MULTIFUNCTION,
+    PCI_HEADER_TYPE_REG, PCI_INTERRUPT_REG, PCI_STATUS_CAPABILITIES, Q35_PCIEXBAR_DEFAULT,
+    Q35_PCIEXBAR_HIGH_WRITABLE_BITS, Q35_PCIEXBAR_LOW_WRITABLE_BITS, Q35_PCIEXBAR_REG,
+    VENDOR_ID_INTEL,
+};
 use byteorder::{ByteOrder, LittleEndian};
 use log::warn;
 use thiserror::Error;
@@ -25,32 +35,6 @@ use crate::device::{BarReprogrammingParams, DeviceRelocation, Error as PciDevice
 pub const PCI_ROOT_DEVICE_ID: u8 = 0;
 /// Denotes the maximum number of PCI devices allowed on a bus. 32 per PCI spec.
 pub const NUM_DEVICE_IDS: u8 = 32;
-
-const VENDOR_ID_INTEL: u16 = 0x8086;
-const DEVICE_ID_INTEL_VIRT_PCIE_HOST: u16 = 0x0d57;
-const DEVICE_ID_INTEL_P35_MCH: u16 = 0x29c0;
-const DEVICE_ID_INTEL_ICH9_LPC: u16 = 0x2918;
-const DEVICE_ID_INTEL_ICH9_AHCI: u16 = 0x2922;
-const DEVICE_ID_INTEL_ICH9_SMBUS: u16 = 0x2930;
-const Q35_PCIEXBAR_REG: usize = 0x60 / 4;
-const Q35_PCIEXBAR_DEFAULT: u32 = 0xb000_0000;
-const Q35_PCIEXBAR_LOW_WRITABLE_BITS: u32 = 0xf000_0007;
-const Q35_PCIEXBAR_HIGH_WRITABLE_BITS: u32 = 0x0000_000f;
-const PCI_COMMAND_STATUS_REG: usize = 0x04 / 4;
-const PCI_HEADER_TYPE_REG: usize = 0x0c / 4;
-const PCI_BAR4_REG: usize = 0x20 / 4;
-const PCI_CAPABILITY_LIST_REG: usize = 0x34 / 4;
-const PCI_INTERRUPT_REG: usize = 0x3c / 4;
-const PCI_HEADER_TYPE_MULTIFUNCTION: u32 = 0x0080_0000;
-const PCI_STATUS_CAPABILITIES: u32 = 0x0010_0000;
-const ICH9_LPC_PMBASE_REG: usize = 0x40 / 4;
-const ICH9_LPC_ACPI_CTRL_REG: usize = 0x44 / 4;
-const ICH9_LPC_PIRQA_ROUT_REG: usize = 0x60 / 4;
-const ICH9_LPC_PIRQE_ROUT_REG: usize = 0x68 / 4;
-const ICH9_LPC_IO_DEC_REG: usize = 0x80 / 4;
-const ICH9_LPC_RCBA_REG: usize = 0xf0 / 4;
-const ICH9_AHCI_MSI_CAP_REG: usize = 0x80 / 4;
-const ICH9_AHCI_SATA_CAP_REG: usize = 0xa8 / 4;
 
 struct AhciProgrammingInterface;
 
