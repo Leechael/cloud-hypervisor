@@ -866,6 +866,32 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
 
 fn create_viot_table(iommu_bdf: &PciBdf, devices_bdf: &[PciBdf]) -> Sdt {
     // VIOT
+    //
+    // Cross-checked field-by-field against QEMU's `build_viot()` in
+    // hw/acpi/viot.c (see ubuntu-qemu-prod1):
+    //   - 36-byte ACPI table header (`VIOT` signature, rev 0)
+    //   - u16 node_count = ranges + 1 (one per managed device + the iommu)
+    //   - u16 node_offset = 48 (header + 12 bytes of count/offset/reserved)
+    //   - 8 bytes reserved
+    //   - VirtioPCI iommu node:
+    //       type=3, length=16, pci_segment, pci_bdf, 8-byte reserved tail
+    //   - Each PCIRange node:
+    //       type=1, length=24, endpoint_start, pci_segment_start,
+    //       pci_segment_end, pci_bdf_start, pci_bdf_end,
+    //       output_node=48 (offset of the VirtioPCI node), 6-byte reserved tail
+    //
+    // QEMU emits one PCIRange per host bridge spanning min_bus..max_bus,
+    // CH emits one PCIRange per assigned device with start==end. Both
+    // forms are spec-legal and convey the same information to firmware
+    // and the guest IOMMU driver — there is no semantic mismatch.
+    //
+    // TDX/RamDiscard interaction (commit 43cd0e095): the VIOT only
+    // describes which DMA endpoints the vIOMMU mediates. Whether a
+    // page is shared or private at any given instant is decided at
+    // runtime by the RamDiscardManager bitmap — the firmware never
+    // needs that distinction surfaced through ACPI. So no extra VIOT
+    // fields are required for the share/private split, and the table
+    // stays identical between TDX and non-TDX boots.
     let mut viot = Sdt::new(*b"VIOT", 36, 0, *b"CLOUDH", *b"CHVIOT  ", 0);
     // Node count
     viot.append((devices_bdf.len() + 1) as u16);
