@@ -257,7 +257,163 @@ Full key list (mirrors `vmm/src/vm_config.rs::SmbiosConfig`):
 | `-virtfs local,path=...,mount_tag=...` | no direct equivalent in this branch |
 | `-smbios type=N,...` | `--platform smbios.<field>=...` |
 
-## 8. GPU passthrough (P4 status)
+### Minimal QEMU comparison command
+
+The equivalent QEMU q35/TDX launch used for benchmarking
+`minimal-tdx-image` examples is:
+
+```bash
+qemu-system-x86_64 \
+  -accel kvm \
+  -cpu host \
+  -nographic \
+  -nodefaults \
+  -chardev file,id=com0,path=/tmp/tdx-serial.log \
+  -serial chardev:com0 \
+  -kernel /path/bzImage \
+  -initrd /path/initramfs.cpio.gz \
+  -append "console=ttyS0 init=/init panic=1 random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock out_tag=out out_dir=/mnt/out initrd=initrd" \
+  -smp 1 \
+  -m 512M \
+  -bios /path/ovmf.fd \
+  -machine q35,kernel-irqchip=split,confidential-guest-support=tdx,hpet=off \
+  -object tdx-guest,id=tdx
+```
+
+For quote tests, add the QGS object and a guest vsock device:
+
+```bash
+qemu-system-x86_64 \
+  ... \
+  -object '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}' \
+  -device vhost-vsock-pci,guest-cid=33
+```
+
+## 8. Validated benchmark commands
+
+The following commands were used to validate Cloud Hypervisor q35/TDX
+against `minimal-tdx-image` hello/memfill/quote examples on both
+`phala-tdx-lab` and `phala-tdx-prod1`.
+
+Hello / memfill:
+
+```bash
+cloud-hypervisor \
+  --tdx firmware=/path/ovmf.fd \
+  --kernel /path/bzImage \
+  --initramfs /path/initramfs.cpio.gz \
+  --cmdline "console=ttyS0 init=/init panic=1 random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock out_tag=out out_dir=/mnt/out" \
+  --memory size=512M \
+  --cpus boot=1,max=1 \
+  --platform num_pci_segments=1,tdx=on \
+  --fw-cfg-config '' \
+  --serial file=/tmp/ch-tdx-serial.log \
+  --console off
+```
+
+Quote:
+
+```bash
+RUN_DIR=/run/ch-tdx
+mkdir -p "$RUN_DIR"
+
+socat \
+  UNIX-LISTEN:$RUN_DIR/ch-vsock.sock_4050,fork,reuseaddr \
+  VSOCK-CONNECT:2:4050 &
+
+cloud-hypervisor \
+  --tdx firmware=/path/ovmf.fd \
+  --kernel /path/bzImage \
+  --initramfs /path/initramfs.cpio.gz \
+  --cmdline "console=ttyS0 init=/init panic=1 random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock out_tag=out out_dir=/mnt/out" \
+  --memory size=512M \
+  --cpus boot=1,max=1 \
+  --platform num_pci_segments=1,tdx=on \
+  --fw-cfg-config '' \
+  --vsock cid=33,socket=$RUN_DIR/ch-vsock.sock \
+  --serial file=/tmp/ch-tdx-serial.log \
+  --console off
+```
+
+Benchmark binaries and hosts:
+
+```text
+Cloud Hypervisor branch: lee/tdx-kvm-uapi-supermicro
+Cloud Hypervisor head:   ea70e118c kvm: gate legacy guest_memfd hugepage flag
+TDX binary sha256:       75ed94c4346a08ff8df504df2a9af578a4618f05c59d0008a5fa357828f0708f
+
+phala-tdx-lab:
+  kernel: 6.8.0-1028-intel
+  qemu:   8.2.2+tdx1.1
+
+phala-tdx-prod1:
+  kernel: 7.0.0-14-generic
+  qemu:   10.2.1
+```
+
+Median hello wall-time from the q35/no-tdx and q35/TDX matrix:
+
+```text
+phala-tdx-lab:
+  CH q35/no-tdx direct-kernel:     1.435s
+  QEMU q35/no-tdx direct-kernel:   2.162s
+  QEMU q35/no-tdx OVMF:            2.701s
+  CH q35/TDX OVMF:                 2.980s
+  QEMU q35/TDX OVMF:               3.815s
+
+phala-tdx-prod1:
+  CH q35/no-tdx direct-kernel:     1.362s
+  QEMU q35/no-tdx direct-kernel:   2.054s
+  QEMU q35/no-tdx OVMF:            2.310s
+  CH q35/TDX OVMF:                 4.432s
+  QEMU q35/TDX OVMF:               5.823s
+```
+
+Interpretation:
+
+- Cloud Hypervisor keeps a measurable q35/no-tdx advantage over QEMU.
+- Enabling TDX dominates total wall time on the new prod1 kernel.
+- On the same host and payload, CH q35/TDX remains faster than QEMU
+  q35/TDX, but both are dominated by kernel/TDX private-memory work.
+
+Kernel bpftrace comparison for hello showed the prod1 slowdown comes
+from nearly full-RAM private page lifecycle work:
+
+```text
+phala-tdx-prod1 CH q35/TDX:
+  tdh_mem_page_aug              132459
+  tdx_sept_set_private_spte     133509
+  tdx_sept_remove_private_spte  133509
+  kvm_gmem_release              ~1.57s
+
+phala-tdx-prod1 QEMU q35/TDX:
+  tdh_mem_page_aug              132459
+  tdx_sept_set_private_spte     133509
+  tdx_sept_remove_private_spte  133509
+  kvm_gmem_release              ~1.07s
+
+phala-tdx-lab QEMU q35/TDX:
+  tdx_mem_page_aug              9308
+  tdx_sept_set_private_spte     10358
+  tdx_sept_remove_private_spte  29776
+```
+
+This means the prod1 result is not a Cloud Hypervisor-only hard-coded
+path. QEMU on the same host performs the same order of TDX page AUG and
+teardown work. The difference is the newer kernel / TDX stack causing
+almost the full 512 MiB guest memory range to be populated and later
+removed as 4 KiB private pages.
+
+Hugepage backing does not remove this bottleneck on prod1's current
+kernel: `arch/x86/kvm/vmx/tdx.c` still forces private SPTE add/remove
+to `PG_LEVEL_4K` (`TODO: handle large pages`), and
+`virt/kvm/guest_memfd.c::kvm_gmem_populate()` iterates page-by-page.
+The older `phala-tdx-lab` kernel has private S-EPT promote/demote code
+and does not have the same hard `PG_LEVEL_4K` checks, but current
+measurements still show thousands of private 4 KiB operations rather
+than hundreds of 2 MiB operations.
+
+## 9. GPU passthrough (P4 status)
 
 The plumbing for VFIO + TDX is in place:
 
@@ -294,7 +450,7 @@ TDX VFIO. The `RamDiscardListener` fans out DMA-map / DMA-unmap as the
 guest flips share/private state, so the standard `--device` path is
 sufficient.
 
-## 9. Known limitations
+## 10. Known limitations
 
 - **No SMM emulation.** OVMF/TDVF must be built non-SMM
   (`SMM_REQUIRE=FALSE` or equivalent). This is consistent with TDX's
@@ -304,6 +460,10 @@ sufficient.
 - **No `KVM_TDX_TERMINATE_VM`.** The fast-teardown ioctl is still at
   RFC stage upstream. Shutdown of large TDX VMs (100+ GiB) takes the
   same time it takes QEMU on the same kernel.
+- **No prod1 TDX private hugepage fast path.** On the tested
+  `7.0.0-14` kernel, private TDX S-EPT add/remove is still forced to
+  4 KiB pages, so hugepage-backed RAM does not collapse the observed
+  ~133k per-page AUG/remove operations.
 - **PIT/PIC userspace emulation is stub-only.** q35 + split irqchip +
   `KVM_CREATE_PIT2` are mutually exclusive at the KVM ABI level. The
   current `PicStub` / `PitStub` / `Port61` cover OVMF + Linux probe
@@ -315,7 +475,7 @@ sufficient.
 - **`mshv` and `aarch64` paths are not maintained for TDX in this
   fork.** Only `x86_64` + `kvm` is validated.
 
-## 10. Roadmap and references
+## 11. Roadmap and references
 
 The full project plan, including completed phases (P0, P1, P3.2, P3.3,
 P3.4, P3.5, P4 main framework) and deferred items (P2 quote async,
