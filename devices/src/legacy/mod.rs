@@ -18,6 +18,8 @@ mod gpio_pl061;
 mod hpet;
 mod i8042;
 #[cfg(target_arch = "x86_64")]
+pub mod ich9_lpc;
+#[cfg(target_arch = "x86_64")]
 mod pc_compat;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
@@ -39,6 +41,8 @@ pub use self::gpio_pl061::Gpio;
 #[cfg(target_arch = "x86_64")]
 pub use self::hpet::{HPET_BASE, HPET_LEN, HPET_NUM_TIMERS, Hpet, hpet_block_id};
 pub use self::i8042::I8042Device;
+#[cfg(target_arch = "x86_64")]
+pub use self::ich9_lpc::{ICH9_PMIO_GPE0_BLK_LEN, ICH9_PMIO_GPE0_STS, ICH9_PM_BLOCK_LEN, ICH9_PM_BLOCK_OFFSET, Ich9Pm};
 #[cfg(target_arch = "x86_64")]
 pub use self::pc_compat::{
     ApmStub, ComPortStub, PicStub, PitStub, Port61, Port92, Q35Pm1Cnt, Q35Pm1Evt,
