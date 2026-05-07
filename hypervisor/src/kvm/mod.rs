@@ -589,6 +589,7 @@ fn tdx_legacy_cpuid_leaf_allowed(function: u32) -> bool {
             | 0x0000_0014
             | 0x0000_001d
             | 0x0000_001e
+            | 0x0000_001f
             | 0x4000_0000
             | 0x4000_0001
             | 0x8000_0000
@@ -598,6 +599,7 @@ fn tdx_legacy_cpuid_leaf_allowed(function: u32) -> bool {
             | 0x8000_0004
             | 0x8000_0005
             | 0x8000_0006
+            | 0x8000_0007
             | 0x8000_0008
     )
 }
@@ -2223,18 +2225,26 @@ impl vm::Vm for KvmVm {
 
             // Mirrors QEMU `tdx_validate_attributes` against legacy KVM TDX
             // caps. Legacy ABI exposes `attrs_fixed0` (mask of bits *allowed*
-            // to be variable) and `attrs_fixed1` (mask of bits *forced to 1*),
-            // so the actual TD attributes are
-            //   `(requested & attrs_fixed0) | attrs_fixed1`.
+            // to be variable) and `attrs_fixed1` (mask of bits *forced to 1*).
+            // Do not silently rewrite the requested attestation attributes.
             let requested_attrs = tdx_requested_attributes(attrs);
-            let attributes = (requested_attrs & caps.attrs_fixed0) | caps.attrs_fixed1;
-            if attributes != requested_attrs {
-                info!(
-                    "TDX legacy attributes adjusted by caps: requested={:#x} \
-                     actual={:#x} fixed0={:#x} fixed1={:#x}",
-                    requested_attrs, attributes, caps.attrs_fixed0, caps.attrs_fixed1,
-                );
+            if ((requested_attrs & caps.attrs_fixed0) | caps.attrs_fixed1) != requested_attrs {
+                return Err(vm::HypervisorVmError::InitializeTdx(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid legacy TDX attributes {requested_attrs:#x} \
+                         (fixed0 {:#x}, fixed1 {:#x})",
+                        caps.attrs_fixed0, caps.attrs_fixed1,
+                    ),
+                )));
             }
+            if attrs.debug {
+                return Err(vm::HypervisorVmError::InitializeTdx(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "legacy TDX does not support debug attributes",
+                )));
+            }
+            let attributes = requested_attrs;
 
             // xfam: explicit override goes through `xfam_fixed0/1` validation,
             // otherwise derive from CPUID (legacy path historically omitted
@@ -2477,17 +2487,45 @@ impl vm::Vm for KvmVm {
                 source: 0,
             };
 
-            if !measure {
-                return Ok(());
+            loop {
+                // SAFETY: KVM reads the mapping descriptor and pins pages from source.
+                let ret = unsafe {
+                    libc::ioctl(
+                        self.fd.as_raw_fd(),
+                        KVM_MEMORY_MAPPING_RAW,
+                        &data as *const KvmMemoryMapping,
+                    )
+                };
+                if ret == 0 {
+                    break;
+                }
+
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+                    continue;
+                }
+
+                return Err(vm::HypervisorVmError::InitMemRegionTdx(err));
             }
 
-            return tdx_command(
-                &self.fd.as_raw_fd(),
-                TdxCommand::InitMemRegion,
-                0,
-                &data as *const _ as *const _,
-            )
-            .map_err(vm::HypervisorVmError::InitMemRegionTdx);
+            if measure {
+                let extend = KvmMemoryMapping {
+                    base_gfn: guest_address >> 12,
+                    nr_pages: (size / 4096).try_into().unwrap(),
+                    flags: 0,
+                    source: 0,
+                };
+
+                tdx_command(
+                    &self.fd.as_raw_fd(),
+                    TdxCommand::InitMemRegion,
+                    0,
+                    &extend as *const _ as *const _,
+                )
+                .map_err(vm::HypervisorVmError::InitMemRegionTdx)?;
+            }
+
+            return Ok(());
         }
 
         #[repr(C)]
@@ -2635,7 +2673,7 @@ fn tdx_command(
 
         if ret < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
+            if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
                 continue;
             }
             return Err(err);
