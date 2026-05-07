@@ -589,7 +589,6 @@ fn tdx_legacy_cpuid_leaf_allowed(function: u32) -> bool {
             | 0x0000_0014
             | 0x0000_001d
             | 0x0000_001e
-            | 0x0000_001f
             | 0x4000_0000
             | 0x4000_0001
             | 0x8000_0000
@@ -599,7 +598,6 @@ fn tdx_legacy_cpuid_leaf_allowed(function: u32) -> bool {
             | 0x8000_0004
             | 0x8000_0005
             | 0x8000_0006
-            | 0x8000_0007
             | 0x8000_0008
     )
 }
@@ -773,13 +771,6 @@ fn tdx_legacy_cpuid_rule(
             depends_on_vmm_cap: 0,
             inducing_ve: true,
             supported_value_on_ve: CPUID_6_EAX_ARAT,
-        },
-        (0x8000_0007, _, TdxCpuidReg::Edx) => TdxCpuidRule {
-            fixed0: 0,
-            fixed1: 0,
-            depends_on_vmm_cap: 0,
-            inducing_ve: true,
-            supported_value_on_ve: u32::MAX,
         },
         (0x4000_0001, _, TdxCpuidReg::Eax) => TdxCpuidRule {
             fixed0: 0,
