@@ -288,6 +288,16 @@ const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
 const TDG_VP_VMCALL_ALIGN_ERROR: u64 = 0x8000000000000002;
 #[cfg(feature = "tdx")]
 const TDX_MAP_GPA_MAX_LEN: u64 = 64 * 1024 * 1024;
+#[cfg(feature = "tdx")]
+const TDX_FW_CFG_DMA_HI_PORT: u16 = 0x514;
+#[cfg(feature = "tdx")]
+const TDX_FW_CFG_DMA_LO_PORT: u16 = 0x518;
+#[cfg(feature = "tdx")]
+const TDX_FW_CFG_DMA_ACCESS_SIZE: u64 = 16;
+#[cfg(feature = "tdx")]
+const TDX_FW_CFG_DMA_CTL_READ: u32 = 0x02;
+#[cfg(feature = "tdx")]
+const TDX_FW_CFG_DMA_CTL_WRITE: u32 = 0x10;
 
 #[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, std::os::raw::c_ulong);
@@ -3779,17 +3789,18 @@ impl cpu::Vcpu for KvmVcpu {
                     let data = data.to_vec();
                     #[cfg(feature = "tdx")]
                     if self.tdx_legacy_cpuid {
-                        if data.len() == 4 && (addr == 0x514 || addr == 0x518) {
+                        if data.len() == 4
+                            && (addr == TDX_FW_CFG_DMA_HI_PORT || addr == TDX_FW_CFG_DMA_LO_PORT)
+                        {
                             let mut buf = [0u8; 4];
                             buf.copy_from_slice(&data);
                             let val = u32::from_be_bytes(buf);
-                            if addr == 0x514 {
+                            if addr == TDX_FW_CFG_DMA_HI_PORT {
                                 self.tdx_fw_cfg_dma_hi = val;
                             } else {
                                 let dma_address =
                                     ((self.tdx_fw_cfg_dma_hi as u64) << 32) | val as u64;
-                                let start = dma_address & !0xfffu64;
-                                self.convert_guest_memory_region(start, 0x1000, false)?;
+                                self.tdx_prepare_fw_cfg_dma(dma_address)?;
                             }
                         }
                         if addr == 0x64 && data.first().copied() == Some(0xfe) {
@@ -5372,6 +5383,62 @@ impl KvmVcpu {
 
         flush_ranges.sort_by_key(|(start, _)| *start);
         flush_ranges
+    }
+
+    #[cfg(feature = "tdx")]
+    fn tdx_shared_page_range(address: u64, size: u64) -> cpu::Result<Option<(u64, u64)>> {
+        if size == 0 {
+            return Ok(None);
+        }
+
+        const PAGE_SIZE: u64 = 4096;
+        let start = address & !(PAGE_SIZE - 1);
+        let end = address
+            .checked_add(size)
+            .and_then(|end| end.checked_add(PAGE_SIZE - 1))
+            .map(|end| end & !(PAGE_SIZE - 1))
+            .ok_or_else(|| {
+                cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                    "TDX fw_cfg DMA shared range overflow: address={address:#x}, size={size:#x}"
+                ))
+            })?;
+
+        Ok(Some((start, end - start)))
+    }
+
+    #[cfg(feature = "tdx")]
+    fn tdx_convert_fw_cfg_dma_range(&self, address: u64, size: u64) -> cpu::Result<()> {
+        if let Some((start, size)) = Self::tdx_shared_page_range(address, size)? {
+            self.convert_guest_memory_region(start, size, false)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn tdx_prepare_fw_cfg_dma(&self, dma_address: u64) -> cpu::Result<()> {
+        self.tdx_convert_fw_cfg_dma_range(dma_address, TDX_FW_CFG_DMA_ACCESS_SIZE)?;
+
+        let Some(vm_ops) = &self.vm_ops else {
+            return Ok(());
+        };
+
+        let mut desc = [0u8; TDX_FW_CFG_DMA_ACCESS_SIZE as usize];
+        vm_ops
+            .guest_mem_read(dma_address, &mut desc)
+            .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))?;
+
+        let control = u32::from_be_bytes(desc[0..4].try_into().unwrap());
+        let length = u32::from_be_bytes(desc[4..8].try_into().unwrap()) as u64;
+        let target = u64::from_be_bytes(desc[8..16].try_into().unwrap());
+
+        if control & (TDX_FW_CFG_DMA_CTL_READ | TDX_FW_CFG_DMA_CTL_WRITE) != 0 {
+            self.tdx_convert_fw_cfg_dma_range(target, length)?;
+        }
+
+        debug!(
+            "TDX fw_cfg DMA prepared: desc={dma_address:#x} control={control:#x} length={length:#x} target={target:#x}"
+        );
+        Ok(())
     }
 
     #[cfg(any(feature = "sev_snp", feature = "tdx"))]

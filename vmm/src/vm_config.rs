@@ -1016,8 +1016,9 @@ impl ApplyLandlock for TpmConfig {
 /// Mirrors the knobs QEMU exposes via `-object tdx-guest,...`. Every field
 /// other than `firmware` is optional; defaults match the historical hard-coded
 /// behaviour (sept_ve_disable on, debug/perfmon off, mr* zeroed, xfam derived
-/// from CPUID) so that `--tdx firmware=<path>` alone is byte-equivalent to the
-/// legacy `--platform tdx=on --firmware <path>` invocation.
+/// from CPUID). Plain `--tdx` uses the non-q35/i440fx-compatible TDX PC
+/// platform; the legacy `--platform tdx=on` spelling remains accepted for the
+/// q35-compatible path.
 #[cfg(feature = "tdx")]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TdxConfig {

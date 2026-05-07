@@ -3611,8 +3611,7 @@ impl VmConfig {
         };
 
         #[cfg(feature = "tdx")]
-        let tdx_firmware_fallback: Option<PathBuf> =
-            tdx.as_ref().map(|t| t.firmware.clone());
+        let tdx_firmware_fallback: Option<PathBuf> = tdx.as_ref().map(|t| t.firmware.clone());
         #[cfg(not(feature = "tdx"))]
         let tdx_firmware_fallback: Option<PathBuf> = None;
 
@@ -3809,7 +3808,27 @@ impl VmConfig {
     pub fn is_tdx_enabled(&self) -> bool {
         // TDX is enabled if either the legacy `--platform tdx=on` toggle is set
         // or the new `--tdx firmware=...` knob has been supplied.
-        self.platform.as_ref().is_some_and(|p| p.tdx) || self.tdx.is_some()
+        self.uses_legacy_tdx_q35_platform() || self.tdx.is_some()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_tdx_q35_platform(&self) -> bool {
+        // Compatibility check for the historical `--platform tdx=on` spelling.
+        // Pure `--tdx firmware=...` uses the non-q35/i440fx-compatible
+        // platform so it can be validated independently from q35.
+        self.uses_legacy_tdx_q35_platform()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_tdx_i440fx_platform(&self) -> bool {
+        self.is_tdx_enabled() && !self.uses_tdx_q35_platform()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_legacy_tdx_q35_platform(&self) -> bool {
+        // Compatibility check for the historical `--platform tdx=on` spelling.
+        // New q35 platform decisions should use `uses_tdx_q35_platform()`.
+        self.platform.as_ref().is_some_and(|p| p.tdx)
     }
 
     #[cfg(feature = "sev_snp")]
@@ -5310,6 +5329,41 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         valid_config.validate().unwrap();
+
+        #[cfg(feature = "tdx")]
+        {
+            let mut tdx_config = valid_config.clone();
+            tdx_config.tdx = Some(TdxConfig {
+                firmware: PathBuf::from("/path/to/tdvf.fd"),
+                sept_ve_disable: None,
+                debug: false,
+                perfmon: false,
+                mrconfigid: None,
+                mrowner: None,
+                mrownerconfig: None,
+                xfam: None,
+            });
+            assert!(tdx_config.is_tdx_enabled());
+            assert!(!tdx_config.uses_tdx_q35_platform());
+            assert!(!tdx_config.uses_legacy_tdx_q35_platform());
+            assert!(tdx_config.uses_tdx_i440fx_platform());
+            let hv_config = hypervisor::HypervisorVmConfig::from(&tdx_config);
+            assert!(hv_config.tdx_enabled);
+
+            let mut legacy_q35_tdx_config = valid_config.clone();
+            legacy_q35_tdx_config.platform = Some(PlatformConfig {
+                tdx: true,
+                ..platform_fixture()
+            });
+            legacy_q35_tdx_config.payload.as_mut().unwrap().firmware =
+                Some(PathBuf::from("/path/to/tdvf.fd"));
+            assert!(legacy_q35_tdx_config.is_tdx_enabled());
+            assert!(legacy_q35_tdx_config.uses_tdx_q35_platform());
+            assert!(legacy_q35_tdx_config.uses_legacy_tdx_q35_platform());
+            assert!(!legacy_q35_tdx_config.uses_tdx_i440fx_platform());
+            let hv_config = hypervisor::HypervisorVmConfig::from(&legacy_q35_tdx_config);
+            assert!(hv_config.tdx_enabled);
+        }
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.mode = ConsoleOutputMode::Tty;

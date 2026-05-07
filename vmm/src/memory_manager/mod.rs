@@ -1455,6 +1455,7 @@ impl MemoryManager {
         prefault: Option<bool>,
         phys_bits: u8,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "tdx")] tdx_q35_platform: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -1513,7 +1514,7 @@ impl MemoryManager {
         } else {
             // Init guest memory
             #[cfg(feature = "tdx")]
-            let arch_mem_regions = if tdx_enabled {
+            let arch_mem_regions = if tdx_enabled && tdx_q35_platform {
                 arch::tdx_q35_arch_memory_regions()
             } else {
                 arch::arch_memory_regions()
@@ -1737,6 +1738,8 @@ impl MemoryManager {
                 config,
                 Some(prefault),
                 phys_bits,
+                #[cfg(feature = "tdx")]
+                false,
                 #[cfg(feature = "tdx")]
                 false,
                 Some(&mem_snapshot),
@@ -2251,8 +2254,7 @@ impl MemoryManager {
         {
             let attrs = self.ram_block_attributes.lock().unwrap();
             for region in attrs.iter() {
-                for (gpa, size) in
-                    region.shared_ranges(region.region_start(), region.region_size())
+                for (gpa, size) in region.shared_ranges(region.region_start(), region.region_size())
                 {
                     let host_va = self.gpa_to_hva(gpa).ok_or_else(|| {
                         io::Error::new(
@@ -2333,7 +2335,10 @@ impl MemoryManager {
                     region.set_shared(gpa, size);
                 }
             }
-            if let Err(e) = self.ram_discard_registry.notify_populate(gpa, host_va, size) {
+            if let Err(e) = self
+                .ram_discard_registry
+                .notify_populate(gpa, host_va, size)
+            {
                 error!(
                     "ram-discard listener notify_populate failed: gpa={gpa:#x} \
                      size={size:#x} hva={host_va:#x}: {e}"

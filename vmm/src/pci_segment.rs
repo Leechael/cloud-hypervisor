@@ -15,8 +15,7 @@ use acpi_tables::{Aml, aml};
 use arch::layout;
 use log::info;
 use pci::{
-    DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciLpcBridge, PciQ35Ahci, PciQ35Smbus,
-    PciRoot,
+    DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciLpcBridge, PciQ35Ahci, PciQ35Smbus, PciRoot,
 };
 #[cfg(target_arch = "x86_64")]
 use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE, PciConfigIo};
@@ -63,10 +62,13 @@ impl PciSegment {
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
         mmio_config_base: u64,
         q35_host_bridge: bool,
+        i440fx_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
         let pci_root = if q35_host_bridge {
             PciRoot::new_q35()
+        } else if i440fx_host_bridge {
+            PciRoot::new_i440fx()
         } else {
             PciRoot::new(None)
         };
@@ -164,6 +166,7 @@ impl PciSegment {
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
         mmio_config_base: u64,
         q35_host_bridge: bool,
+        i440fx_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
         let mut segment = Self::new(
@@ -174,6 +177,7 @@ impl PciSegment {
             mem64_allocator,
             mmio_config_base,
             q35_host_bridge,
+            i440fx_host_bridge,
             pci_irq_slots,
         )?;
         let pci_config_io = Arc::new(Mutex::new(PciConfigIo::new(Arc::clone(&segment.pci_bus))));
@@ -199,6 +203,7 @@ impl PciSegment {
         mem64_allocator: Arc<Mutex<AddressAllocator>>,
         mmio_config_base: u64,
         q35_host_bridge: bool,
+        i440fx_host_bridge: bool,
         pci_irq_slots: &[u8; 32],
     ) -> DeviceManagerResult<PciSegment> {
         Self::new(
@@ -209,6 +214,7 @@ impl PciSegment {
             mem64_allocator,
             mmio_config_base,
             q35_host_bridge,
+            i440fx_host_bridge,
             pci_irq_slots,
         )
     }
@@ -874,7 +880,6 @@ mod unit_tests {
             allocator_1,
             allocator_2,
             layout::PCI_MMCONFIG_START.0,
-            false,
             &arr,
             &mock_device_reloc,
         )

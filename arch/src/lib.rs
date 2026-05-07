@@ -73,6 +73,9 @@ pub mod q35_pci_ids {
     /// CH's synthetic "virtual PCIe host" device ID. Not a real Intel
     /// part — predates the q35 work but uses an Intel vendor range.
     pub const DEVICE_ID_INTEL_VIRT_PCIE_HOST: u16 = 0x0d57;
+    /// Intel 82441FX PMC host bridge used by QEMU's i440fx PC machine.
+    /// TDVF/OVMF recognises this as a conventional non-q35 PC root bridge.
+    pub const DEVICE_ID_INTEL_I440FX_HOST_BRIDGE: u16 = 0x1237;
     /// Intel P35/X38 host bridge (DRAM controller). QEMU's q35 machine
     /// uses this ID for the root complex; matching it lets stock OVMF
     /// and Linux apply the correct chipset quirks.

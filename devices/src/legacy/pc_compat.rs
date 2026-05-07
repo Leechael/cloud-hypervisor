@@ -395,7 +395,7 @@ impl BusDevice for Q35Pm1Cnt {
     }
 }
 
-/// Minimal APM command/status ports used as q35 SMI_CMD.
+/// Minimal PC APM command/status ports used as SMI_CMD.
 pub struct ApmStub {
     command: u8,
     status: u8,

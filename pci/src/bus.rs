@@ -10,11 +10,11 @@ use std::ops::DerefMut;
 use std::sync::{Arc, Barrier, Mutex};
 
 use arch::q35_pci_ids::{
-    DEVICE_ID_INTEL_ICH9_AHCI, DEVICE_ID_INTEL_ICH9_LPC, DEVICE_ID_INTEL_ICH9_SMBUS,
-    DEVICE_ID_INTEL_P35_MCH, DEVICE_ID_INTEL_VIRT_PCIE_HOST, ICH9_AHCI_MSI_CAP_REG,
-    ICH9_AHCI_SATA_CAP_REG, ICH9_LPC_ACPI_CTRL_REG, ICH9_LPC_IO_DEC_REG, ICH9_LPC_PIRQA_ROUT_REG,
-    ICH9_LPC_PIRQE_ROUT_REG, ICH9_LPC_PMBASE_REG, ICH9_LPC_RCBA_REG, PCI_BAR4_REG,
-    PCI_CAPABILITY_LIST_REG, PCI_COMMAND_STATUS_REG, PCI_HEADER_TYPE_MULTIFUNCTION,
+    DEVICE_ID_INTEL_I440FX_HOST_BRIDGE, DEVICE_ID_INTEL_ICH9_AHCI, DEVICE_ID_INTEL_ICH9_LPC,
+    DEVICE_ID_INTEL_ICH9_SMBUS, DEVICE_ID_INTEL_P35_MCH, DEVICE_ID_INTEL_VIRT_PCIE_HOST,
+    ICH9_AHCI_MSI_CAP_REG, ICH9_AHCI_SATA_CAP_REG, ICH9_LPC_ACPI_CTRL_REG, ICH9_LPC_IO_DEC_REG,
+    ICH9_LPC_PIRQA_ROUT_REG, ICH9_LPC_PIRQE_ROUT_REG, ICH9_LPC_PMBASE_REG, ICH9_LPC_RCBA_REG,
+    PCI_BAR4_REG, PCI_CAPABILITY_LIST_REG, PCI_COMMAND_STATUS_REG, PCI_HEADER_TYPE_MULTIFUNCTION,
     PCI_HEADER_TYPE_REG, PCI_INTERRUPT_REG, PCI_STATUS_CAPABILITIES, Q35_PCIEXBAR_DEFAULT,
     Q35_PCIEXBAR_HIGH_WRITABLE_BITS, Q35_PCIEXBAR_LOW_WRITABLE_BITS, Q35_PCIEXBAR_REG,
     VENDOR_ID_INTEL,
@@ -122,6 +122,25 @@ impl PciRoot {
         config.set_writable_bits(Q35_PCIEXBAR_REG + 1, Q35_PCIEXBAR_HIGH_WRITABLE_BITS);
 
         PciRoot { config }
+    }
+
+    /// Create a QEMU i440fx-compatible host bridge.
+    pub fn new_i440fx() -> Self {
+        PciRoot {
+            config: PciConfiguration::new(
+                VENDOR_ID_INTEL,
+                DEVICE_ID_INTEL_I440FX_HOST_BRIDGE,
+                2,
+                PciClassCode::BridgeDevice,
+                &PciBridgeSubclass::HostBridge,
+                None,
+                PciHeaderType::Device,
+                0,
+                0,
+                None,
+                None,
+            ),
+        }
     }
 }
 

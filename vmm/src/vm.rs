@@ -32,7 +32,7 @@ use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY;
 #[cfg(feature = "tdx")]
-use arch::x86_64::tdx::{InitramfsInfo, TdvfSection, TdvfSectionType};
+use arch::x86_64::tdx::{TdvfSection, TdvfSectionType};
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits};
 use devices::AcpiNotificationFlags;
 #[cfg(target_arch = "aarch64")]
@@ -75,7 +75,7 @@ use vm_device::Bus;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemory;
 #[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
+use vm_memory::{ByteValued, GuestMemoryRegion, ReadVolatile};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
@@ -1446,6 +1446,12 @@ impl Vm {
         } else {
             vm_config.lock().unwrap().is_tdx_enabled()
         };
+        #[cfg(feature = "tdx")]
+        let tdx_q35_platform = if snapshot.is_some() {
+            false
+        } else {
+            vm_config.lock().unwrap().uses_tdx_q35_platform()
+        };
 
         #[cfg(feature = "igvm")]
         let igvm_file = {
@@ -1501,6 +1507,8 @@ impl Vm {
                     phys_bits,
                     #[cfg(feature = "tdx")]
                     tdx_enabled,
+                    #[cfg(feature = "tdx")]
+                    tdx_q35_platform,
                     None,
                     Default::default(),
                 )

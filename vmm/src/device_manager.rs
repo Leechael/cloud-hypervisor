@@ -129,9 +129,9 @@ use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
-use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 #[cfg(feature = "tdx")]
 use crate::memory_manager::ram_discard::RamDiscardListener;
+use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(feature = "ivshmem")]
@@ -177,15 +177,6 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
-
-#[cfg(all(target_arch = "x86_64", any(test, feature = "tdx")))]
-fn page_aligned_range(address: u64, size: u64) -> Option<(u64, u64)> {
-    const PAGE_SIZE: u64 = 4096;
-    let start = address & !(PAGE_SIZE - 1);
-    let end = address.checked_add(size)?.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
-
-    (end > start).then_some((start, end - start))
-}
 
 #[cfg(target_arch = "x86_64")]
 fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
@@ -1270,9 +1261,13 @@ impl RamDiscardListener for VfioRamDiscardListener {
         // remains mapped for the VM's lifetime; VFIO read/writes via
         // DMA are otherwise unsynchronized which is the existing
         // contract for `vfio_dma_map`.
-        unsafe { self.vfio_ops.vfio_dma_map(gpa, size as usize, host_va as *mut u8) }.map_err(
-            |e| std::io::Error::other(format!("vfio_dma_map gpa={gpa:#x} size={size:#x}: {e}")),
-        )
+        unsafe {
+            self.vfio_ops
+                .vfio_dma_map(gpa, size as usize, host_va as *mut u8)
+        }
+        .map_err(|e| {
+            std::io::Error::other(format!("vfio_dma_map gpa={gpa:#x} size={size:#x}: {e}"))
+        })
     }
 
     fn notify_discard(&self, gpa: u64, size: u64) {
@@ -1336,16 +1331,15 @@ impl DeviceManager {
         }
 
         #[cfg(feature = "tdx")]
-        let tdx_enabled = config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .is_some_and(|p| p.tdx);
+        let tdx_q35_platform = config.lock().unwrap().uses_tdx_q35_platform();
         #[cfg(not(feature = "tdx"))]
-        let tdx_enabled = false;
+        let tdx_q35_platform = false;
+        #[cfg(feature = "tdx")]
+        let tdx_i440fx_platform = config.lock().unwrap().uses_tdx_i440fx_platform();
+        #[cfg(not(feature = "tdx"))]
+        let tdx_i440fx_platform = false;
 
-        let (start_of_mmio32_area, end_of_mmio32_area, pci_mmconfig_start) = if tdx_enabled {
+        let (start_of_mmio32_area, end_of_mmio32_area, pci_mmconfig_start) = if tdx_q35_platform {
             (
                 layout::Q35_MEM_32BIT_DEVICES_START.0,
                 layout::Q35_MEM_32BIT_DEVICES_START.0 + layout::Q35_MEM_32BIT_DEVICES_SIZE - 1,
@@ -1426,7 +1420,8 @@ impl DeviceManager {
             Arc::clone(&address_manager.pci_mmio32_allocators[0]),
             Arc::clone(&address_manager.pci_mmio64_allocators[0]),
             pci_mmconfig_start,
-            tdx_enabled,
+            tdx_q35_platform,
+            tdx_i440fx_platform,
             &pci_irq_slots,
         )?];
 
@@ -1438,7 +1433,8 @@ impl DeviceManager {
                 Arc::clone(&address_manager.pci_mmio32_allocators[i]),
                 Arc::clone(&address_manager.pci_mmio64_allocators[i]),
                 pci_mmconfig_start,
-                tdx_enabled,
+                tdx_q35_platform,
+                false,
                 &pci_irq_slots,
             )?);
         }
@@ -2105,7 +2101,7 @@ impl DeviceManager {
             .unwrap()
             .vcpus_kill_signalled()
             .clone();
-        let q35_guest_exit_evt = guest_exit_evt
+        let pm1_guest_exit_evt = guest_exit_evt
             .try_clone()
             .map_err(DeviceManagerError::EventFd)?;
         let shutdown_device = Arc::new(Mutex::new(devices::AcpiShutdownDevice::new(
@@ -2121,15 +2117,13 @@ impl DeviceManager {
         {
             let shutdown_pio_address: u16 = 0x600;
             #[cfg(feature = "tdx")]
-            let tdx_enabled = self
-                .config
-                .lock()
-                .unwrap()
-                .platform
-                .as_ref()
-                .is_some_and(|p| p.tdx);
+            let tdx_q35_platform = self.config.lock().unwrap().uses_tdx_q35_platform();
             #[cfg(not(feature = "tdx"))]
-            let tdx_enabled = false;
+            let tdx_q35_platform = false;
+            #[cfg(feature = "tdx")]
+            let tdx_i440fx_platform = self.config.lock().unwrap().uses_tdx_i440fx_platform();
+            #[cfg(not(feature = "tdx"))]
+            let tdx_i440fx_platform = false;
 
             self.address_manager
                 .allocator
@@ -2138,28 +2132,28 @@ impl DeviceManager {
                 .allocate_io_addresses(Some(GuestAddress(shutdown_pio_address.into())), 0x8, None)
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
-            if tdx_enabled {
-                let q35_pm1_evt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Evt::new()));
+            if tdx_q35_platform || tdx_i440fx_platform {
+                let pm1_evt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Evt::new()));
                 self.bus_devices
-                    .push(Arc::clone(&q35_pm1_evt) as Arc<dyn BusDeviceSync>);
-                info!("Adding q35 PM1_EVT io port {shutdown_pio_address:#x}");
+                    .push(Arc::clone(&pm1_evt) as Arc<dyn BusDeviceSync>);
+                info!("Adding PC PM1_EVT io port {shutdown_pio_address:#x}");
                 self.address_manager
                     .io_bus
-                    .insert(q35_pm1_evt, shutdown_pio_address.into(), 0x4)
+                    .insert(pm1_evt, shutdown_pio_address.into(), 0x4)
                     .map_err(DeviceManagerError::BusError)?;
-                let q35_pm1_cnt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Cnt::new(
-                    q35_guest_exit_evt,
+                let pm1_cnt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Cnt::new(
+                    pm1_guest_exit_evt,
                     vcpus_kill_signalled.clone(),
                 )));
                 self.bus_devices
-                    .push(Arc::clone(&q35_pm1_cnt) as Arc<dyn BusDeviceSync>);
+                    .push(Arc::clone(&pm1_cnt) as Arc<dyn BusDeviceSync>);
                 info!(
-                    "Adding q35 PM1_CNT io port {:#x}",
+                    "Adding PC PM1_CNT io port {:#x}",
                     shutdown_pio_address + 0x4
                 );
                 self.address_manager
                     .io_bus
-                    .insert(q35_pm1_cnt, (shutdown_pio_address + 0x4).into(), 0x4)
+                    .insert(pm1_cnt, (shutdown_pio_address + 0x4).into(), 0x4)
                     .map_err(DeviceManagerError::BusError)?;
                 self.acpi_platform_addresses.pm1_evt_address =
                     Some(GenericAddress::io_port_address::<u32>(shutdown_pio_address));
@@ -2167,43 +2161,45 @@ impl DeviceManager {
                     GenericAddress::io_port_address::<u16>(shutdown_pio_address + 0x4),
                 );
 
-                // Ich9Pm fills the rest of the q35 PMBASE block (GPE0,
-                // SMI_*, TCO) starting at PMBASE+0x10. PM1_EVT/CNT and
-                // PM_TMR remain owned by their existing devices.
-                let ich9_pm_base: u16 =
-                    shutdown_pio_address + devices::legacy::ICH9_PM_BLOCK_OFFSET;
-                let ich9_pm_len: u64 = devices::legacy::ICH9_PM_BLOCK_LEN as u64;
-                self.address_manager
-                    .allocator
-                    .lock()
-                    .unwrap()
-                    .allocate_io_addresses(
-                        Some(GuestAddress(ich9_pm_base.into())),
-                        ich9_pm_len,
-                        None,
-                    )
-                    .ok_or(DeviceManagerError::AllocateIoPort)?;
-                let ich9_pm = Arc::new(Mutex::new(devices::legacy::Ich9Pm::new()));
-                self.bus_devices
-                    .push(Arc::clone(&ich9_pm) as Arc<dyn BusDeviceSync>);
-                info!(
-                    "Adding ICH9 PM block io ports {:#x}-{:#x} (GPE0/SMI/TCO)",
-                    ich9_pm_base,
-                    ich9_pm_base as u64 + ich9_pm_len - 1
-                );
-                self.address_manager
-                    .io_bus
-                    .insert(ich9_pm, ich9_pm_base.into(), ich9_pm_len)
-                    .map_err(DeviceManagerError::BusError)?;
+                if tdx_q35_platform {
+                    // Ich9Pm fills the rest of the q35 PMBASE block (GPE0,
+                    // SMI_*, TCO) starting at PMBASE+0x10. PM1_EVT/CNT and
+                    // PM_TMR remain owned by their existing devices.
+                    let ich9_pm_base: u16 =
+                        shutdown_pio_address + devices::legacy::ICH9_PM_BLOCK_OFFSET;
+                    let ich9_pm_len: u64 = devices::legacy::ICH9_PM_BLOCK_LEN as u64;
+                    self.address_manager
+                        .allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_io_addresses(
+                            Some(GuestAddress(ich9_pm_base.into())),
+                            ich9_pm_len,
+                            None,
+                        )
+                        .ok_or(DeviceManagerError::AllocateIoPort)?;
+                    let ich9_pm = Arc::new(Mutex::new(devices::legacy::Ich9Pm::new()));
+                    self.bus_devices
+                        .push(Arc::clone(&ich9_pm) as Arc<dyn BusDeviceSync>);
+                    info!(
+                        "Adding ICH9 PM block io ports {:#x}-{:#x} (GPE0/SMI/TCO)",
+                        ich9_pm_base,
+                        ich9_pm_base as u64 + ich9_pm_len - 1
+                    );
+                    self.address_manager
+                        .io_bus
+                        .insert(ich9_pm, ich9_pm_base.into(), ich9_pm_len)
+                        .map_err(DeviceManagerError::BusError)?;
 
-                // Advertise GPE0 to ACPI: the status block starts at
-                // PMBASE+ICH9_PMIO_GPE0_STS, total len is reported via
-                // GPE0_BLK_LEN (status + enable halves combined).
-                let gpe0_addr = shutdown_pio_address + devices::legacy::ICH9_PMIO_GPE0_STS;
-                self.acpi_platform_addresses.gpe0_blk_address =
-                    Some(GenericAddress::io_port_address::<u32>(gpe0_addr));
-                self.acpi_platform_addresses.gpe0_blk_len =
-                    Some(devices::legacy::ICH9_PMIO_GPE0_BLK_LEN);
+                    // Advertise GPE0 to ACPI: the status block starts at
+                    // PMBASE+ICH9_PMIO_GPE0_STS, total len is reported via
+                    // GPE0_BLK_LEN (status + enable halves combined).
+                    let gpe0_addr = shutdown_pio_address + devices::legacy::ICH9_PMIO_GPE0_STS;
+                    self.acpi_platform_addresses.gpe0_blk_address =
+                        Some(GenericAddress::io_port_address::<u32>(gpe0_addr));
+                    self.acpi_platform_addresses.gpe0_blk_len =
+                        Some(devices::legacy::ICH9_PMIO_GPE0_BLK_LEN);
+                }
             } else {
                 self.address_manager
                     .io_bus
@@ -2364,7 +2360,7 @@ impl DeviceManager {
         let apm = Arc::new(Mutex::new(devices::legacy::ApmStub::new()));
         self.bus_devices
             .push(Arc::clone(&apm) as Arc<dyn BusDeviceSync>);
-        info!("Adding q35 APM io ports 0xb2-0xb3");
+        info!("Adding PC APM/SMI_CMD io ports 0xb2-0xb3");
         self.address_manager
             .io_bus
             .insert(apm, 0xb2, 0x2)
@@ -3538,7 +3534,7 @@ impl DeviceManager {
         // Add virtio-rng if required
         let config = self.config.lock().unwrap();
         #[cfg(all(feature = "tdx", feature = "fw_cfg", target_arch = "x86_64"))]
-        if config.platform.as_ref().is_some_and(|p| p.tdx)
+        if config.is_tdx_enabled()
             && config
                 .payload
                 .as_ref()
@@ -4409,10 +4405,9 @@ impl DeviceManager {
             } else {
                 #[cfg(feature = "tdx")]
                 {
-                    let listener: Arc<dyn RamDiscardListener> =
-                        Arc::new(VfioRamDiscardListener {
-                            vfio_ops: Arc::clone(&vfio_ops),
-                        });
+                    let listener: Arc<dyn RamDiscardListener> = Arc::new(VfioRamDiscardListener {
+                        vfio_ops: Arc::clone(&vfio_ops),
+                    });
                     self.memory_manager
                         .lock()
                         .unwrap()
@@ -6304,15 +6299,6 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_page_aligned_range() {
-        assert_eq!(None, page_aligned_range(0x1000, 0));
-        assert_eq!(Some((0x1000, 0x1000)), page_aligned_range(0x1000, 1));
-        assert_eq!(Some((0x1000, 0x2000)), page_aligned_range(0x1800, 0x1000));
-        assert_eq!(None, page_aligned_range(u64::MAX - 0x800, 0x1000));
-    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

@@ -123,16 +123,16 @@ Flag-by-flag:
   carved out of this.
 - `--cpus boot=1,max=1` — TDX does not currently support vCPU hotplug,
   so `boot == max`.
-- `--platform num_pci_segments=1,tdx=on` — q35 with a single PCI
-  segment. The legacy `--platform tdx=on` flag is preserved for
-  backwards compatibility and is equivalent to declaring `--tdx` with
-  no firmware (the firmware then must be supplied via `--firmware`).
+- `--platform num_pci_segments=1,tdx=on` — legacy q35-compatible TDX
+  platform with a single PCI segment. Omit this option to use the
+  non-q35/i440fx-compatible TDX PC platform.
 - `--fw-cfg-config ''` — enables the fw_cfg IO port with no extra
   user-supplied entries (required for SMBIOS / ACPI delivery to TDVF).
 - `--serial tty --console off` — route the guest's `ttyS0` to the
   controlling terminal and disable the virtio-console device.
 
-The two CLI styles are equivalent:
+The preferred style declares the TD object and keeps the non-q35/i440fx
+platform:
 
 ```bash
 # Preferred (this fork)
