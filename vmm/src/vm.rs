@@ -1251,6 +1251,16 @@ impl Vm {
     }
 
     #[cfg(feature = "fw_cfg")]
+    fn payload_uses_fw_cfg(payload: &PayloadConfig) -> bool {
+        payload.fw_cfg_config.is_some()
+    }
+
+    #[cfg(not(feature = "fw_cfg"))]
+    fn payload_uses_fw_cfg(_payload: &PayloadConfig) -> bool {
+        false
+    }
+
+    #[cfg(feature = "fw_cfg")]
     fn populate_fw_cfg(
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
@@ -1843,7 +1853,7 @@ impl Vm {
         }
         match (&payload.firmware, &payload.kernel) {
             (Some(firmware), None) | (Some(firmware), Some(_))
-                if payload.fw_cfg_config.is_some() =>
+                if Self::payload_uses_fw_cfg(payload) =>
             {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_kernel(firmware, None, memory_manager)
@@ -1867,7 +1877,7 @@ impl Vm {
     ) -> Result<EntryPoint> {
         match (&payload.firmware, &payload.kernel) {
             (Some(firmware), None) | (Some(firmware), Some(_))
-                if payload.fw_cfg_config.is_some() =>
+                if Self::payload_uses_fw_cfg(payload) =>
             {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_firmware(&firmware, memory_manager)
