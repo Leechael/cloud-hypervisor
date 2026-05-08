@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::{cmp, io, result, thread};
+use std::{cmp, env, io, result, thread};
 
 use acpi_tables::sdt::Sdt;
 use acpi_tables::{Aml, aml};
@@ -94,6 +94,19 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vm::physical_bits;
 use crate::vm_config::{CoreScheduling, CpusConfig};
 use crate::{CPU_MANAGER_SNAPSHOT_ID, GuestMemoryMmap};
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_HDR_SIZE: u64 = 24;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_MAX_BUF_LEN: u64 = 128 * 1024;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_GET_QUOTE_STRUCTURE_VERSION: u64 = 1;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_SUCCESS: u64 = 0;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_ERROR: u64 = 0x8000_0000_0000_0000;
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+const TDX_VP_GET_QUOTE_QGS_UNAVAILABLE: u64 = 0x8000_0000_0000_0001;
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -325,6 +338,20 @@ struct LocalX2Apic {
     pub processor_id: u32,
 }
 
+/// Local x2APIC NMI structure. See ACPI spec section 5.2.12.13.
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct LocalX2ApicNmi {
+    pub r#type: u8,
+    pub length: u8,
+    pub flags: u16,
+    pub processor_uid: u32,
+    pub local_x2apic_lint: u8,
+    pub _reserved: [u8; 3],
+}
+
 #[allow(dead_code)]
 #[repr(C, packed)]
 #[derive(Default, IntoBytes, Immutable, FromBytes)]
@@ -549,6 +576,7 @@ impl Vcpu {
         #[cfg(target_arch = "x86_64")] kvm_hyperv: bool,
         #[cfg(target_arch = "x86_64")] topology: (u16, u16, u16, u16),
         #[cfg(target_arch = "x86_64")] nested: bool,
+        #[cfg(feature = "tdx")] tdx_enabled: bool,
         #[cfg(feature = "igvm")] igvm_enabled: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
@@ -584,6 +612,8 @@ impl Vcpu {
                 self.vendor,
                 topology,
                 nested,
+                #[cfg(feature = "tdx")]
+                tdx_enabled,
                 setup_registers,
             )
             .map_err(Error::VcpuConfiguration)?;
@@ -638,6 +668,24 @@ impl Vcpu {
     /// anything useful.
     pub fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         self.vcpu.run()
+    }
+
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> Result<()> {
+        use hypervisor::kvm::KvmVcpu;
+        let kvm_vcpu = self
+            .vcpu
+            .as_any()
+            .downcast_ref::<KvmVcpu>()
+            .ok_or_else(|| Error::VcpuCreate(anyhow::anyhow!("not a KvmVcpu")))?;
+        kvm_vcpu
+            .convert_guest_memory_region(address, size, private)
+            .map_err(|e| Error::VcpuRun(e.into()))
     }
 
     #[cfg(feature = "sev_snp")]
@@ -719,6 +767,8 @@ pub struct CpuManager {
     affinity: BTreeMap<u32, Vec<usize>>,
     dynamic: bool,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    #[cfg(feature = "tdx")]
+    tdx_enabled: bool,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
     // State of the core scheduling group leader election (VM mode).
@@ -839,6 +889,214 @@ impl VcpuState {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_get_quote_qgs_port() -> u32 {
+    env::var("CH_TDX_QGS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(4050)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_read_le_u64(buf: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_read_le_u32(buf: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_write_le_u64(buf: &mut [u8], offset: usize, value: u64) {
+    buf[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn tdx_write_le_u32(buf: &mut [u8], offset: usize, value: u32) {
+    buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx", target_os = "linux"))]
+fn tdx_qgs_vsock_request(port: u32, request: &[u8], max_response: usize) -> io::Result<Vec<u8>> {
+    // QEMU's tdx-guest object connects to the host QGS over AF_VSOCK cid 2.
+    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let addr = libc::sockaddr_vm {
+            svm_family: libc::AF_VSOCK as libc::sa_family_t,
+            svm_reserved1: 0,
+            svm_port: port,
+            svm_cid: libc::VMADDR_CID_HOST,
+            svm_zero: [0; 4],
+        };
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut sent = 0;
+        while sent < request.len() {
+            let ret = unsafe {
+                libc::send(
+                    fd,
+                    request[sent..].as_ptr() as *const libc::c_void,
+                    request.len() - sent,
+                    0,
+                )
+            };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "zero-length write to QGS",
+                ));
+            }
+            sent += ret as usize;
+        }
+
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_WR);
+        }
+
+        let mut response = Vec::new();
+        let mut scratch = [0u8; 4096];
+        while response.len() < max_response {
+            let limit = cmp::min(scratch.len(), max_response - response.len());
+            let ret =
+                unsafe { libc::recv(fd, scratch.as_mut_ptr() as *mut libc::c_void, limit, 0) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ret == 0 {
+                break;
+            }
+            response.extend_from_slice(&scratch[..ret as usize]);
+        }
+
+        Ok(response)
+    })();
+
+    unsafe {
+        libc::close(fd);
+    }
+
+    result
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx", not(target_os = "linux")))]
+fn tdx_qgs_vsock_request(_port: u32, _request: &[u8], _max_response: usize) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TDX QGS vsock is only supported on Linux",
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+fn handle_tdx_get_quote(
+    vm_ops: &Arc<dyn VmOps>,
+    shared_gpa_mask: u64,
+    raw_gpa: u64,
+    buf_len: u64,
+) -> TdxExitStatus {
+    if buf_len == 0 || raw_gpa & shared_gpa_mask == 0 {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let gpa = raw_gpa & !shared_gpa_mask;
+    if gpa & 0xfff != 0 || buf_len & 0xfff != 0 {
+        return TdxExitStatus::AlignError;
+    }
+    if buf_len > TDX_GET_QUOTE_MAX_BUF_LEN || buf_len < TDX_GET_QUOTE_HDR_SIZE {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let mut header = [0u8; TDX_GET_QUOTE_HDR_SIZE as usize];
+    if let Err(e) = vm_ops.guest_mem_read(gpa, &mut header) {
+        warn!("TDX GET_QUOTE failed to read header: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let structure_version = tdx_read_le_u64(&header, 0);
+    let error_code = tdx_read_le_u64(&header, 8);
+    let in_len = tdx_read_le_u32(&header, 16) as u64;
+    let out_len = tdx_read_le_u32(&header, 20);
+
+    if structure_version != TDX_GET_QUOTE_STRUCTURE_VERSION
+        || error_code != TDX_VP_GET_QUOTE_SUCCESS
+        || out_len != 0
+        || in_len > buf_len - TDX_GET_QUOTE_HDR_SIZE
+    {
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let payload_gpa = gpa + TDX_GET_QUOTE_HDR_SIZE;
+    let mut request = vec![0u8; in_len as usize];
+    if let Err(e) = vm_ops.guest_mem_read(payload_gpa, &mut request) {
+        warn!("TDX GET_QUOTE failed to read request payload: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    let max_response = (buf_len - TDX_GET_QUOTE_HDR_SIZE) as usize;
+    let qgs_port = tdx_get_quote_qgs_port();
+    let response = match tdx_qgs_vsock_request(qgs_port, &request, max_response) {
+        Ok(response) => response,
+        Err(e) => {
+            warn!("TDX GET_QUOTE QGS request failed on port {qgs_port}: {e}");
+            tdx_write_le_u64(&mut header, 8, TDX_VP_GET_QUOTE_QGS_UNAVAILABLE);
+            if let Err(e) = vm_ops.guest_mem_write(gpa, &header) {
+                warn!("TDX GET_QUOTE failed to publish QGS unavailable header: {e}");
+                return TdxExitStatus::InvalidOperand;
+            }
+            return TdxExitStatus::Success;
+        }
+    };
+
+    let status = if response.len() <= max_response {
+        if let Err(e) = vm_ops.guest_mem_write(payload_gpa, &response) {
+            warn!("TDX GET_QUOTE failed to write response payload: {e}");
+            TDX_VP_GET_QUOTE_ERROR
+        } else {
+            tdx_write_le_u32(&mut header, 20, response.len() as u32);
+            TDX_VP_GET_QUOTE_SUCCESS
+        }
+    } else {
+        TDX_VP_GET_QUOTE_ERROR
+    };
+
+    tdx_write_le_u64(&mut header, 8, status);
+    if let Err(e) = vm_ops.guest_mem_write(gpa, &header) {
+        warn!("TDX GET_QUOTE failed to publish completion header: {e}");
+        return TdxExitStatus::InvalidOperand;
+    }
+
+    info!(
+        "TDX GET_QUOTE completed through QGS port {qgs_port}: request={} response={}",
+        request.len(),
+        response.len()
+    );
+    TdxExitStatus::Success
+}
+
 impl CpuManager {
     #[allow(unused_variables)]
     #[allow(clippy::too_many_arguments)]
@@ -872,10 +1130,42 @@ impl CpuManager {
         let cpu_vendor = hypervisor.get_cpu_vendor();
 
         #[cfg(target_arch = "x86_64")]
-        if config.features.amx {
-            hypervisor
-                .enable_amx_state_components()
-                .map_err(|e| Error::AmxEnable(e.into()))?;
+        {
+            let amx_explicit = config.features.amx;
+            let amx_implicit_for_tdx = {
+                #[cfg(feature = "tdx")]
+                {
+                    tdx_enabled && !amx_explicit
+                }
+                #[cfg(not(feature = "tdx"))]
+                {
+                    false
+                }
+            };
+            if amx_explicit || amx_implicit_for_tdx {
+                match hypervisor.enable_amx_state_components() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Fail-loud only when the user explicitly opted into
+                        // AMX. The TDX path implicitly requests AMX even on
+                        // CPUs that do not expose it (e.g. Sierra Forest /
+                        // Crestmont E-core SKUs); on such hosts the TDX
+                        // module will not advertise AMX in guest CPUID, so
+                        // the AMX request is harmless to skip — fall back
+                        // gracefully rather than refusing to boot the VM.
+                        if amx_explicit {
+                            return Err(Error::AmxEnable(e.into()));
+                        }
+                        warn!(
+                            "TDX implicit AMX enable failed; host CPU likely \
+                             does not advertise AMX (e.g. Sierra Forest \
+                             E-core). Continuing without guest AMX — TDX \
+                             module will not expose AMX in guest CPUID. \
+                             err={e:#}"
+                        );
+                    }
+                }
+            }
         }
 
         let proximity_domain_per_cpu: BTreeMap<u32, u32> = {
@@ -926,6 +1216,8 @@ impl CpuManager {
             affinity,
             dynamic,
             hypervisor,
+            #[cfg(feature = "tdx")]
+            tdx_enabled,
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
             core_scheduling_group_leader: Arc::new(AtomicI32::new(
@@ -943,7 +1235,18 @@ impl CpuManager {
         #[cfg(feature = "tdx")] tdx: bool,
     ) -> Result<()> {
         self.cpuid = {
-            let phys_bits = physical_bits(hypervisor, self.config.max_phys_bits);
+            let phys_bits = {
+                #[cfg(feature = "tdx")]
+                if tdx {
+                    arch::get_host_cpu_phys_bits(hypervisor)
+                } else {
+                    physical_bits(hypervisor, self.config.max_phys_bits)
+                }
+                #[cfg(not(feature = "tdx"))]
+                {
+                    physical_bits(hypervisor, self.config.max_phys_bits)
+                }
+            };
             arch::generate_common_cpuid(
                 hypervisor,
                 &arch::CpuidConfig {
@@ -958,6 +1261,47 @@ impl CpuManager {
         };
 
         Ok(())
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+    fn tdx_shared_gpa_mask(&self) -> u64 {
+        // On legacy TDX uapi hosts, the guest physical-address width KVM
+        // commits is constrained by `caps.supported_gpaw`: bit 1 set means
+        // 5-level (52-bit GPA, shared bit = 51); otherwise 4-level (48-bit
+        // GPA, shared bit = 47). Sierra Forest E-core SKUs report
+        // `supported_gpaw = 0x1` even though host CPUID 0x80000008 advertises
+        // 52 phys bits — so reading host CPUID directly here gives the wrong
+        // shared bit, causing TDG.VP.VMCALL<MapGPA> from the guest to be
+        // misclassified as private.
+        const TDX_CAP_GPAW_52: u32 = 1 << 1;
+        if let Ok(Some(gpaw)) = self.hypervisor.tdx_legacy_caps_supported_gpaw() {
+            return if (gpaw & TDX_CAP_GPAW_52) != 0 {
+                1u64 << 51
+            } else {
+                1u64 << 47
+            };
+        }
+
+        let guest_phys_bits = self
+            .cpuid
+            .iter()
+            .find(|entry| entry.function == 0x8000_0008 && entry.index == 0)
+            .map(|entry| {
+                let guest_phys_bits = ((entry.eax >> 16) & 0xff) as u8;
+                if guest_phys_bits == 0 {
+                    (entry.eax & 0xff) as u8
+                } else {
+                    guest_phys_bits
+                }
+            })
+            .filter(|bits| *bits != 0)
+            .unwrap_or_else(|| arch::get_host_cpu_phys_bits(self.hypervisor.as_ref()));
+
+        if guest_phys_bits > 48 {
+            1u64 << 51
+        } else {
+            1u64 << 47
+        }
     }
 
     fn create_vcpu(
@@ -1055,6 +1399,8 @@ impl CpuManager {
             self.config.kvm_hyperv,
             topology,
             self.config.nested,
+            #[cfg(feature = "tdx")]
+            self.tdx_enabled,
             #[cfg(feature = "igvm")]
             self.igvm_enabled,
         )?;
@@ -1100,6 +1446,21 @@ impl CpuManager {
         Ok(vcpus)
     }
 
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    pub fn convert_guest_memory_region(
+        &self,
+        address: u64,
+        size: u64,
+        private: bool,
+    ) -> Result<()> {
+        if let Some(vcpu) = self.vcpus.first() {
+            let vcpu = vcpu.lock().unwrap();
+            vcpu.convert_guest_memory_region(address, size, private)
+        } else {
+            Err(Error::DesiredVCpuCountIsZero)
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub fn init_pmu(&self, irq: u32) -> Result<bool> {
         for cpu in self.vcpus.iter() {
@@ -1136,10 +1497,21 @@ impl CpuManager {
         let hypervisor_type = self.hypervisor.hypervisor_type();
         #[cfg(feature = "guest_debug")]
         let vm_debug_evt = self.vm_debug_evt.try_clone().unwrap();
+        #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+        let tdx_shared_gpa_mask = if self.tdx_enabled {
+            self.tdx_shared_gpa_mask()
+        } else {
+            1u64 << u32::from(physical_bits(
+                self.hypervisor.as_ref(),
+                self.config.max_phys_bits,
+            ))
+        };
         let panic_exit_evt = self.exit_evt.try_clone().unwrap();
         let vcpus_kill_signalled = self.vcpus_kill_signalled.clone();
         let vcpus_pause_signalled = self.vcpus_pause_signalled.clone();
         let vcpus_kick_signalled = self.vcpus_kick_signalled.clone();
+        #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+        let vm_ops = self.vm_ops.clone();
 
         let mut vcpu_states = self.vcpu_states.lock().unwrap();
 
@@ -1282,7 +1654,7 @@ impl CpuManager {
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
 
-                    std::panic::catch_unwind(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1394,15 +1766,52 @@ impl CpuManager {
                                     #[cfg(feature = "tdx")]
                                     VmExit::Tdx => {
                                             match vcpu.vcpu.get_tdx_exit_details() {
-                                                Ok(details) => match details {
-                                                    TdxExitDetails::GetQuote => warn!("TDG_VP_VMCALL_GET_QUOTE not supported"),
-                                                    TdxExitDetails::SetupEventNotifyInterrupt => {
-                                                        warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
+                                                Ok(details) => {
+                                                    let detail_str = match details {
+                                                        TdxExitDetails::MapGpa => "MapGpa",
+                                                        TdxExitDetails::GetQuote { .. } => "GetQuote",
+                                                        TdxExitDetails::SetupEventNotifyInterrupt { .. } => "SetupEventNotifyInterrupt",
+                                                    };
+                                                    log::debug!("KVM_EXIT_TDX details={detail_str}");
+                                                    match details {
+                                                    TdxExitDetails::MapGpa => {
+                                                        match vcpu.vcpu.handle_tdx_map_gpa(tdx_shared_gpa_mask) {
+                                                            Ok(status) => {
+                                                                log::debug!("TDG_VP_VMCALL_MAP_GPA handled");
+                                                                vcpu.vcpu.set_tdx_status(status);
+                                                                continue;
+                                                            }
+                                                            Err(e) => {
+                                                                error!("TDG_VP_VMCALL_MAP_GPA failed: {e}");
+                                                                vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                                                exit_evt.write(1).unwrap();
+                                                                break;
+                                                            }
+                                                        }
                                                     }
-                                                },
-                                                Err(e) => error!("Unexpected TDX VMCALL: {e}"),
+                                                    TdxExitDetails::GetQuote { gpa, size } => {
+                                                        let status = handle_tdx_get_quote(
+                                                            &vm_ops,
+                                                            tdx_shared_gpa_mask,
+                                                            gpa,
+                                                            size,
+                                                        );
+                                                        vcpu.vcpu.set_tdx_status(status);
+                                                    }
+                                                    TdxExitDetails::SetupEventNotifyInterrupt { vector } => {
+                                                        let status = if (32..=255).contains(&vector) {
+                                                            TdxExitStatus::Success
+                                                        } else {
+                                                            TdxExitStatus::InvalidOperand
+                                                        };
+                                                        vcpu.vcpu.set_tdx_status(status);
+                                                    }
+                                                }},
+                                                Err(e) => {
+                                                    error!("Unexpected TDX VMCALL: {e}");
+                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                }
                                             }
-                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                     }
                                 },
 
@@ -1422,7 +1831,7 @@ impl CpuManager {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .or_else(|_| {
                         panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
                         error!("vCPU thread panicked");
@@ -1623,13 +2032,32 @@ impl CpuManager {
     #[cfg(feature = "tdx")]
     pub fn initialize_tdx(&self, hob_address: u64) -> Result<()> {
         for vcpu in &self.vcpus {
-            vcpu.lock()
-                .unwrap()
-                .vcpu
+            let vcpu = vcpu.lock().unwrap();
+            vcpu.vcpu
                 .tdx_init(hob_address)
                 .map_err(Error::InitializeTdx)?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    pub unsafe fn tdx_init_memory_region(
+        &self,
+        host_address: *mut u8,
+        guest_address: u64,
+        size: usize,
+        measure: bool,
+    ) -> Result<()> {
+        unsafe {
+            self.vcpus
+                .first()
+                .expect("TDX memory initialization requires at least one vCPU")
+                .lock()
+                .unwrap()
+                .vcpu
+                .tdx_init_memory_region(host_address, guest_address, size, measure)
+        }
+        .map_err(Error::InitializeTdx)
     }
 
     pub fn boot_vcpus(&self) -> u32 {
@@ -1644,6 +2072,38 @@ impl CpuManager {
     pub fn common_cpuid(&self) -> Vec<CpuIdEntry> {
         assert!(!self.cpuid.is_empty());
         self.cpuid.clone()
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
+    pub fn tdx_init_cpuid(&self) -> Vec<CpuIdEntry> {
+        assert!(!self.cpuid.is_empty());
+
+        let topology = self.config.topology.clone().map_or_else(
+            || {
+                (
+                    1_u16,
+                    u16::try_from(self.boot_vcpus()).unwrap(),
+                    1_u16,
+                    1_u16,
+                )
+            },
+            |t| {
+                (
+                    t.threads_per_core,
+                    t.cores_per_die,
+                    t.dies_per_package,
+                    t.packages,
+                )
+            },
+        );
+
+        arch::x86_64::configure_vcpu_cpuid(
+            self.cpuid.clone(),
+            0,
+            self.hypervisor.get_cpu_vendor(),
+            topology,
+            self.config.nested,
+        )
     }
 
     /// Locks the vCPU states and calls [`Self::active_vcpus`].
@@ -1724,14 +2184,39 @@ impl CpuManager {
                 ..Default::default()
             });
 
+            // PIT IRQ0 is routed to IOAPIC GSI 2 on q35. flags=0 (active high,
+            // edge trigger) matches QEMU's standard MADT for PC platforms.
             madt.append(InterruptSourceOverride {
                 r#type: acpi::ACPI_APIC_XRUPT_OVERRIDE,
                 length: 10,
                 bus: 0,
-                source: 4,
-                gsi: 4,
+                source: 0,
+                gsi: 2,
                 flags: 0,
             });
+
+            // ACPI SCI on IRQ9: active high, level triggered. Polarity=01
+            // (active high), Trigger=11 (level) -> flags = 0xd.
+            madt.append(InterruptSourceOverride {
+                r#type: acpi::ACPI_APIC_XRUPT_OVERRIDE,
+                length: 10,
+                bus: 0,
+                source: 9,
+                gsi: 9,
+                flags: 0xd,
+            });
+
+            // One Local x2APIC NMI structure per vCPU wiring NMI to LINT1.
+            for cpu in 0..self.config.max_vcpus {
+                madt.append(LocalX2ApicNmi {
+                    r#type: acpi::ACPI_X2APIC_LOCAL_NMI,
+                    length: 12,
+                    flags: 0,
+                    processor_uid: cpu,
+                    local_x2apic_lint: 1,
+                    _reserved: [0; 3],
+                });
+            }
         }
 
         #[cfg(target_arch = "aarch64")]

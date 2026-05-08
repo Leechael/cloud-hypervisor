@@ -10,6 +10,8 @@
 //
 //
 
+use std::any::Any;
+
 use thiserror::Error;
 #[cfg(not(target_arch = "riscv64"))]
 use {anyhow::anyhow, vm_memory::GuestAddress};
@@ -360,6 +362,10 @@ pub type Result<T> = anyhow::Result<T, HypervisorCpuError>;
 ///
 pub trait Vcpu: Send + Sync {
     ///
+    /// Downcast to the underlying hypervisor-specific vCPU type.
+    ///
+    fn as_any(&self) -> &dyn Any;
+    ///
     /// Returns StandardRegisters with default value set
     ///
     fn create_standard_regs(&self) -> StandardRegisters {
@@ -536,6 +542,21 @@ pub trait Vcpu: Send + Sync {
     fn tdx_init(&self, _hob_address: u64) -> Result<()> {
         unimplemented!()
     }
+    #[cfg(feature = "tdx")]
+    /// Initialize a TDX memory region using the vCPU TDX ioctl path
+    ///
+    /// # Safety
+    ///
+    /// `_host_address` must be valid for `_size` bytes
+    unsafe fn tdx_init_memory_region(
+        &self,
+        _host_address: *mut u8,
+        _guest_address: u64,
+        _size: usize,
+        _measure: bool,
+    ) -> Result<()> {
+        unimplemented!()
+    }
     ///
     /// Set the "immediate_exit" state
     ///
@@ -545,6 +566,13 @@ pub trait Vcpu: Send + Sync {
     /// Returns the details about TDX exit reason
     ///
     fn get_tdx_exit_details(&mut self) -> Result<TdxExitDetails> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    ///
+    /// Handle a TDX MAP_GPA request using the hypervisor-specific memory conversion path.
+    ///
+    fn handle_tdx_map_gpa(&mut self, _shared_gpa_mask: u64) -> Result<TdxExitStatus> {
         unimplemented!()
     }
     #[cfg(feature = "tdx")]

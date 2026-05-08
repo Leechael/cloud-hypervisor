@@ -146,6 +146,16 @@ pub trait Hypervisor: Send + Sync {
     fn tdx_capabilities(&self) -> Result<TdxCapabilities> {
         unimplemented!()
     }
+    /// Retrieve `supported_gpaw` from the legacy TDX capabilities struct
+    /// (`TDX_CAP_GPAW_48 = bit 0`, `TDX_CAP_GPAW_52 = bit 1`). Used by the
+    /// vmm to choose the right shared-bit when the host runs a legacy KVM
+    /// TDX uapi (e.g. Sierra Forest where `supported_gpaw = 0x1`, so guest
+    /// physical addresses are 48-bit and the shared bit is bit 47, not 51).
+    /// Returns `None` if not running on a legacy TDX host.
+    #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+    fn tdx_legacy_caps_supported_gpaw(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
     ///
     /// Get the number of supported hardware breakpoints
     ///

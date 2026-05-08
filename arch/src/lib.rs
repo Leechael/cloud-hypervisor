@@ -53,6 +53,72 @@ pub enum Error {
 /// Type for returning public functions outcome.
 pub type Result<T> = result::Result<T, Error>;
 
+/// Vendor / device IDs and chipset register offsets for the emulated
+/// Q35 + ICH9 platform.
+///
+/// These values are properties of the *machine model* CH presents to
+/// the guest, not of the PCI bus implementation, so they live in the
+/// `arch` crate alongside other layout constants. Keeping them in one
+/// place lets ACPI/SMBIOS code in the `vmm` crate and the PCI host
+/// bridge in the `pci` crate share a single source of truth and stay
+/// byte-compatible with QEMU's q35 machine type.
+///
+/// Exposed unconditionally (not gated on x86_64) because the emulated
+/// PCI host bridge in `pci/src/bus.rs` is also unconditional and these
+/// constants must be importable from there on every supported target.
+pub mod q35_pci_ids {
+    /// Intel vendor ID, used for the host bridge, ICH9 LPC, AHCI, SMBus,
+    /// and CH's virt PCIe host stub.
+    pub const VENDOR_ID_INTEL: u16 = 0x8086;
+    /// CH's synthetic "virtual PCIe host" device ID. Not a real Intel
+    /// part — predates the q35 work but uses an Intel vendor range.
+    pub const DEVICE_ID_INTEL_VIRT_PCIE_HOST: u16 = 0x0d57;
+    /// Intel 82441FX PMC host bridge used by QEMU's i440fx PC machine.
+    /// TDVF/OVMF recognises this as a conventional non-q35 PC root bridge.
+    pub const DEVICE_ID_INTEL_I440FX_HOST_BRIDGE: u16 = 0x1237;
+    /// Intel P35/X38 host bridge (DRAM controller). QEMU's q35 machine
+    /// uses this ID for the root complex; matching it lets stock OVMF
+    /// and Linux apply the correct chipset quirks.
+    pub const DEVICE_ID_INTEL_P35_MCH: u16 = 0x29c0;
+    /// ICH9 LPC interface bridge — the PCI/ISA bridge on q35.
+    pub const DEVICE_ID_INTEL_ICH9_LPC: u16 = 0x2918;
+    /// ICH9 SATA AHCI controller. Reused as a multifunction shell on
+    /// q35 even when no AHCI is exposed to the guest.
+    pub const DEVICE_ID_INTEL_ICH9_AHCI: u16 = 0x2922;
+    /// ICH9 SMBus controller. Required for OVMF's SMBus probe sequence.
+    pub const DEVICE_ID_INTEL_ICH9_SMBUS: u16 = 0x2930;
+
+    // Q35 host-bridge PCIEXBAR window and writable bit masks (defined
+    // by the P35/X38 datasheet, mirrored by QEMU q35).
+    pub const Q35_PCIEXBAR_REG: usize = 0x60 / 4;
+    pub const Q35_PCIEXBAR_DEFAULT: u32 = 0xb000_0000;
+    pub const Q35_PCIEXBAR_LOW_WRITABLE_BITS: u32 = 0xf000_0007;
+    pub const Q35_PCIEXBAR_HIGH_WRITABLE_BITS: u32 = 0x0000_000f;
+
+    // Standard PCI configuration space register indices used by the
+    // emulated host bridge / LPC functions.
+    pub const PCI_COMMAND_STATUS_REG: usize = 0x04 / 4;
+    pub const PCI_HEADER_TYPE_REG: usize = 0x0c / 4;
+    pub const PCI_BAR4_REG: usize = 0x20 / 4;
+    pub const PCI_CAPABILITY_LIST_REG: usize = 0x34 / 4;
+    pub const PCI_INTERRUPT_REG: usize = 0x3c / 4;
+    pub const PCI_HEADER_TYPE_MULTIFUNCTION: u32 = 0x0080_0000;
+    pub const PCI_STATUS_CAPABILITIES: u32 = 0x0010_0000;
+
+    // ICH9 LPC chipset registers (PMBASE, ACPI control, PIRQ routing,
+    // I/O decode, RCBA) used by the ACPI subsystem.
+    pub const ICH9_LPC_PMBASE_REG: usize = 0x40 / 4;
+    pub const ICH9_LPC_ACPI_CTRL_REG: usize = 0x44 / 4;
+    pub const ICH9_LPC_PIRQA_ROUT_REG: usize = 0x60 / 4;
+    pub const ICH9_LPC_PIRQE_ROUT_REG: usize = 0x68 / 4;
+    pub const ICH9_LPC_IO_DEC_REG: usize = 0x80 / 4;
+    pub const ICH9_LPC_RCBA_REG: usize = 0xf0 / 4;
+
+    // ICH9 AHCI capability register indices.
+    pub const ICH9_AHCI_MSI_CAP_REG: usize = 0x80 / 4;
+    pub const ICH9_AHCI_SATA_CAP_REG: usize = 0xa8 / 4;
+}
+
 /// Type for memory region types.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum RegionType {
@@ -102,6 +168,7 @@ pub use x86_64::{
     _NSIG, CpuidConfig, CpuidFeatureEntry, EntryPoint, arch_memory_regions, configure_system,
     configure_vcpu, generate_common_cpuid, generate_ram_ranges, get_host_cpu_phys_bits,
     initramfs_load_addr, layout, layout::CMDLINE_MAX_SIZE, layout::CMDLINE_START, regs,
+    tdx_q35_arch_memory_regions,
 };
 
 /// Safe wrapper for `sysconf(_SC_PAGESIZE)`.

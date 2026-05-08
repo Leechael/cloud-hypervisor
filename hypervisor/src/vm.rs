@@ -51,6 +51,46 @@ impl From<DataMatch> for u64 {
     }
 }
 
+/// TDX-specific knobs forwarded from `vmm::vm_config::TdxConfig` into the
+/// hypervisor backend.
+///
+/// Mirrors QEMU's `-object tdx-guest,...` surface but kept hypervisor-side so
+/// the `vmm` crate doesn't leak into trait signatures here. Defaults match
+/// pre-P1.2 hard-coded behaviour: SEPT_VE_DISABLE on, debug/perfmon off,
+/// `mr*` zeroed, `xfam` derived from CPUID 0xd.
+#[cfg(feature = "tdx")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TdxAttributes {
+    /// `bit 28` (`SEPT_VE_DISABLE`).
+    pub sept_ve_disable: bool,
+    /// `bit 0` (`DEBUG`).
+    pub debug: bool,
+    /// `bit 63` (`PERFMON`).
+    pub perfmon: bool,
+    /// 48-byte measurement seeds passed verbatim to `KVM_TDX_INIT_VM`.
+    pub mrconfigid: [u8; 48],
+    pub mrowner: [u8; 48],
+    pub mrownerconfig: [u8; 48],
+    /// Explicit XFAM override; `None` means derive from CPUID 0xd masked by
+    /// `caps.supported_xfam`.
+    pub xfam: Option<u64>,
+}
+
+#[cfg(feature = "tdx")]
+impl Default for TdxAttributes {
+    fn default() -> Self {
+        Self {
+            sept_ve_disable: true,
+            debug: false,
+            perfmon: false,
+            mrconfigid: [0u8; 48],
+            mrowner: [0u8; 48],
+            mrownerconfig: [0u8; 48],
+            xfam: None,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 ///
 /// Enum for VM error
@@ -116,6 +156,12 @@ pub enum HypervisorVmError {
     #[error("Failed to set GSI routing")]
     CreateDevice(#[source] anyhow::Error),
     ///
+    /// Failed to set / clear a VFIO file fd on a KVM_DEV_TYPE_VFIO device
+    /// (KVM_DEV_VFIO_FILE_ADD / KVM_DEV_VFIO_FILE_DEL).
+    ///
+    #[error("Failed to attach/detach VFIO file fd to KVM VFIO device")]
+    SetVfioDeviceFd(#[source] anyhow::Error),
+    ///
     /// Get preferred target error
     ///
     #[error("Failed to get preferred target")]
@@ -125,6 +171,11 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to enable split Irq")]
     EnableSplitIrq(#[source] anyhow::Error),
+    ///
+    /// Create in-kernel PIT error
+    ///
+    #[error("Failed to create in-kernel PIT")]
+    CreatePit(#[source] anyhow::Error),
     ///
     /// Enable x2apic API error
     ///
@@ -213,6 +264,12 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to finalize TDX")]
     FinalizeTdx(#[source] std::io::Error),
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    ///
+    /// Error setting memory attributes
+    ///
+    #[error("Failed to set memory attributes")]
+    SetMemoryAttributes(#[source] std::io::Error),
     #[cfg(feature = "tdx")]
     ///
     /// Error initializing the TDX memory region
@@ -378,6 +435,11 @@ pub trait Vm: Send + Sync + Any {
     /// Enable split Irq capability
     #[cfg(target_arch = "x86_64")]
     fn enable_split_irq(&self) -> Result<()>;
+    /// Create in-kernel PIT
+    #[cfg(target_arch = "x86_64")]
+    fn create_pit2(&self) -> Result<()> {
+        Ok(())
+    }
     /// Retrieve guest clock.
     #[cfg(target_arch = "x86_64")]
     fn get_clock(&self) -> Result<ClockData>;
@@ -397,8 +459,18 @@ pub trait Vm: Send + Sync + Any {
     fn sev_snp_init(&self, guest_policy: SnpPolicy) -> Result<()>;
     #[cfg(feature = "tdx")]
     /// Initialize TDX on this VM
-    fn tdx_init(&self, _cpuid: &[CpuIdEntry], _max_vcpus: u32) -> Result<()> {
+    fn tdx_init(
+        &self,
+        _cpuid: &[CpuIdEntry],
+        _max_vcpus: u32,
+        _attrs: &TdxAttributes,
+    ) -> Result<()> {
         unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    /// Whether TDX INIT_VM must use the boot vCPU CPUID instead of common CPUID.
+    fn tdx_init_uses_boot_vcpu_cpuid(&self) -> bool {
+        false
     }
     #[cfg(feature = "tdx")]
     /// Finalize the configuration of TDX on this VM
@@ -462,9 +534,18 @@ pub trait Vm: Send + Sync + Any {
         Ok(())
     }
 
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn set_memory_attributes(&self, _address: u64, _size: u64, _attributes: u64) -> Result<()> {
+        unimplemented!()
+    }
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     fn enable_x2apic_api(&self) -> Result<()> {
         unimplemented!("x2Apic is only supported on KVM/Linux hosts")
+    }
+
+    #[cfg(any(feature = "sev_snp", feature = "tdx"))]
+    fn share_memory_region(&self, _address: u64, _size: u64) -> Result<()> {
+        unimplemented!()
     }
 }
 
@@ -477,4 +558,17 @@ pub trait VmOps: Send + Sync {
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> Result<()>;
+    /// TDX-only: hook called by the hypervisor whenever a guest page
+    /// range flips between shared and private. The VMM uses this to
+    /// drive `RamDiscardListener` notifications (e.g. VFIO IOMMU
+    /// updates) in lock-step with `KVM_SET_MEMORY_ATTRIBUTES`.
+    ///
+    /// `private == true` means the range is about to become private
+    /// (host-inaccessible); listeners are notified *before* the host
+    /// backing is punched out. `private == false` means the range
+    /// just became shared; listeners are notified *after*
+    /// `set_memory_attributes` has acknowledged the flip so the host
+    /// VA is safe to map.
+    #[cfg(feature = "tdx")]
+    fn notify_memory_state_change(&self, _gpa: u64, _size: u64, _private: bool) {}
 }

@@ -3,6 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#[cfg(feature = "tdx")]
+pub mod ram_block_attributes;
+#[cfg(feature = "tdx")]
+pub mod ram_discard;
+
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -237,6 +242,16 @@ pub struct MemoryManager {
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    /// TDX-only: registry of listeners notified on guest page
+    /// share/private transitions. Populated lazily by callers like
+    /// `DeviceManager` when registering VFIO listeners.
+    #[cfg(feature = "tdx")]
+    ram_discard_registry: Arc<ram_discard::RamDiscardListenerRegistry>,
+    /// TDX-only: per-RAM-region shared/private bitmap. One entry per
+    /// guest_memfd-backed RAM region. Source of truth for "what is
+    /// currently shared", consulted on listener registration.
+    #[cfg(feature = "tdx")]
+    ram_block_attributes: Arc<Mutex<Vec<ram_block_attributes::RamBlockAttributes>>>,
 }
 
 #[derive(Error, Debug)]
@@ -1363,6 +1378,21 @@ impl MemoryManager {
                 self.ram_allocator
                     .allocate(Some(region.start_addr()), region.len(), None)
                     .ok_or(Error::MemoryRangeAllocation)?;
+
+                // TDX-only: track per-page shared/private state for
+                // every guest_memfd-backed RAM region. virtio-mem
+                // regions are excluded because they're hot-plugged
+                // separately. Initial state is all-private (zeroed).
+                #[cfg(feature = "tdx")]
+                if !virtio_mem {
+                    self.ram_block_attributes.lock().unwrap().push(
+                        ram_block_attributes::RamBlockAttributes::new(
+                            region.start_addr().raw_value(),
+                            region.len(),
+                            4096,
+                        ),
+                    );
+                }
             }
         }
 
@@ -1425,6 +1455,7 @@ impl MemoryManager {
         prefault: Option<bool>,
         phys_bits: u8,
         #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "tdx")] tdx_q35_platform: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -1482,6 +1513,13 @@ impl MemoryManager {
             )
         } else {
             // Init guest memory
+            #[cfg(feature = "tdx")]
+            let arch_mem_regions = if tdx_enabled && tdx_q35_platform {
+                arch::tdx_q35_arch_memory_regions()
+            } else {
+                arch::arch_memory_regions()
+            };
+            #[cfg(not(feature = "tdx"))]
             let arch_mem_regions = arch::arch_memory_regions();
 
             let ram_regions: Vec<(GuestAddress, usize)> = arch_mem_regions
@@ -1629,6 +1667,7 @@ impl MemoryManager {
         };
 
         // The start of device area and RAM area are placed next to each other.
+        let start_of_device_area: GuestAddress = start_of_device_area;
         let end_of_ram_area = start_of_device_area.unchecked_sub(1);
         let ram_allocator = AddressAllocator::new(GuestAddress(0), start_of_device_area.0).unwrap();
 
@@ -1667,6 +1706,10 @@ impl MemoryManager {
             #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             uefi_flash: None,
             thp: config.thp,
+            #[cfg(feature = "tdx")]
+            ram_discard_registry: Arc::new(ram_discard::RamDiscardListenerRegistry::new()),
+            #[cfg(feature = "tdx")]
+            ram_block_attributes: Arc::new(Mutex::new(Vec::new())),
         };
 
         Ok(Arc::new(Mutex::new(memory_manager)))
@@ -1695,6 +1738,8 @@ impl MemoryManager {
                 config,
                 Some(prefault),
                 phys_bits,
+                #[cfg(feature = "tdx")]
+                false,
                 #[cfg(feature = "tdx")]
                 false,
                 Some(&mem_snapshot),
@@ -2116,6 +2161,16 @@ impl MemoryManager {
             file_offset: 0,
         });
 
+        // TDX-only: track shared/private state for the new RAM region.
+        #[cfg(feature = "tdx")]
+        self.ram_block_attributes.lock().unwrap().push(
+            ram_block_attributes::RamBlockAttributes::new(
+                region.start_addr().raw_value(),
+                region.len(),
+                4096,
+            ),
+        );
+
         self.add_region(Arc::clone(&region))?;
 
         Ok(region)
@@ -2175,6 +2230,121 @@ impl MemoryManager {
 
     pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
         self.boot_guest_memory.clone()
+    }
+
+    /// TDX-only: handle to the listener registry. Subsystems (VFIO,
+    /// vhost-user, ...) clone this to register share/private listeners.
+    #[cfg(feature = "tdx")]
+    pub fn ram_discard_registry(&self) -> Arc<ram_discard::RamDiscardListenerRegistry> {
+        Arc::clone(&self.ram_discard_registry)
+    }
+
+    /// TDX-only: register a listener and immediately replay
+    /// currently-shared ranges so it can populate IOMMU mappings for
+    /// state that's already shared at registration time.
+    #[cfg(feature = "tdx")]
+    pub fn register_ram_discard_listener(
+        &self,
+        listener: Arc<dyn ram_discard::RamDiscardListener>,
+    ) -> io::Result<()> {
+        // Snapshot shared ranges *before* publishing the listener so
+        // we don't double-fire if a transition is racing the
+        // registration.
+        let mut replay: Vec<(u64, u64, u64)> = Vec::new();
+        {
+            let attrs = self.ram_block_attributes.lock().unwrap();
+            for region in attrs.iter() {
+                for (gpa, size) in region.shared_ranges(region.region_start(), region.region_size())
+                {
+                    let host_va = self.gpa_to_hva(gpa).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no host mapping for shared range gpa={gpa:#x}"),
+                        )
+                    })?;
+                    replay.push((gpa, host_va, size));
+                }
+            }
+        }
+
+        self.ram_discard_registry.register(Arc::clone(&listener));
+
+        for (gpa, host_va, size) in replay {
+            listener.notify_populate(gpa, host_va, size)?;
+        }
+        Ok(())
+    }
+
+    /// TDX-only: best-effort listener removal. See
+    /// `RamDiscardListenerRegistry::unregister` for caveats.
+    #[cfg(feature = "tdx")]
+    pub fn unregister_ram_discard_listener(
+        &self,
+        listener: &Arc<dyn ram_discard::RamDiscardListener>,
+    ) -> bool {
+        self.ram_discard_registry.unregister(listener)
+    }
+
+    /// TDX-only: convert a guest physical address to its current host
+    /// virtual address by walking the registered RAM mappings.
+    #[cfg(feature = "tdx")]
+    pub fn gpa_to_hva(&self, gpa: u64) -> Option<u64> {
+        use vm_memory::GuestMemory;
+        let mem = self.guest_memory.memory();
+        let region = mem.find_region(GuestAddress(gpa))?;
+        let offset = gpa.checked_sub(region.start_addr().raw_value())?;
+        Some(region.as_ptr() as u64 + offset)
+    }
+
+    /// TDX-only: drive the listener registry plus per-region bitmap
+    /// after a successful `set_memory_attributes` transition. The
+    /// hypervisor calls this through `VmOps::notify_memory_state_change`
+    /// so listeners fire in lock-step with attribute flips.
+    ///
+    /// `private == true` means the range just became (or is about to
+    /// become) private. We notify listeners of the discard *before*
+    /// updating the bitmap so they see the same "currently shared"
+    /// view they had during the most recent populate.
+    #[cfg(feature = "tdx")]
+    pub fn notify_memory_state_change(&self, gpa: u64, size: u64, private: bool) {
+        if size == 0 {
+            return;
+        }
+        // KVM applies set_memory_attributes across the entire guest
+        // address space, which includes regions outside guest RAM (PCIe
+        // MMIO hole, ACPI reserved, etc.). Listeners and the bitmap only
+        // model RAM-backed pages, so silently ignore non-RAM ranges.
+        let host_va = match self.gpa_to_hva(gpa) {
+            Some(hva) => hva,
+            None => return,
+        };
+        if private {
+            // Notify discard first (listener tears down DMA mappings)
+            // then mark pages private in the bitmap. The hypervisor
+            // punches the host backing afterwards.
+            self.ram_discard_registry.notify_discard(gpa, size);
+            let mut attrs = self.ram_block_attributes.lock().unwrap();
+            for region in attrs.iter_mut() {
+                region.set_private(gpa, size);
+            }
+        } else {
+            // Mark shared first, then notify populate with the resolved HVA.
+            {
+                let mut attrs = self.ram_block_attributes.lock().unwrap();
+                for region in attrs.iter_mut() {
+                    region.set_shared(gpa, size);
+                }
+            }
+            if let Err(e) = self
+                .ram_discard_registry
+                .notify_populate(gpa, host_va, size)
+            {
+                error!(
+                    "ram-discard listener notify_populate failed: gpa={gpa:#x} \
+                     size={size:#x} hva={host_va:#x}: {e}"
+                );
+            }
+        }
     }
 
     pub fn allocator(&self) -> Arc<Mutex<SystemAllocator>> {

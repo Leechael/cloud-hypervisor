@@ -133,6 +133,7 @@ pub enum PciSerialBusSubClass {
     Accessbus = 0x01,
     Ssa = 0x02,
     Usb = 0x03,
+    Smbus = 0x05,
 }
 
 impl PciSubclass for PciSerialBusSubClass {
@@ -671,6 +672,25 @@ impl PciConfiguration {
             *r = (*r & !self.writable_bits[reg_idx]) | (value & mask);
         } else {
             warn!("bad PCI register write {reg_idx}");
+        }
+    }
+
+    /// Sets a raw 32-bit configuration register value, bypassing the guest
+    /// writable-bit mask. This is intended for device-model initialization.
+    pub fn set_reg(&mut self, reg_idx: usize, value: u32) {
+        if let Some(r) = self.registers.get_mut(reg_idx) {
+            *r = value;
+        } else {
+            warn!("bad PCI register set {reg_idx}");
+        }
+    }
+
+    /// Sets the guest writable mask for a 32-bit configuration register.
+    pub fn set_writable_bits(&mut self, reg_idx: usize, mask: u32) {
+        if let Some(r) = self.writable_bits.get_mut(reg_idx) {
+            *r = mask;
+        } else {
+            warn!("bad PCI writable mask set {reg_idx}");
         }
     }
 

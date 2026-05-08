@@ -34,6 +34,9 @@ pub const ACPI_X2APIC_PROCESSOR: u8 = 9;
 pub const ACPI_APIC_IO: u8 = 1;
 #[cfg(target_arch = "x86_64")]
 pub const ACPI_APIC_XRUPT_OVERRIDE: u8 = 2;
+/// ACPI Local x2APIC NMI structure type. See ACPI spec section 5.2.12.13.
+#[cfg(target_arch = "x86_64")]
+pub const ACPI_X2APIC_LOCAL_NMI: u8 = 0x0a;
 #[cfg(target_arch = "aarch64")]
 pub const ACPI_APIC_GENERIC_CPU_INTERFACE: u8 = 11;
 #[cfg(target_arch = "aarch64")]
@@ -284,32 +287,60 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
     let mut facp = Sdt::new(*b"FACP", 276, 6, *b"CLOUDH", *b"CHFACP  ", 1);
 
     {
-        if let Some(address) = device_manager.acpi_platform_addresses().reset_reg_address {
+        let addresses = device_manager.acpi_platform_addresses();
+
+        if let Some(address) = addresses.pm1_evt_address {
+            // PM1a_EVT_BLK / X_PM1a_EVT_BLK
+            facp.write(56, address.address as u32);
+            facp.write(148, address);
+            // PM1_EVT_LEN
+            facp.write(88, 4u8);
+        }
+
+        if let Some(address) = addresses.pm1_cnt_address {
+            // PM1a_CNT_BLK / X_PM1a_CNT_BLK
+            facp.write(64, address.address as u32);
+            facp.write(172, address);
+            // PM1_CNT_LEN
+            facp.write(89, 2u8);
+        }
+
+        if let Some(address) = addresses.reset_reg_address {
             // RESET_REG
             facp.write(116, address);
             // RESET_VALUE
             facp.write(128, 1u8);
         }
 
-        if let Some(address) = device_manager
-            .acpi_platform_addresses()
-            .sleep_control_reg_address
-        {
+        if let Some(address) = addresses.sleep_control_reg_address {
             // SLEEP_CONTROL_REG
             facp.write(244, address);
         }
 
-        if let Some(address) = device_manager
-            .acpi_platform_addresses()
-            .sleep_status_reg_address
-        {
+        if let Some(address) = addresses.sleep_status_reg_address {
             // SLEEP_STATUS_REG
             facp.write(256, address);
         }
 
-        if let Some(address) = device_manager.acpi_platform_addresses().pm_timer_address {
+        if let Some(address) = addresses.pm_timer_address {
+            // PM_TMR_BLK
+            facp.write(76, address.address as u32);
+            // PM_TMR_LEN
+            facp.write(91, 4u8);
             // X_PM_TMR_BLK
             facp.write(208, address);
+        }
+
+        if let Some(address) = addresses.gpe0_blk_address {
+            // ACPI 6.x FADT layout:
+            //   offset 80  GPE0_BLK     (u32)  -> status block I/O address
+            //   offset 92  GPE0_BLK_LEN (u8)   -> length of status+enable
+            //   offset 220 X_GPE0_BLK   (GAS)  -> 64-bit-capable form
+            facp.write(80, address.address as u32);
+            facp.write(220, address);
+            if let Some(len) = addresses.gpe0_blk_len {
+                facp.write(92, len);
+            }
         }
     }
 
@@ -318,12 +349,23 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
     // ARM_BOOT_ARCH: enable PSCI with HVC enable-method
     facp.write(129, 3u16);
 
-    // Architecture common fields
-    // HW_REDUCED_ACPI, RESET_REG_SUP, TMR_VAL_EXT
-    let fadt_flags: u32 = (1 << 20) | (1 << 10) | (1 << 8);
+    // Architecture common fields.
+    // TMR_VAL_EXT is always set. HW_REDUCED_ACPI is only set when the
+    // platform exposes reduced sleep registers instead of q35 PM1 blocks.
+    let addresses = device_manager.acpi_platform_addresses();
+    let has_pm1 = addresses.pm1_evt_address.is_some() && addresses.pm1_cnt_address.is_some();
+    let mut fadt_flags: u32 = 1 << 8;
+    if addresses.reset_reg_address.is_some() {
+        fadt_flags |= 1 << 10;
+    }
+    if !has_pm1 {
+        fadt_flags |= 1 << 20;
+    }
     facp.write(112, fadt_flags);
     // FADT minor version
     facp.write(131, 3u8);
+    // SCI_INT
+    facp.write(46, 9u16);
     // X_DSDT
     facp.write(FACP_DSDT_OFFSET, dsdt_offset.0);
     // Hypervisor Vendor Identity
@@ -363,6 +405,36 @@ fn create_tpm2_table() -> Sdt {
 
     tpm.update_checksum();
     tpm
+}
+
+#[cfg(target_arch = "x86_64")]
+fn create_hpet_table(hpet_id: u32) -> Sdt {
+    // ACPI 2.0 HPET Description Table (IA-PC HPET spec 1.0a §3.2.4)
+    // Length = 36 (header) + 4 (block id) + 12 (GAS) + 1 + 2 + 1 = 56.
+    let mut hpet = Sdt::new(*b"HPET", 56, 1, *b"CLOUDH", *b"CHHPET  ", 1);
+
+    // Event Timer Block ID at offset 36.
+    hpet.write(36, hpet_id);
+
+    // BaseAddress as a Generic Address Structure starting at offset 40.
+    // QEMU emits {space=0, bit_width=0, bit_offset=0, access_size=0,
+    // address=0xfed0_0000} on the wire, so build the struct manually
+    // rather than using `GenericAddress::mmio_address::<u64>()` (which
+    // would set bit_width=64 and access_size=4).
+    hpet.write(40, 0u8); // address_space_id (system memory)
+    hpet.write(41, 0u8); // register_bit_width
+    hpet.write(42, 0u8); // register_bit_offset
+    hpet.write(43, 0u8); // access_size
+    hpet.write(44, devices::legacy::HPET_BASE);
+
+    hpet.write(52, 0u8); // HPET Number
+    // Main Counter Minimum Clock Tick (Periodic Mode). QEMU's
+    // hw/i386/acpi-build.c emits 0; verified in the reference tree.
+    hpet.write(53, 0u16);
+    hpet.write(55, 0u8); // Page Protection And OEM Attribute
+
+    hpet.update_checksum();
+    hpet
 }
 
 fn create_srat_table(
@@ -806,6 +878,32 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
 
 fn create_viot_table(iommu_bdf: &PciBdf, devices_bdf: &[PciBdf]) -> Sdt {
     // VIOT
+    //
+    // Cross-checked field-by-field against QEMU's `build_viot()` in
+    // hw/acpi/viot.c (see ubuntu-qemu-prod1):
+    //   - 36-byte ACPI table header (`VIOT` signature, rev 0)
+    //   - u16 node_count = ranges + 1 (one per managed device + the iommu)
+    //   - u16 node_offset = 48 (header + 12 bytes of count/offset/reserved)
+    //   - 8 bytes reserved
+    //   - VirtioPCI iommu node:
+    //       type=3, length=16, pci_segment, pci_bdf, 8-byte reserved tail
+    //   - Each PCIRange node:
+    //       type=1, length=24, endpoint_start, pci_segment_start,
+    //       pci_segment_end, pci_bdf_start, pci_bdf_end,
+    //       output_node=48 (offset of the VirtioPCI node), 6-byte reserved tail
+    //
+    // QEMU emits one PCIRange per host bridge spanning min_bus..max_bus,
+    // CH emits one PCIRange per assigned device with start==end. Both
+    // forms are spec-legal and convey the same information to firmware
+    // and the guest IOMMU driver — there is no semantic mismatch.
+    //
+    // TDX/RamDiscard interaction (commit 43cd0e095): the VIOT only
+    // describes which DMA endpoints the vIOMMU mediates. Whether a
+    // page is shared or private at any given instant is decided at
+    // runtime by the RamDiscardManager bitmap — the firmware never
+    // needs that distinction surfaced through ACPI. So no extra VIOT
+    // fields are required for the share/private split, and the table
+    // stays identical between TDX and non-TDX boots.
     let mut viot = Sdt::new(*b"VIOT", 36, 0, *b"CLOUDH", *b"CHVIOT  ", 0);
     // Node count
     viot.append((devices_bdf.len() + 1) as u16);
@@ -918,6 +1016,17 @@ fn create_acpi_tables_internal(
     xsdt_table_pointers.push(mcfg_addr.0);
     prev_tbl_len = mcfg.len() as u64;
     prev_tbl_addr = mcfg_addr;
+
+    // HPET
+    #[cfg(target_arch = "x86_64")]
+    {
+        let hpet = create_hpet_table(devices::legacy::hpet_block_id());
+        let hpet_addr = prev_tbl_addr.checked_add(prev_tbl_len).unwrap();
+        tables_bytes.extend_from_slice(hpet.as_slice());
+        xsdt_table_pointers.push(hpet_addr.0);
+        prev_tbl_len = hpet.len() as u64;
+        prev_tbl_addr = hpet_addr;
+    }
 
     // SPCR and DBG2
     #[cfg(target_arch = "aarch64")]
@@ -1045,43 +1154,48 @@ pub fn create_acpi_tables_for_fw_cfg(
         numa_nodes,
         tpm_enabled,
     );
-    let mut pointer_offsets: Vec<usize> = vec![];
-    let mut checksums: Vec<(usize, usize)> = vec![];
+    let mut pointer_offsets: Vec<(usize, u8)> = vec![];
 
     let xsdt_addr = rsdp.xsdt_addr.get() as usize;
-    let xsdt_checksum = (xsdt_addr, table_bytes.len() - xsdt_addr);
 
     // create pointer offsets (use location of pointers in XSDT table)
     // XSDT doesn't have a pointer to DSDT so we use FACP's pointer to DSDT
     let facp_offset = xsdt_table_pointers[0] as usize;
-    pointer_offsets.push(facp_offset + FACP_DSDT_OFFSET);
+    pointer_offsets.push((facp_offset + FACP_DSDT_OFFSET, 8));
     let mut current_offset = xsdt_addr + 36;
     for _ in 0..xsdt_table_pointers.len() {
-        pointer_offsets.push(current_offset);
+        pointer_offsets.push((current_offset, 8));
         current_offset += 8;
     }
 
-    // create (offset, len) pairs for firmware to calculate
-    // table checksums and verify ACPI tables
-    let mut i = 0;
-    while i < xsdt_table_pointers.len() - 1 {
-        let current_table_offset = xsdt_table_pointers[i];
-        let current_table_length = xsdt_table_pointers[i + 1] - current_table_offset;
-        checksums.push((current_table_offset as usize, current_table_length as usize));
-        i += 1;
-    }
-    checksums.push((
-        xsdt_table_pointers[xsdt_table_pointers.len() - 1] as usize,
-        0,
-    ));
-    checksums.push(xsdt_checksum);
+    let mut table_offsets = vec![0usize, xsdt_addr];
+    table_offsets.extend(xsdt_table_pointers.iter().map(|offset| *offset as usize));
+    table_offsets.sort_unstable();
+    table_offsets.dedup();
+    let checksums = table_offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, offset)| {
+            let end = table_offsets
+                .get(index + 1)
+                .copied()
+                .unwrap_or(table_bytes.len());
+            let len = end.checked_sub(*offset)?;
+            (len >= 36).then_some((*offset, len))
+        })
+        .collect();
 
     device_manager
         .fw_cfg()
         .expect("fw_cfg must be present")
         .lock()
         .unwrap()
-        .add_acpi(rsdp, table_bytes, checksums, pointer_offsets)
+        .add_acpi(
+            rsdp.as_bytes().to_vec(),
+            table_bytes,
+            checksums,
+            pointer_offsets,
+        )
         .map_err(crate::vm::Error::CreatingAcpiTables)
 }
 
@@ -1147,6 +1261,9 @@ pub fn create_acpi_tables_tdx(
 
     // MCFG
     tables.push(create_mcfg_table(device_manager.pci_segments()));
+
+    // HPET
+    tables.push(create_hpet_table(devices::legacy::hpet_block_id()));
 
     // SRAT and SLIT
     // Only created if the NUMA nodes list is not empty.

@@ -55,6 +55,21 @@ const AMX_INT8: u8 = 25; // AMX tile computation on 8-bit integers
 const AMX_FP16: u8 = 21; // AMX tile computation on fp16 numbers
 const AMX_COMPLEX: u8 = 8; // AMX tile computation on complex numbers
 
+#[cfg(feature = "tdx")]
+const SMX_ECX_BIT: u8 = 6;
+#[cfg(feature = "tdx")]
+const SGX_EBX_BIT: u8 = 2;
+#[cfg(feature = "tdx")]
+const MPX_EBX_BIT: u8 = 14;
+#[cfg(feature = "tdx")]
+const TSC_ADJUST_EBX_BIT: u8 = 1;
+#[cfg(feature = "tdx")]
+const INTEL_PT_EBX_BIT: u8 = 25;
+#[cfg(feature = "tdx")]
+const ENQCMD_ECX_BIT: u8 = 29;
+#[cfg(feature = "tdx")]
+const SGX_LC_ECX_BIT: u8 = 30;
+
 // KVM feature bits
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_CLOCKSOURCE_BIT: u8 = 0;
@@ -68,6 +83,15 @@ const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
 const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
+
+#[cfg(feature = "tdx")]
+const TDX_SUPPORTED_KVM_FEATURES: u32 = (1 << 1)
+    | (1 << 7)
+    | (1 << 9)
+    | (1 << 11)
+    | (1 << 12)
+    | (1 << 13)
+    | (1 << KVM_FEATURE_MSI_EXT_DEST_ID);
 
 const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 
@@ -152,11 +176,6 @@ pub enum Error {
     // Error getting CPU TSC frequency
     #[error("Error getting CPU TSC frequency")]
     GetTscFrequency(#[source] HypervisorCpuError),
-
-    /// Error retrieving TDX capabilities through the hypervisor (kvm/mshv) API
-    #[cfg(feature = "tdx")]
-    #[error("Error retrieving TDX capabilities through the hypervisor API")]
-    TdxCapabilities(#[source] HypervisorError),
 
     /// Failed to configure E820 map for bzImage
     #[error("Failed to configure E820 map for bzImage")]
@@ -628,17 +647,6 @@ pub fn generate_common_cpuid(
 
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
-    #[cfg(feature = "tdx")]
-    let tdx_capabilities = if config.tdx {
-        let caps = hypervisor
-            .tdx_capabilities()
-            .map_err(Error::TdxCapabilities)?;
-        info!("TDX capabilities {caps:#?}");
-        Some(caps)
-    } else {
-        None
-    };
-
     // Update some existing CPUID
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
@@ -653,23 +661,22 @@ pub fn generate_common_cpuid(
                     entry.edx &= !(1 << AMX_COMPLEX);
                 }
             }
-            0xd =>
+            0x1 =>
             {
                 #[cfg(feature = "tdx")]
-                if let Some(caps) = &tdx_capabilities {
-                    let xcr0_mask: u64 = 0x82ff;
-                    let xss_mask: u64 = !xcr0_mask;
-                    if entry.index == 0 {
-                        entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
-                        entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
-                        entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
-                        entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
-                    } else if entry.index == 1 {
-                        entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
-                        entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
-                        entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
-                        entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
-                    }
+                if config.tdx {
+                    entry.ecx &= !((1 << VMX_ECX_BIT) | (1 << SMX_ECX_BIT) | (1 << 16));
+                }
+            }
+            0x7 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx && entry.index == 0 {
+                    entry.ebx &= !((1 << TSC_ADJUST_EBX_BIT)
+                        | (1 << SGX_EBX_BIT)
+                        | (1 << MPX_EBX_BIT)
+                        | (1 << INTEL_PT_EBX_BIT));
+                    entry.ecx &= !((1 << ENQCMD_ECX_BIT) | (1 << SGX_LC_ECX_BIT));
                 }
             }
             // Tile Information (purely AMX related).
@@ -685,6 +692,16 @@ pub fn generate_common_cpuid(
                 entry.ebx = 0;
                 entry.ecx = 0;
                 entry.edx = 0;
+            }
+            0x12 | 0x14 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax = 0;
+                    entry.ebx = 0;
+                    entry.ecx = 0;
+                    entry.edx = 0;
+                }
             }
 
             // Copy host L1 cache details if not populated by KVM
@@ -722,6 +739,11 @@ pub fn generate_common_cpuid(
             // Set CPU physical bits
             0x8000_0008 => {
                 entry.eax = (entry.eax & 0xffff_ff00) | (config.phys_bits as u32 & 0xff);
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax =
+                        (entry.eax & !0x00ff_0000) | ((config.phys_bits as u32 & 0xff) << 16);
+                }
             }
             0x4000_0001 => {
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
@@ -737,6 +759,14 @@ pub fn generate_common_cpuid(
                         | (1 << KVM_FEATURE_ASYNC_PF_BIT)
                         | (1 << KVM_FEATURE_ASYNC_PF_VMEXIT_BIT)
                         | (1 << KVM_FEATURE_STEAL_TIME_BIT));
+                    entry.eax &= TDX_SUPPORTED_KVM_FEATURES;
+                }
+            }
+            0x4000_0000 =>
+            {
+                #[cfg(feature = "tdx")]
+                if config.tdx {
+                    entry.eax = 0x4000_0001;
                 }
             }
             _ => {}
@@ -819,49 +849,25 @@ pub fn configure_vcpu(
     cpu_vendor: CpuVendor,
     topology: (u16, u16, u16, u16),
     nested: bool,
+    #[cfg(feature = "tdx")] tdx_enabled: bool,
     setup_registers: bool,
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id, Some(topology));
-
-    // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
-    let mut cpuid = cpuid;
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, x2apic_id);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, x2apic_id);
-    if matches!(cpu_vendor, CpuVendor::AMD) {
-        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_001e, Some(0), CpuidReg::EAX, x2apic_id);
-    }
-
-    // Set ApicId in cpuid for each vcpu - found in cpuid ebx when eax = 1
-    let mut apic_id_patched = false;
-    for entry in &mut cpuid {
-        if entry.function == 1 {
-            entry.ebx &= 0xffffff;
-            entry.ebx |= x2apic_id << 24;
-            apic_id_patched = true;
-            if matches!(cpu_vendor, CpuVendor::Intel) {
-                if !nested {
-                    // Disable nested virtualization for Intel
-                    entry.ecx &= !(1 << VMX_ECX_BIT);
-                }
-                break;
-            }
-        }
-        if entry.function == 0x8000_0001 {
-            if !nested {
-                // Disable the nested virtualization for AMD
-                entry.ecx &= !(1 << SVM_ECX_BIT);
-            }
-            break;
-        }
-    }
-    assert!(apic_id_patched);
-
-    update_cpuid_topology(
-        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
-    );
+    let mut cpuid = configure_vcpu_cpuid(cpuid, id, cpu_vendor, topology, nested);
 
     // The TSC frequency CPUID leaf should not be included when running with HyperV emulation
-    if !kvm_hyperv && let Some(tsc_khz) = vcpu.tsc_khz().map_err(Error::GetTscFrequency)? {
+    if !kvm_hyperv
+        && {
+            #[cfg(feature = "tdx")]
+            {
+                !tdx_enabled
+            }
+            #[cfg(not(feature = "tdx"))]
+            {
+                true
+            }
+        }
+        && let Some(tsc_khz) = vcpu.tsc_khz().map_err(Error::GetTscFrequency)?
+    {
         // Need to check that the TSC doesn't vary with dynamic frequency
         #[allow(unused_unsafe)]
         // SAFETY: cpuid called with valid leaves
@@ -907,35 +913,147 @@ pub fn configure_vcpu(
         }
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
     }
+    #[cfg(feature = "tdx")]
+    if !tdx_enabled {
+        interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
+    }
+    #[cfg(not(feature = "tdx"))]
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
+}
+
+pub fn configure_vcpu_cpuid(
+    mut cpuid: Vec<CpuIdEntry>,
+    id: u32,
+    cpu_vendor: CpuVendor,
+    topology: (u16, u16, u16, u16),
+    nested: bool,
+) -> Vec<CpuIdEntry> {
+    let x2apic_id = get_x2apic_id(id, Some(topology));
+
+    // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, x2apic_id);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, x2apic_id);
+    if matches!(cpu_vendor, CpuVendor::AMD) {
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_001e, Some(0), CpuidReg::EAX, x2apic_id);
+    }
+
+    // Set ApicId in cpuid for each vcpu - found in cpuid ebx when eax = 1
+    let mut apic_id_patched = false;
+    for entry in &mut cpuid {
+        if entry.function == 1 {
+            entry.ebx &= 0xffffff;
+            entry.ebx |= x2apic_id << 24;
+            apic_id_patched = true;
+            if matches!(cpu_vendor, CpuVendor::Intel) {
+                if !nested {
+                    // Disable nested virtualization for Intel
+                    entry.ecx &= !(1 << VMX_ECX_BIT);
+                }
+                break;
+            }
+        }
+        if entry.function == 0x8000_0001 {
+            if !nested {
+                // Disable the nested virtualization for AMD
+                entry.ecx &= !(1 << SVM_ECX_BIT);
+            }
+            break;
+        }
+    }
+    assert!(apic_id_patched);
+
+    update_cpuid_topology(
+        &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
+    );
+
+    cpuid
 }
 
 /// Returns a Vec of the valid memory addresses.
 ///
 /// These should be used to configure the GuestMemory structure for the platform.
-/// For x86_64 all addresses are valid from the start of the kernel except a
-/// carve out at the end of 32bit address space.
-pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
-    vec![
-        // 0 GiB ~ 3GiB: memory before the gap
+fn arch_memory_regions_with_lowmem_end(
+    lowmem_end: GuestAddress,
+) -> Vec<(GuestAddress, usize, RegionType)> {
+    assert!(lowmem_end <= layout::MEM_32BIT_RESERVED_START);
+
+    let mut regions = vec![
+        // 0 GiB ~ lowmem_end: memory before the 32-bit gap.
         (
             GuestAddress(0),
-            layout::MEM_32BIT_RESERVED_START.raw_value() as usize,
+            lowmem_end.raw_value() as usize,
             RegionType::Ram,
         ),
-        // 4 GiB ~ inf: memory after the gap
+        // 4 GiB ~ inf: memory after the gap.
         (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
-        // 3 GiB ~ 3712 MiB: 32-bit device memory hole
+    ];
+
+    if lowmem_end < layout::MEM_32BIT_RESERVED_START {
+        regions.push((
+            lowmem_end,
+            layout::MEM_32BIT_RESERVED_START.unchecked_offset_from(lowmem_end) as usize,
+            RegionType::Reserved,
+        ));
+    }
+
+    regions.extend_from_slice(&[
+        // 3 GiB ~ 3712 MiB: 32-bit device memory hole.
         (
             layout::MEM_32BIT_RESERVED_START,
             layout::MEM_32BIT_DEVICES_SIZE as usize,
             RegionType::SubRegion,
         ),
-        // 3712 MiB ~ 3968 MiB: 32-bit reserved memory hole
+        // 3712 MiB ~ 3968 MiB: 32-bit reserved memory hole.
         (
             layout::MEM_32BIT_RESERVED_START.unchecked_add(layout::MEM_32BIT_DEVICES_SIZE),
             (layout::MEM_32BIT_RESERVED_SIZE - layout::MEM_32BIT_DEVICES_SIZE) as usize,
+            RegionType::Reserved,
+        ),
+    ]);
+
+    regions
+}
+
+/// For x86_64 all addresses are valid from the start of the kernel except a
+/// carve out at the end of 32bit address space.
+pub fn arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
+    arch_memory_regions_with_lowmem_end(layout::MEM_32BIT_RESERVED_START)
+}
+
+/// Q35-like x86_64 memory layout used by TDX/OVMF guests.
+///
+/// Matching QEMU q35's 2GiB low-memory split prevents OVMF from allocating
+/// shared DMA buffers from the same below-4GiB RAM range that is backed by
+/// private guest_memfd pages.
+pub fn tdx_q35_arch_memory_regions() -> Vec<(GuestAddress, usize, RegionType)> {
+    vec![
+        // 0 GiB ~ 2 GiB: low memory visible to the guest.
+        (
+            GuestAddress(0),
+            layout::Q35_LOWMEM_END.raw_value() as usize,
+            RegionType::Ram,
+        ),
+        // 4 GiB ~ inf: memory above the 32-bit PCI hole.
+        (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
+        // 2 GiB ~ 2816 MiB: QEMU q35 32-bit PCI MMIO window.
+        (
+            layout::Q35_MEM_32BIT_DEVICES_START,
+            layout::Q35_MEM_32BIT_DEVICES_SIZE as usize,
+            RegionType::SubRegion,
+        ),
+        // 2816 MiB ~ 3072 MiB: QEMU q35 PCI ECAM/MMCONFIG window.
+        (
+            layout::Q35_PCI_MMCONFIG_START,
+            layout::Q35_PCI_MMCONFIG_SIZE as usize,
+            RegionType::Reserved,
+        ),
+        // 3072 MiB ~ 4 GiB: remaining firmware/platform reserved space.
+        (
+            layout::Q35_PCI_MMCONFIG_START.unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
+            layout::RAM_64BIT_START.unchecked_offset_from(
+                layout::Q35_PCI_MMCONFIG_START.unchecked_add(layout::Q35_PCI_MMCONFIG_SIZE),
+            ) as usize,
             RegionType::Reserved,
         ),
     ]
@@ -1498,6 +1616,41 @@ mod unit_tests {
         assert_eq!(4, regions.len());
         assert_eq!(GuestAddress(0), regions[0].0);
         assert_eq!(GuestAddress(1 << 32), regions[1].0);
+    }
+
+    #[test]
+    fn tdx_q35_regions_keep_below_4g_dma_hole_out_of_ram() {
+        let regions = tdx_q35_arch_memory_regions();
+
+        assert_eq!(5, regions.len());
+        assert_eq!(
+            (
+                GuestAddress(0),
+                layout::Q35_LOWMEM_END.0 as usize,
+                RegionType::Ram
+            ),
+            regions[0]
+        );
+        assert_eq!(
+            (layout::RAM_64BIT_START, usize::MAX, RegionType::Ram),
+            regions[1]
+        );
+        assert_eq!(
+            (
+                layout::Q35_MEM_32BIT_DEVICES_START,
+                layout::Q35_MEM_32BIT_DEVICES_SIZE as usize,
+                RegionType::SubRegion,
+            ),
+            regions[2]
+        );
+        assert_eq!(
+            (
+                layout::Q35_PCI_MMCONFIG_START,
+                layout::Q35_PCI_MMCONFIG_SIZE as usize,
+                RegionType::Reserved,
+            ),
+            regions[3]
+        );
     }
 
     #[test]

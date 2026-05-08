@@ -168,6 +168,14 @@ pub enum Error {
     #[error("TDX firmware missing")]
     /// No TDX firmware
     FirmwarePathMissing,
+    #[cfg(feature = "tdx")]
+    #[error("Error parsing --tdx: {0}={1}: expected 96 hex chars (48 bytes)")]
+    /// Invalid measurement-seed hex string supplied to --tdx
+    InvalidTdxMeasurementHex(&'static str, String),
+    #[cfg(feature = "tdx")]
+    #[error("Error parsing --tdx: xfam: expected u64 (decimal or 0x-prefixed hex)")]
+    /// Invalid xfam u64 supplied to --tdx
+    InvalidTdxXfam,
     /// Failed parsing userspace device
     #[error("Error parsing --user-device")]
     ParseUserDevice(#[source] OptionParserError),
@@ -212,6 +220,11 @@ pub enum Error {
     ParseFwCfgItem(#[source] OptionParserError),
     #[error("Error parsing common PCI device config")]
     ParsePciDeviceCommonConfig(#[source] OptionParserError),
+    /// Invalid SMBIOS system_uuid
+    #[error(
+        "Invalid smbios.system_uuid '{0}': expected 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+    )]
+    InvalidSmbiosUuid(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -312,6 +325,9 @@ pub enum ValidationError {
         "IOMMU address width in bits ({0}) should be less than or equal to {MAX_IOMMU_ADDRESS_WIDTH_BITS}"
     )]
     InvalidIommuAddressWidthBits(u8),
+    /// Invalid option ROM specification
+    #[error("Invalid option_roms entry '{0}': expected NAME:PATH and the file must exist")]
+    InvalidOptionRom(String),
     /// Balloon too big
     #[error("Ballon size ({0}) greater than RAM ({1})")]
     BalloonLargerThanRam(u64, u64),
@@ -463,6 +479,8 @@ pub struct VmParams<'a> {
     pub gdb: bool,
     pub pci_segments: Option<Vec<&'a str>>,
     pub platform: Option<&'a str>,
+    #[cfg(feature = "tdx")]
+    pub tdx: Option<&'a str>,
     pub tpm: Option<&'a str>,
     #[cfg(feature = "igvm")]
     pub igvm: Option<&'a str>,
@@ -533,6 +551,8 @@ impl<'a> VmParams<'a> {
             .get_many::<String>("pci-segment")
             .map(|x| x.map(|y| y as &str).collect());
         let platform = args.get_one::<String>("platform").map(|x| x as &str);
+        #[cfg(feature = "tdx")]
+        let tdx = args.get_one::<String>("tdx").map(|x| x as &str);
         #[cfg(feature = "guest_debug")]
         let gdb = args.contains_id("gdb");
         let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
@@ -582,6 +602,8 @@ impl<'a> VmParams<'a> {
             gdb,
             pci_segments,
             platform,
+            #[cfg(feature = "tdx")]
+            tdx,
             tpm,
             #[cfg(feature = "igvm")]
             igvm,
@@ -812,6 +834,26 @@ impl PciSegmentConfig {
     }
 }
 
+/// Parse a 16-byte UUID from `smbios.system_uuid`.
+///
+/// Accepts either canonical dashed form
+/// (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) or 32 contiguous hex chars.
+/// Returns the raw RFC 4122 big-endian bytes; the SMBIOS Type 1 wire-format
+/// byte-flip is applied later by `build_qemu_compat_smbios`.
+pub(crate) fn parse_smbios_uuid_hex(s: &str) -> Option<[u8; 16]> {
+    let stripped: String = s.chars().filter(|c| *c != '-').collect();
+    if stripped.len() != 32 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let hi = u8::from_str_radix(&stripped[i * 2..i * 2 + 1], 16).ok()?;
+        let lo = u8::from_str_radix(&stripped[i * 2 + 1..i * 2 + 2], 16).ok()?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(bytes)
+}
+
 impl PlatformConfig {
     pub fn syntax() -> &'static str {
         static SYNTAX: LazyLock<String> = LazyLock::new(|| {
@@ -819,7 +861,18 @@ impl PlatformConfig {
             \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
             iommu_address_width=<bits>,serial_number=<dmi_device_serial_number>,\
             uuid=<dmi_device_uuid>,oem_strings=<list_of_strings>,iommufd=on|off,\
-            vfio_p2p_dma=on|off"
+            vfio_p2p_dma=on|off,\
+            option_roms=<list_of_NAME:PATH>,\
+            smbios.bios_vendor=<str>,smbios.bios_version=<str>,\
+            smbios.bios_release_date=<MM/DD/YYYY>,\
+            smbios.system_manufacturer=<str>,smbios.system_product=<str>,\
+            smbios.system_version=<str>,smbios.system_serial=<str>,\
+            smbios.system_uuid=<uuid>,smbios.system_sku=<str>,\
+            smbios.system_family=<str>,\
+            smbios.chassis_manufacturer=<str>,smbios.chassis_version=<str>,\
+            smbios.chassis_serial=<str>,smbios.chassis_asset_tag=<str>,\
+            smbios.processor_manufacturer=<str>,smbios.processor_version=<str>,\
+            smbios.oem_strings=<colon_separated_list>"
                 .to_string();
 
             if cfg!(feature = "tdx") {
@@ -848,7 +901,28 @@ impl PlatformConfig {
             .add("uuid")
             .add("oem_strings")
             .add("iommufd")
-            .add("vfio_p2p_dma");
+            .add("vfio_p2p_dma")
+            .add("option_roms")
+            // SMBIOS string overrides — namespaced under `smbios.*` so they
+            // don't collide with the legacy `serial_number` / `uuid` /
+            // `oem_strings` aliases above.
+            .add("smbios.bios_vendor")
+            .add("smbios.bios_version")
+            .add("smbios.bios_release_date")
+            .add("smbios.system_manufacturer")
+            .add("smbios.system_product")
+            .add("smbios.system_version")
+            .add("smbios.system_serial")
+            .add("smbios.system_uuid")
+            .add("smbios.system_sku")
+            .add("smbios.system_family")
+            .add("smbios.chassis_manufacturer")
+            .add("smbios.chassis_version")
+            .add("smbios.chassis_serial")
+            .add("smbios.chassis_asset_tag")
+            .add("smbios.processor_manufacturer")
+            .add("smbios.processor_version")
+            .add("smbios.oem_strings");
         #[cfg(feature = "tdx")]
         parser.add("tdx");
         #[cfg(feature = "sev_snp")]
@@ -885,6 +959,121 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
             .0;
+        let option_roms = parser
+            .convert::<StringList>("option_roms")
+            .map_err(Error::ParsePlatform)?
+            .map(|v| v.0);
+
+        // SMBIOS string overrides. Each `smbios.*` key is parsed
+        // independently and only present (`Some`) when the operator
+        // supplied it on the command line — `None` keeps the legacy
+        // `CH_SMBIOS_*` defaults baked into `build_qemu_compat_smbios`.
+        let smbios_bios_vendor = parser
+            .convert::<String>("smbios.bios_vendor")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_bios_version = parser
+            .convert::<String>("smbios.bios_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_bios_release_date = parser
+            .convert::<String>("smbios.bios_release_date")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_manufacturer = parser
+            .convert::<String>("smbios.system_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_product = parser
+            .convert::<String>("smbios.system_product")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_version = parser
+            .convert::<String>("smbios.system_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_serial = parser
+            .convert::<String>("smbios.system_serial")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_uuid = parser
+            .convert::<String>("smbios.system_uuid")
+            .map_err(Error::ParsePlatform)?;
+        if let Some(s) = smbios_system_uuid.as_deref()
+            && parse_smbios_uuid_hex(s).is_none()
+        {
+            return Err(Error::InvalidSmbiosUuid(s.to_string()));
+        }
+        let smbios_system_sku = parser
+            .convert::<String>("smbios.system_sku")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_system_family = parser
+            .convert::<String>("smbios.system_family")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_manufacturer = parser
+            .convert::<String>("smbios.chassis_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_version = parser
+            .convert::<String>("smbios.chassis_version")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_serial = parser
+            .convert::<String>("smbios.chassis_serial")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_chassis_asset_tag = parser
+            .convert::<String>("smbios.chassis_asset_tag")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_processor_manufacturer = parser
+            .convert::<String>("smbios.processor_manufacturer")
+            .map_err(Error::ParsePlatform)?;
+        let smbios_processor_version = parser
+            .convert::<String>("smbios.processor_version")
+            .map_err(Error::ParsePlatform)?;
+        // SMBIOS OEM strings live inside a single `--platform` value, so the
+        // outer `,` separator is already taken by the option parser. We
+        // accept a colon-separated list here (mirroring how CH formats
+        // `cpus features` and other multi-valued option fields), which
+        // avoids the need for `[...]` quoting tricks for the common case.
+        let smbios_oem_strings = parser
+            .convert::<String>("smbios.oem_strings")
+            .map_err(Error::ParsePlatform)?
+            .map(|raw| {
+                raw.split(':')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>()
+            });
+        let smbios = if smbios_bios_vendor.is_some()
+            || smbios_bios_version.is_some()
+            || smbios_bios_release_date.is_some()
+            || smbios_system_manufacturer.is_some()
+            || smbios_system_product.is_some()
+            || smbios_system_version.is_some()
+            || smbios_system_serial.is_some()
+            || smbios_system_uuid.is_some()
+            || smbios_system_sku.is_some()
+            || smbios_system_family.is_some()
+            || smbios_chassis_manufacturer.is_some()
+            || smbios_chassis_version.is_some()
+            || smbios_chassis_serial.is_some()
+            || smbios_chassis_asset_tag.is_some()
+            || smbios_processor_manufacturer.is_some()
+            || smbios_processor_version.is_some()
+            || smbios_oem_strings.is_some()
+        {
+            Some(SmbiosConfig {
+                bios_vendor: smbios_bios_vendor,
+                bios_version: smbios_bios_version,
+                bios_release_date: smbios_bios_release_date,
+                system_manufacturer: smbios_system_manufacturer,
+                system_product: smbios_system_product,
+                system_version: smbios_system_version,
+                system_serial: smbios_system_serial,
+                system_uuid: smbios_system_uuid,
+                system_sku: smbios_system_sku,
+                system_family: smbios_system_family,
+                chassis_manufacturer: smbios_chassis_manufacturer,
+                chassis_version: smbios_chassis_version,
+                chassis_serial: smbios_chassis_serial,
+                chassis_asset_tag: smbios_chassis_asset_tag,
+                processor_manufacturer: smbios_processor_manufacturer,
+                processor_version: smbios_processor_version,
+                oem_strings: smbios_oem_strings,
+            })
+        } else {
+            None
+        };
         #[cfg(feature = "tdx")]
         let tdx = parser
             .convert::<Toggle>("tdx")
@@ -910,6 +1099,8 @@ impl PlatformConfig {
             tdx,
             #[cfg(feature = "sev_snp")]
             sev_snp,
+            option_roms,
+            smbios,
         })
     }
 
@@ -932,6 +1123,20 @@ impl PlatformConfig {
             return Err(ValidationError::InvalidIommuAddressWidthBits(
                 self.iommu_address_width_bits,
             ));
+        }
+
+        if let Some(roms) = self.option_roms.as_ref() {
+            for entry in roms {
+                let mut parts = entry.splitn(2, ':');
+                let name = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                if name.is_empty() || path.is_empty() {
+                    return Err(ValidationError::InvalidOptionRom(entry.clone()));
+                }
+                if !std::path::Path::new(path).exists() {
+                    return Err(ValidationError::InvalidOptionRom(entry.clone()));
+                }
+            }
         }
 
         Ok(())
@@ -2675,6 +2880,101 @@ impl TpmConfig {
     }
 }
 
+#[cfg(feature = "tdx")]
+fn parse_tdx_xfam(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    let (radix, body) = if let Some(stripped) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (16u32, stripped)
+    } else {
+        (10u32, trimmed)
+    };
+    u64::from_str_radix(body, radix).map_err(|_| Error::InvalidTdxXfam)
+}
+
+#[cfg(feature = "tdx")]
+fn validate_tdx_measurement_hex(field: &'static str, raw: &str) -> Result<String> {
+    // Strip optional separators commonly used by humans / paste sources.
+    let stripped: String = raw
+        .chars()
+        .filter(|c| !matches!(*c, '-' | ':' | ' ' | '_'))
+        .collect();
+    if stripped.len() != 96 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::InvalidTdxMeasurementHex(field, raw.to_string()));
+    }
+    Ok(stripped)
+}
+
+#[cfg(feature = "tdx")]
+impl TdxConfig {
+    pub const SYNTAX: &'static str = "TDX guest configuration \
+        \"firmware=</path/to/tdvf>,sept_ve_disable=on|off,debug=on|off,\
+        perfmon=on|off,mrconfigid=<96 hex chars>,mrowner=<96 hex chars>,\
+        mrownerconfig=<96 hex chars>,xfam=<u64 (0x prefix accepted)>\"";
+
+    pub fn parse(tdx: &str) -> Result<Self> {
+        let mut parser = OptionParser::new();
+        parser
+            .add("firmware")
+            .add("sept_ve_disable")
+            .add("debug")
+            .add("perfmon")
+            .add("mrconfigid")
+            .add("mrowner")
+            .add("mrownerconfig")
+            .add("xfam");
+        parser.parse(tdx).map_err(Error::ParseTdx)?;
+
+        let firmware = parser
+            .get("firmware")
+            .map(PathBuf::from)
+            .ok_or(Error::FirmwarePathMissing)?;
+
+        let sept_ve_disable = parser
+            .convert::<Toggle>("sept_ve_disable")
+            .map_err(Error::ParseTdx)?
+            .map(|t| t.0);
+        let debug = parser
+            .convert::<Toggle>("debug")
+            .map_err(Error::ParseTdx)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let perfmon = parser
+            .convert::<Toggle>("perfmon")
+            .map_err(Error::ParseTdx)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        let mrconfigid = parser
+            .get("mrconfigid")
+            .map(|s| validate_tdx_measurement_hex("mrconfigid", &s))
+            .transpose()?;
+        let mrowner = parser
+            .get("mrowner")
+            .map(|s| validate_tdx_measurement_hex("mrowner", &s))
+            .transpose()?;
+        let mrownerconfig = parser
+            .get("mrownerconfig")
+            .map(|s| validate_tdx_measurement_hex("mrownerconfig", &s))
+            .transpose()?;
+
+        let xfam = parser.get("xfam").map(|s| parse_tdx_xfam(&s)).transpose()?;
+
+        Ok(TdxConfig {
+            firmware,
+            sept_ve_disable,
+            debug,
+            perfmon,
+            mrconfigid,
+            mrowner,
+            mrownerconfig,
+            xfam,
+        })
+    }
+}
+
 impl LandlockConfig {
     pub const SYNTAX: &'static str = "Landlock parameters \
         \"path=<path/to/{file/dir}>,access=[rw]\"";
@@ -2806,9 +3106,14 @@ impl VmConfig {
 
         #[cfg(feature = "tdx")]
         {
-            let tdx_enabled = self.platform.as_ref().is_some_and(|p| p.tdx);
-            // At this point we know payload isn't None.
-            if tdx_enabled && self.payload.as_ref().unwrap().firmware.is_none() {
+            let tdx_enabled = self.is_tdx_enabled();
+            // Firmware can come from either `--firmware` (PayloadConfig) or
+            // `--tdx firmware=...` (TdxConfig). Either is acceptable; the TD
+            // firmware loader prefers `payload.firmware` and falls back to
+            // `tdx.firmware` when only the latter is provided.
+            let firmware_present = self.payload.as_ref().is_some_and(|p| p.firmware.is_some())
+                || self.tdx.as_ref().is_some();
+            if tdx_enabled && !firmware_present {
                 return Err(ValidationError::TdxFirmwareMissing);
             }
             if tdx_enabled && (self.cpus.max_vcpus != self.cpus.boot_vcpus) {
@@ -3296,19 +3601,40 @@ impl VmConfig {
             numa = Some(numa_config_list);
         }
 
+        // Parse `--tdx` early so `payload.firmware` can fall back to the TDX
+        // firmware path when only `--tdx firmware=...` is supplied.
+        #[cfg(feature = "tdx")]
+        let tdx: Option<TdxConfig> = if let Some(tdx_str) = vm_params.tdx {
+            Some(TdxConfig::parse(tdx_str)?)
+        } else {
+            None
+        };
+
+        #[cfg(feature = "tdx")]
+        let tdx_firmware_fallback: Option<PathBuf> = tdx.as_ref().map(|t| t.firmware.clone());
+        #[cfg(not(feature = "tdx"))]
+        let tdx_firmware_fallback: Option<PathBuf> = None;
+
         #[cfg(not(feature = "igvm"))]
-        let payload_present = vm_params.kernel.is_some() || vm_params.firmware.is_some();
+        let payload_present = vm_params.kernel.is_some()
+            || vm_params.firmware.is_some()
+            || tdx_firmware_fallback.is_some();
 
         #[cfg(feature = "igvm")]
-        let payload_present =
-            vm_params.kernel.is_some() || vm_params.firmware.is_some() || vm_params.igvm.is_some();
+        let payload_present = vm_params.kernel.is_some()
+            || vm_params.firmware.is_some()
+            || vm_params.igvm.is_some()
+            || tdx_firmware_fallback.is_some();
 
         let payload = if payload_present {
             Some(PayloadConfig {
                 kernel: vm_params.kernel.map(PathBuf::from),
                 initramfs: vm_params.initramfs.map(PathBuf::from),
                 cmdline: vm_params.cmdline.map(|s| s.to_string()),
-                firmware: vm_params.firmware.map(PathBuf::from),
+                firmware: vm_params
+                    .firmware
+                    .map(PathBuf::from)
+                    .or(tdx_firmware_fallback),
                 #[cfg(feature = "igvm")]
                 igvm: vm_params.igvm.map(PathBuf::from),
                 #[cfg(feature = "sev_snp")]
@@ -3379,6 +3705,8 @@ impl VmConfig {
             gdb,
             pci_segments,
             platform,
+            #[cfg(feature = "tdx")]
+            tdx,
             tpm,
             preserved_fds: None,
             landlock_enable: vm_params.landlock_enable,
@@ -3478,6 +3806,28 @@ impl VmConfig {
 
     #[cfg(feature = "tdx")]
     pub fn is_tdx_enabled(&self) -> bool {
+        // TDX is enabled if either the legacy `--platform tdx=on` toggle is set
+        // or the new `--tdx firmware=...` knob has been supplied.
+        self.uses_legacy_tdx_q35_platform() || self.tdx.is_some()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_tdx_q35_platform(&self) -> bool {
+        // Compatibility check for the historical `--platform tdx=on` spelling.
+        // Pure `--tdx firmware=...` uses the non-q35/i440fx-compatible
+        // platform so it can be validated independently from q35.
+        self.uses_legacy_tdx_q35_platform()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_tdx_i440fx_platform(&self) -> bool {
+        self.is_tdx_enabled() && !self.uses_tdx_q35_platform()
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn uses_legacy_tdx_q35_platform(&self) -> bool {
+        // Compatibility check for the historical `--platform tdx=on` spelling.
+        // New q35 platform decisions should use `uses_tdx_q35_platform()`.
         self.platform.as_ref().is_some_and(|p| p.tdx)
     }
 
@@ -3514,6 +3864,8 @@ impl Clone for VmConfig {
             numa: self.numa.clone(),
             pci_segments: self.pci_segments.clone(),
             platform: self.platform.clone(),
+            #[cfg(feature = "tdx")]
+            tdx: self.tdx.clone(),
             tpm: self.tpm.clone(),
             preserved_fds: self
                 .preserved_fds
@@ -4718,6 +5070,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             gdb: false,
             pci_segments: None,
             platform: None,
+            #[cfg(feature = "tdx")]
+            tdx: None,
             tpm: None,
             preserved_fds: None,
             net: Some(vec![
@@ -4874,6 +5228,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            option_roms: None,
+            smbios: None,
         }
     }
 
@@ -4962,6 +5318,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             gdb: false,
             pci_segments: None,
             platform: None,
+            #[cfg(feature = "tdx")]
+            tdx: None,
             tpm: None,
             preserved_fds: None,
             landlock_enable: false,
@@ -4971,6 +5329,41 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         valid_config.validate().unwrap();
+
+        #[cfg(feature = "tdx")]
+        {
+            let mut tdx_config = valid_config.clone();
+            tdx_config.tdx = Some(TdxConfig {
+                firmware: PathBuf::from("/path/to/tdvf.fd"),
+                sept_ve_disable: None,
+                debug: false,
+                perfmon: false,
+                mrconfigid: None,
+                mrowner: None,
+                mrownerconfig: None,
+                xfam: None,
+            });
+            assert!(tdx_config.is_tdx_enabled());
+            assert!(!tdx_config.uses_tdx_q35_platform());
+            assert!(!tdx_config.uses_legacy_tdx_q35_platform());
+            assert!(tdx_config.uses_tdx_i440fx_platform());
+            let hv_config = hypervisor::HypervisorVmConfig::from(&tdx_config);
+            assert!(hv_config.tdx_enabled);
+
+            let mut legacy_q35_tdx_config = valid_config.clone();
+            legacy_q35_tdx_config.platform = Some(PlatformConfig {
+                tdx: true,
+                ..platform_fixture()
+            });
+            legacy_q35_tdx_config.payload.as_mut().unwrap().firmware =
+                Some(PathBuf::from("/path/to/tdvf.fd"));
+            assert!(legacy_q35_tdx_config.is_tdx_enabled());
+            assert!(legacy_q35_tdx_config.uses_tdx_q35_platform());
+            assert!(legacy_q35_tdx_config.uses_legacy_tdx_q35_platform());
+            assert!(!legacy_q35_tdx_config.uses_tdx_i440fx_platform());
+            let hv_config = hypervisor::HypervisorVmConfig::from(&legacy_q35_tdx_config);
+            assert!(hv_config.tdx_enabled);
+        }
 
         let mut invalid_config = valid_config.clone();
         invalid_config.serial.mode = ConsoleOutputMode::Tty;

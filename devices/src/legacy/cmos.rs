@@ -13,7 +13,7 @@ use std::{mem, thread};
 #[cfg_attr(target_env = "musl", allow(deprecated))]
 use libc::time_t;
 use libc::{CLOCK_REALTIME, clock_gettime, gmtime_r, timespec, tm};
-use log::{info, warn};
+use log::warn;
 use vm_device::BusDevice;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -23,6 +23,21 @@ const DATA_OFFSET: u64 = 0x1;
 const DATA_LEN: usize = 128;
 
 /// A CMOS/RTC device commonly seen on x86 I/O port 0x70/0x71.
+///
+/// Periodic interrupt delivery (the legacy MC146818 IRQ8 path through
+/// register A/B) is intentionally not implemented here. Since the q35
+/// rework added an emulated HPET (`devices::legacy::hpet`), Linux
+/// programs the HPET into legacy-replacement mode on boot, which
+/// re-routes the RTC clock interrupt through HPET timer 1 instead of
+/// the CMOS chip. The kernel boot log shows this as
+/// `rtc_cmos: ... hpet irqs`. Driving IRQ8 from a userspace timer here
+/// would race the HPET-driven path and produce duplicated ticks, so
+/// the CMOS device is kept timer-free on purpose.
+///
+/// All this device is responsible for is exposing date/time and
+/// memory-size scratch registers to firmware/Linux on reads, plus the
+/// `0x8f` reset shortcut on writes. The HPET (and the LAPIC timer when
+/// HPET is unavailable) provide the actual periodic tick.
 pub struct Cmos {
     index: u8,
     data: [u8; DATA_LEN],
@@ -41,6 +56,18 @@ impl Cmos {
         vcpus_kill_signalled: Option<Arc<AtomicBool>>,
     ) -> Cmos {
         let mut data = [0u8; DATA_LEN];
+
+        // Base memory (first MiB), in KiB. Match QEMU's PC CMOS layout.
+        let base_mem = min(mem_below_4g / 1024, 640);
+        data[0x15] = base_mem as u8;
+        data[0x16] = (base_mem >> 8) as u8;
+
+        // Extended memory between 1 MiB and 64 MiB, in KiB.
+        let ext_mem_kib = min(0xFFFF, mem_below_4g.saturating_sub(1024 * 1024) / 1024);
+        data[0x17] = ext_mem_kib as u8;
+        data[0x18] = (ext_mem_kib >> 8) as u8;
+        data[0x30] = ext_mem_kib as u8;
+        data[0x31] = (ext_mem_kib >> 8) as u8;
 
         // Extended memory from 16 MB to 4 GB in units of 64 KB
         let ext_mem = min(
@@ -76,7 +103,7 @@ impl BusDevice for Cmos {
             INDEX_OFFSET => self.index = data[0],
             DATA_OFFSET => {
                 if self.index == 0x8f && data[0] == 0 {
-                    info!("CMOS reset");
+                    warn!("CMOS reset");
                     self.reset_evt.write(1).unwrap();
                     if let Some(vcpus_kill_signalled) = self.vcpus_kill_signalled.take() {
                         // Spin until we are sure the reset_evt has been handled and that when

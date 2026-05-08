@@ -271,6 +271,7 @@ pub enum PayloadImageType {
 #[derive(Copy, Clone, Default, Debug)]
 pub struct PayloadInfo {
     pub image_type: PayloadImageType,
+    pub reserved: u32,
     pub entry_point: u64,
 }
 
@@ -279,6 +280,20 @@ pub struct PayloadInfo {
 struct TdPayload {
     guid_type: HobGuidType,
     payload_info: PayloadInfo,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct InitramfsInfo {
+    pub address: u64,
+    pub size: u64,
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone, Default, Debug)]
+struct TdInitramfs {
+    guid_type: HobGuidType,
+    initramfs_info: InitramfsInfo,
 }
 
 // SAFETY: data structure only contain a series of integers
@@ -293,6 +308,10 @@ unsafe impl ByteValued for HobGuidType {}
 unsafe impl ByteValued for PayloadInfo {}
 // SAFETY: data structure only contain a series of integers
 unsafe impl ByteValued for TdPayload {}
+// SAFETY: data structure only contain a series of integers
+unsafe impl ByteValued for InitramfsInfo {}
+// SAFETY: data structure only contain a series of integers
+unsafe impl ByteValued for TdInitramfs {}
 
 pub struct TdHob {
     start_offset: u64,
@@ -389,6 +408,22 @@ impl TdHob {
         ram: bool,
         guid_found: bool,
     ) -> Result<(), TdvfError> {
+        // Resource type follows the TDVF spec / EDK2 PI Volume 3:
+        //   0   EFI_RESOURCE_SYSTEM_MEMORY        (private RAM accepted by VMM)
+        //   5   EFI_RESOURCE_MEMORY_RESERVED      (reserved private region)
+        //   7   EFI_RESOURCE_MEMORY_UNACCEPTED    (TDX must accept on first touch)
+        //
+        // Resource attribute mask matches QEMU's
+        // `EFI_RESOURCE_ATTRIBUTE_TDVF_PRIVATE` / `..._TDVF_UNACCEPTED`
+        // (hw/i386/tdvf-hob.h):
+        //   PRESENT (0x1) | INITIALIZED (0x2) | TESTED (0x4) = 0x7.
+        //
+        // The PI 1.7 spec also defines ENCRYPTED (0x0400_0000) and
+        // NEEDS_EARLY_ACCEPT bits, but TDVF as shipped today does not
+        // expect them: setting either one causes existing TDVF builds to
+        // misclassify the region (the early TDVF code only consults
+        // PRESENT/INITIALIZED/TESTED). Stay on QEMU's mask so the same
+        // OVMF/TDVF binary works under both VMMs.
         self.add_resource(
             mem,
             physical_start,
@@ -402,13 +437,9 @@ impl TdHob {
             } else if guid_found {
                 0 /* EFI_RESOURCE_SYSTEM_MEMORY */
             } else {
-                0x5 /*EFI_RESOURCE_MEMORY_RESERVED */
+                0x5 /* EFI_RESOURCE_MEMORY_RESERVED */
             },
-            /* TODO:
-             * QEMU currently fills it in like this:
-             * EFI_RESOURCE_ATTRIBUTE_PRESENT | EFI_RESOURCE_ATTRIBUTE_INITIALIZED | EFI_RESOURCE_ATTRIBUTE_TESTED
-             * which differs from the spec (due to TDVF implementation issue?)
-             */
+            // PRESENT | INITIALIZED | TESTED — see comment above.
             0x7,
         )
     }
@@ -419,14 +450,16 @@ impl TdHob {
         physical_start: u64,
         resource_length: u64,
     ) -> Result<(), TdvfError> {
+        // EFI_RESOURCE_MEMORY_MAPPED_IO with QEMU's
+        // `EFI_RESOURCE_ATTRIBUTE_TDVF_MMIO` mask (hw/i386/tdvf-hob.h):
+        //   PRESENT (0x1) | INITIALIZED (0x2) | UNCACHEABLE (0x400) = 0x403.
+        // Crucially TESTED is *not* set on MMIO, otherwise TDVF would treat
+        // the MMIO HOB the same as private RAM.
         self.add_resource(
             mem,
             physical_start,
             resource_length,
             0x1, /* EFI_RESOURCE_MEMORY_MAPPED_IO */
-            /*
-             * EFI_RESOURCE_ATTRIBUTE_PRESENT | EFI_RESOURCE_ATTRIBUTE_INITIALIZED | EFI_RESOURCE_ATTRIBUTE_UNCACHEABLE
-             */
             0x403,
         )
     }
@@ -514,6 +547,40 @@ impl TdHob {
         mem.write_obj(payload, GuestAddress(self.current_offset))
             .map_err(TdvfError::GuestMemoryWriteHob)?;
         self.update_offset::<TdPayload>();
+
+        Ok(())
+    }
+
+    pub fn add_initramfs(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        initramfs_info: InitramfsInfo,
+    ) -> Result<(), TdvfError> {
+        let initramfs = TdInitramfs {
+            guid_type: HobGuidType {
+                header: HobHeader {
+                    r#type: HobType::GuidExtension,
+                    length: std::mem::size_of::<TdInitramfs>() as u16,
+                    reserved: 0,
+                },
+                // CH_TD_INITRAMFS_INFO_GUID
+                // 0x27c0a33f, 0xa9f5, 0x4fcb, {0x8b, 0xe4, 0xa2, 0x7c, 0x63, 0x4b, 0x16, 0x77}
+                name: EfiGuid {
+                    data1: 0x27c0_a33f,
+                    data2: 0xa9f5,
+                    data3: 0x4fcb,
+                    data4: [0x8b, 0xe4, 0xa2, 0x7c, 0x63, 0x4b, 0x16, 0x77],
+                },
+            },
+            initramfs_info,
+        };
+        info!(
+            "Writing HOB TD_INITRAMFS {:x} {:x?}",
+            self.current_offset, initramfs
+        );
+        mem.write_obj(initramfs, GuestAddress(self.current_offset))
+            .map_err(TdvfError::GuestMemoryWriteHob)?;
+        self.update_offset::<TdInitramfs>();
 
         Ok(())
     }

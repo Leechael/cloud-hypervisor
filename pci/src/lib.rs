@@ -22,7 +22,8 @@ use std::str::FromStr;
 use serde::de::Visitor;
 
 pub use self::bus::{
-    NUM_DEVICE_IDS, PCI_ROOT_DEVICE_ID, PciBus, PciConfigIo, PciConfigMmio, PciRoot, PciRootError,
+    NUM_DEVICE_IDS, PCI_ROOT_DEVICE_ID, PciBus, PciConfigIo, PciConfigMmio, PciLpcBridge,
+    PciQ35Ahci, PciQ35Smbus, PciRoot, PciRootError,
 };
 pub use self::configuration::{
     PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,

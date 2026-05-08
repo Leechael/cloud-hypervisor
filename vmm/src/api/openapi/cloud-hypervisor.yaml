@@ -672,6 +672,8 @@ components:
             $ref: "#/components/schemas/PciSegmentConfig"
         platform:
           $ref: "#/components/schemas/PlatformConfig"
+        tdx:
+          $ref: "#/components/schemas/TdxConfig"
         tpm:
           $ref: "#/components/schemas/TpmConfig"
         landlock_enable:
@@ -800,6 +802,95 @@ components:
         vfio_p2p_dma:
           type: boolean
           default: true
+        smbios:
+          $ref: "#/components/schemas/SmbiosConfig"
+
+    SmbiosConfig:
+      type: object
+      description: |
+        SMBIOS string overrides flowed into the `etc/smbios/smbios-tables`
+        blob built by the fw_cfg device. Every field is optional; when
+        omitted, the historical Cloud Hypervisor defaults are used so that
+        attestation measurements taken before this knob existed remain
+        byte-for-byte stable.
+      properties:
+        bios_vendor:
+          type: string
+        bios_version:
+          type: string
+        bios_release_date:
+          type: string
+          description: SMBIOS Type 0 release date in MM/DD/YYYY format.
+        system_manufacturer:
+          type: string
+        system_product:
+          type: string
+        system_version:
+          type: string
+        system_serial:
+          type: string
+        system_uuid:
+          type: string
+          description: 32 hex chars, optionally with dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+        system_sku:
+          type: string
+        system_family:
+          type: string
+        chassis_manufacturer:
+          type: string
+        chassis_version:
+          type: string
+        chassis_serial:
+          type: string
+        chassis_asset_tag:
+          type: string
+        processor_manufacturer:
+          type: string
+        processor_version:
+          type: string
+        oem_strings:
+          type: array
+          items:
+            type: string
+
+    TdxConfig:
+      type: object
+      required:
+        - firmware
+      description: |
+        TDX guest configuration mirroring QEMU's `-object tdx-guest,...`
+        knobs. When this object is absent but `platform.tdx` is `true`,
+        Cloud Hypervisor uses the historical defaults (`sept_ve_disable=on`,
+        `debug=off`, `perfmon=off`, all `mr*` zeroed, `xfam` derived from
+        guest CPUID 0xd intersected with `caps.supported_xfam`).
+      properties:
+        firmware:
+          type: string
+          description: Path to the TDVF firmware blob.
+        sept_ve_disable:
+          type: boolean
+          description: Set bit 28 (`SEPT_VE_DISABLE`). Defaults to `true` when omitted.
+        debug:
+          type: boolean
+          default: false
+          description: Set bit 0 (`DEBUG`).
+        perfmon:
+          type: boolean
+          default: false
+          description: Set bit 63 (`PERFMON`).
+        mrconfigid:
+          type: string
+          description: 96-hex-char (48-byte) measurement-config seed; dashes/colons accepted.
+        mrowner:
+          type: string
+          description: 96-hex-char (48-byte) measurement-owner seed.
+        mrownerconfig:
+          type: string
+          description: 96-hex-char (48-byte) measurement-owner-config seed.
+        xfam:
+          type: integer
+          format: uint64
+          description: Explicit XFAM override; omit to derive from CPUID.
 
     MemoryZoneConfig:
       required:

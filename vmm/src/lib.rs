@@ -229,7 +229,7 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
     fn from(_value: &VmConfig) -> Self {
         hypervisor::HypervisorVmConfig {
             #[cfg(feature = "tdx")]
-            tdx_enabled: _value.platform.as_ref().is_some_and(|p| p.tdx),
+            tdx_enabled: _value.is_tdx_enabled(),
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled: _value.is_sev_snp_enabled(),
             #[cfg(feature = "sev_snp")]
@@ -1082,6 +1082,8 @@ impl Vmm {
             phys_bits,
             #[cfg(feature = "tdx")]
             false,
+            #[cfg(feature = "tdx")]
+            false,
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
         )
@@ -1693,7 +1695,7 @@ impl Vmm {
                         break 'outer;
                     }
                     EpollDispatch::Reset => {
-                        info!("VM reset event");
+                        warn!("VM reset event");
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         self.vm_reboot().map_err(Error::VmReboot)?;
@@ -2729,6 +2731,8 @@ mod unit_tests {
             gdb: false,
             pci_segments: None,
             platform: None,
+            #[cfg(feature = "tdx")]
+            tdx: None,
             tpm: None,
             preserved_fds: None,
             landlock_enable: false,

@@ -123,10 +123,14 @@ use vm_migration::{
 use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(target_arch = "x86_64")]
+use crate::GuestMemoryMmap;
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
+#[cfg(feature = "tdx")]
+use crate::memory_manager::ram_discard::RamDiscardListener;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
@@ -173,6 +177,27 @@ const WATCHDOG_DEVICE_NAME: &str = "__watchdog";
 const VFIO_DEVICE_NAME_PREFIX: &str = "_vfio";
 const VFIO_USER_DEVICE_NAME_PREFIX: &str = "_vfio_user";
 const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
+
+#[cfg(target_arch = "x86_64")]
+fn cmos_memory_sizes(guest_memory: &GuestMemoryMmap) -> (u64, u64) {
+    let four_gib = arch::layout::RAM_64BIT_START.0;
+    let mut below_4g = 0u64;
+    let mut above_4g = 0u64;
+
+    for region in guest_memory.iter() {
+        let start = region.start_addr().0;
+        let end = start.saturating_add(region.len() as u64);
+
+        if start < four_gib {
+            below_4g += std::cmp::min(end, four_gib) - start;
+        }
+        if end > four_gib {
+            above_4g += end - std::cmp::max(start, four_gib);
+        }
+    }
+
+    (below_4g, above_4g)
+}
 
 /// Errors associated with device manager
 #[derive(Error, Debug)]
@@ -951,10 +976,19 @@ impl MetaVirtioDevice {
 
 #[derive(Default)]
 pub struct AcpiPlatformAddresses {
+    pub pm1_evt_address: Option<GenericAddress>,
+    pub pm1_cnt_address: Option<GenericAddress>,
     pub pm_timer_address: Option<GenericAddress>,
     pub reset_reg_address: Option<GenericAddress>,
     pub sleep_control_reg_address: Option<GenericAddress>,
     pub sleep_status_reg_address: Option<GenericAddress>,
+    /// GPE0 status block address (PMBASE + 0x20 on q35/ICH9). The
+    /// enable half follows at +(gpe0_blk_len/2). Length is reported
+    /// separately via [`Self::gpe0_blk_len`].
+    pub gpe0_blk_address: Option<GenericAddress>,
+    /// Combined length of the GPE0 status + enable halves, in bytes.
+    /// The ACPI FADT exposes this as a single `GPE0_BLK_LEN` field.
+    pub gpe0_blk_len: Option<u8>,
 }
 
 #[cfg(feature = "sev_snp")]
@@ -1208,6 +1242,44 @@ fn use_64bit_bar_for_virtio_device(
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
 }
 
+/// TDX-only: bridges `RamDiscardListener` into a `VfioOps` instance.
+///
+/// On `notify_populate` the listener installs an IOMMU mapping for the
+/// freshly-shared range; on `notify_discard` it tears it down before
+/// the host backing is released. The listener does *not* own the
+/// VFIO container — it merely calls into the existing `VfioOps`
+/// shared with `add_vfio_device`.
+#[cfg(feature = "tdx")]
+struct VfioRamDiscardListener {
+    vfio_ops: Arc<dyn VfioOps>,
+}
+
+#[cfg(feature = "tdx")]
+impl RamDiscardListener for VfioRamDiscardListener {
+    fn notify_populate(&self, gpa: u64, host_va: u64, size: u64) -> std::io::Result<()> {
+        // SAFETY: guest RAM at `host_va` is owned by MemoryManager and
+        // remains mapped for the VM's lifetime; VFIO read/writes via
+        // DMA are otherwise unsynchronized which is the existing
+        // contract for `vfio_dma_map`.
+        unsafe {
+            self.vfio_ops
+                .vfio_dma_map(gpa, size as usize, host_va as *mut u8)
+        }
+        .map_err(|e| {
+            std::io::Error::other(format!("vfio_dma_map gpa={gpa:#x} size={size:#x}: {e}"))
+        })
+    }
+
+    fn notify_discard(&self, gpa: u64, size: u64) {
+        if let Err(e) = self.vfio_ops.vfio_dma_unmap(gpa, size as usize) {
+            warn!(
+                "VfioRamDiscardListener::notify_discard: vfio_dma_unmap gpa={gpa:#x} \
+                 size={size:#x}: {e}"
+            );
+        }
+    }
+}
+
 impl DeviceManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1258,9 +1330,28 @@ impl DeviceManager {
             }
         }
 
-        let start_of_mmio32_area = layout::MEM_32BIT_DEVICES_START.0;
-        let end_of_mmio32_area =
-            layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1;
+        #[cfg(feature = "tdx")]
+        let tdx_q35_platform = config.lock().unwrap().uses_tdx_q35_platform();
+        #[cfg(not(feature = "tdx"))]
+        let tdx_q35_platform = false;
+        #[cfg(feature = "tdx")]
+        let tdx_i440fx_platform = config.lock().unwrap().uses_tdx_i440fx_platform();
+        #[cfg(not(feature = "tdx"))]
+        let tdx_i440fx_platform = false;
+
+        let (start_of_mmio32_area, end_of_mmio32_area, pci_mmconfig_start) = if tdx_q35_platform {
+            (
+                layout::Q35_MEM_32BIT_DEVICES_START.0,
+                layout::Q35_MEM_32BIT_DEVICES_START.0 + layout::Q35_MEM_32BIT_DEVICES_SIZE - 1,
+                layout::Q35_PCI_MMCONFIG_START.0,
+            )
+        } else {
+            (
+                layout::MEM_32BIT_DEVICES_START.0,
+                layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1,
+                layout::PCI_MMCONFIG_START.0,
+            )
+        };
         let pci_mmio32_allocators = create_mmio_allocators(
             start_of_mmio32_area,
             end_of_mmio32_area,
@@ -1328,6 +1419,9 @@ impl DeviceManager {
             &address_manager,
             Arc::clone(&address_manager.pci_mmio32_allocators[0]),
             Arc::clone(&address_manager.pci_mmio64_allocators[0]),
+            pci_mmconfig_start,
+            tdx_q35_platform,
+            tdx_i440fx_platform,
             &pci_irq_slots,
         )?];
 
@@ -1338,6 +1432,9 @@ impl DeviceManager {
                 &address_manager,
                 Arc::clone(&address_manager.pci_mmio32_allocators[i]),
                 Arc::clone(&address_manager.pci_mmio64_allocators[i]),
+                pci_mmconfig_start,
+                tdx_q35_platform,
+                false,
                 &pci_irq_slots,
             )?);
         }
@@ -1520,6 +1617,7 @@ impl DeviceManager {
             self.reset_evt
                 .try_clone()
                 .map_err(DeviceManagerError::EventFd)?,
+            legacy_interrupt_manager.as_ref(),
         )?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1581,9 +1679,87 @@ impl DeviceManager {
 
     #[cfg(feature = "fw_cfg")]
     pub fn create_fw_cfg_device(&mut self) -> Result<(), DeviceManagerError> {
-        let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new(
+        let linuxboot_option_rom_enabled = true;
+        #[cfg(feature = "tdx")]
+        let patch_linux_setup_header = !self.config.lock().unwrap().is_tdx_enabled();
+        #[cfg(not(feature = "tdx"))]
+        let patch_linux_setup_header = true;
+
+        let option_roms: Vec<(String, std::path::PathBuf)> = self
+            .config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .and_then(|p| p.option_roms.as_ref())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let mut parts = entry.splitn(2, ':');
+                        let name = parts.next()?.to_string();
+                        let path = parts.next()?;
+                        if name.is_empty() || path.is_empty() {
+                            return None;
+                        }
+                        Some((name, std::path::PathBuf::from(path)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Translate `PlatformConfig::smbios` into the `devices`-side
+        // `FwCfgSmbiosOverrides` (the `devices` crate does not depend on
+        // `vmm`, so we duplicate the struct shape and copy across). Total
+        // RAM size is fed in for the SMBIOS Type 17 Memory Device entry.
+        #[cfg(target_arch = "x86_64")]
+        let smbios_overrides: Option<devices::legacy::fw_cfg::FwCfgSmbiosOverrides> = self
+            .config
+            .lock()
+            .unwrap()
+            .platform
+            .as_ref()
+            .and_then(|p| p.smbios.as_ref())
+            .map(|s| devices::legacy::fw_cfg::FwCfgSmbiosOverrides {
+                bios_vendor: s.bios_vendor.clone(),
+                bios_version: s.bios_version.clone(),
+                bios_release_date: s.bios_release_date.clone(),
+                system_manufacturer: s.system_manufacturer.clone(),
+                system_product: s.system_product.clone(),
+                system_version: s.system_version.clone(),
+                system_serial: s.system_serial.clone(),
+                system_uuid: s
+                    .system_uuid
+                    .as_deref()
+                    .and_then(crate::config::parse_smbios_uuid_hex),
+                system_sku: s.system_sku.clone(),
+                system_family: s.system_family.clone(),
+                chassis_manufacturer: s.chassis_manufacturer.clone(),
+                chassis_version: s.chassis_version.clone(),
+                chassis_serial: s.chassis_serial.clone(),
+                chassis_asset_tag: s.chassis_asset_tag.clone(),
+                processor_manufacturer: s.processor_manufacturer.clone(),
+                processor_version: s.processor_version.clone(),
+                oem_strings: s.oem_strings.clone(),
+            });
+        #[cfg(target_arch = "x86_64")]
+        let total_memory_size = self.config.lock().unwrap().memory.size;
+
+        #[allow(unused_mut)]
+        let mut fw_cfg_inner = devices::legacy::FwCfg::new_with_options(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
-        )));
+            linuxboot_option_rom_enabled,
+            patch_linux_setup_header,
+            option_roms,
+        );
+        #[cfg(target_arch = "x86_64")]
+        {
+            fw_cfg_inner = fw_cfg_inner.with_total_memory_size(total_memory_size);
+            if let Some(o) = smbios_overrides {
+                fw_cfg_inner = fw_cfg_inner.with_smbios_overrides(o);
+            }
+        }
+        let fw_cfg = Arc::new(Mutex::new(fw_cfg_inner));
 
         self.fw_cfg = Some(fw_cfg.clone());
 
@@ -1925,10 +2101,13 @@ impl DeviceManager {
             .unwrap()
             .vcpus_kill_signalled()
             .clone();
+        let pm1_guest_exit_evt = guest_exit_evt
+            .try_clone()
+            .map_err(DeviceManagerError::EventFd)?;
         let shutdown_device = Arc::new(Mutex::new(devices::AcpiShutdownDevice::new(
             guest_exit_evt,
             reset_evt,
-            vcpus_kill_signalled,
+            vcpus_kill_signalled.clone(),
         )));
 
         self.bus_devices
@@ -1937,6 +2116,14 @@ impl DeviceManager {
         #[cfg(target_arch = "x86_64")]
         {
             let shutdown_pio_address: u16 = 0x600;
+            #[cfg(feature = "tdx")]
+            let tdx_q35_platform = self.config.lock().unwrap().uses_tdx_q35_platform();
+            #[cfg(not(feature = "tdx"))]
+            let tdx_q35_platform = false;
+            #[cfg(feature = "tdx")]
+            let tdx_i440fx_platform = self.config.lock().unwrap().uses_tdx_i440fx_platform();
+            #[cfg(not(feature = "tdx"))]
+            let tdx_i440fx_platform = false;
 
             self.address_manager
                 .allocator
@@ -1945,17 +2132,87 @@ impl DeviceManager {
                 .allocate_io_addresses(Some(GuestAddress(shutdown_pio_address.into())), 0x8, None)
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
-            self.address_manager
-                .io_bus
-                .insert(shutdown_device, shutdown_pio_address.into(), 0x4)
-                .map_err(DeviceManagerError::BusError)?;
+            if tdx_q35_platform || tdx_i440fx_platform {
+                let pm1_evt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Evt::new()));
+                self.bus_devices
+                    .push(Arc::clone(&pm1_evt) as Arc<dyn BusDeviceSync>);
+                info!("Adding PC PM1_EVT io port {shutdown_pio_address:#x}");
+                self.address_manager
+                    .io_bus
+                    .insert(pm1_evt, shutdown_pio_address.into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
+                let pm1_cnt = Arc::new(Mutex::new(devices::legacy::Q35Pm1Cnt::new(
+                    pm1_guest_exit_evt,
+                    vcpus_kill_signalled.clone(),
+                )));
+                self.bus_devices
+                    .push(Arc::clone(&pm1_cnt) as Arc<dyn BusDeviceSync>);
+                info!(
+                    "Adding PC PM1_CNT io port {:#x}",
+                    shutdown_pio_address + 0x4
+                );
+                self.address_manager
+                    .io_bus
+                    .insert(pm1_cnt, (shutdown_pio_address + 0x4).into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
+                self.acpi_platform_addresses.pm1_evt_address =
+                    Some(GenericAddress::io_port_address::<u32>(shutdown_pio_address));
+                self.acpi_platform_addresses.pm1_cnt_address = Some(
+                    GenericAddress::io_port_address::<u16>(shutdown_pio_address + 0x4),
+                );
 
-            self.acpi_platform_addresses.sleep_control_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
-            self.acpi_platform_addresses.sleep_status_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
-            self.acpi_platform_addresses.reset_reg_address =
-                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                if tdx_q35_platform {
+                    // Ich9Pm fills the rest of the q35 PMBASE block (GPE0,
+                    // SMI_*, TCO) starting at PMBASE+0x10. PM1_EVT/CNT and
+                    // PM_TMR remain owned by their existing devices.
+                    let ich9_pm_base: u16 =
+                        shutdown_pio_address + devices::legacy::ICH9_PM_BLOCK_OFFSET;
+                    let ich9_pm_len: u64 = devices::legacy::ICH9_PM_BLOCK_LEN as u64;
+                    self.address_manager
+                        .allocator
+                        .lock()
+                        .unwrap()
+                        .allocate_io_addresses(
+                            Some(GuestAddress(ich9_pm_base.into())),
+                            ich9_pm_len,
+                            None,
+                        )
+                        .ok_or(DeviceManagerError::AllocateIoPort)?;
+                    let ich9_pm = Arc::new(Mutex::new(devices::legacy::Ich9Pm::new()));
+                    self.bus_devices
+                        .push(Arc::clone(&ich9_pm) as Arc<dyn BusDeviceSync>);
+                    info!(
+                        "Adding ICH9 PM block io ports {:#x}-{:#x} (GPE0/SMI/TCO)",
+                        ich9_pm_base,
+                        ich9_pm_base as u64 + ich9_pm_len - 1
+                    );
+                    self.address_manager
+                        .io_bus
+                        .insert(ich9_pm, ich9_pm_base.into(), ich9_pm_len)
+                        .map_err(DeviceManagerError::BusError)?;
+
+                    // Advertise GPE0 to ACPI: the status block starts at
+                    // PMBASE+ICH9_PMIO_GPE0_STS, total len is reported via
+                    // GPE0_BLK_LEN (status + enable halves combined).
+                    let gpe0_addr = shutdown_pio_address + devices::legacy::ICH9_PMIO_GPE0_STS;
+                    self.acpi_platform_addresses.gpe0_blk_address =
+                        Some(GenericAddress::io_port_address::<u32>(gpe0_addr));
+                    self.acpi_platform_addresses.gpe0_blk_len =
+                        Some(devices::legacy::ICH9_PMIO_GPE0_BLK_LEN);
+                }
+            } else {
+                self.address_manager
+                    .io_bus
+                    .insert(shutdown_device, shutdown_pio_address.into(), 0x4)
+                    .map_err(DeviceManagerError::BusError)?;
+
+                self.acpi_platform_addresses.sleep_control_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                self.acpi_platform_addresses.sleep_status_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+                self.acpi_platform_addresses.reset_reg_address =
+                    Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+            }
         }
 
         let ged_irq = self
@@ -2026,7 +2283,11 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn add_legacy_devices(&mut self, reset_evt: EventFd) -> DeviceManagerResult<()> {
+    fn add_legacy_devices(
+        &mut self,
+        reset_evt: EventFd,
+        interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
+    ) -> DeviceManagerResult<()> {
         let vcpus_kill_signalled = self
             .cpu_manager
             .lock()
@@ -2042,23 +2303,73 @@ impl DeviceManager {
         self.bus_devices
             .push(Arc::clone(&i8042) as Arc<dyn BusDeviceSync>);
 
+        info!("Adding i8042 data io port 0x60");
         self.address_manager
             .io_bus
-            .insert(i8042, 0x61, 0x4)
+            .insert(Arc::clone(&i8042) as Arc<dyn BusDeviceSync>, 0x60, 0x1)
             .map_err(DeviceManagerError::BusError)?;
+        info!("Adding i8042 command io port 0x64");
+        self.address_manager
+            .io_bus
+            .insert(i8042, 0x64, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let port61 = Arc::new(Mutex::new(devices::legacy::Port61::new()));
+        self.bus_devices
+            .push(Arc::clone(&port61) as Arc<dyn BusDeviceSync>);
+        info!("Adding port 0x61 system-control latch");
+        self.address_manager
+            .io_bus
+            .insert(port61, 0x61, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+        let pic = Arc::new(Mutex::new(devices::legacy::PicStub::new()));
+        self.bus_devices
+            .push(Arc::clone(&pic) as Arc<dyn BusDeviceSync>);
+        info!("Adding PIC master io ports 0x20-0x21");
+        self.address_manager
+            .io_bus
+            .insert(Arc::clone(&pic) as Arc<dyn BusDeviceSync>, 0x20, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+        info!("Adding PIC slave io ports 0xa0-0xa1");
+        self.address_manager
+            .io_bus
+            .insert(pic, 0xa0, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let pit_interrupt = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 0 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let pit = Arc::new(Mutex::new(devices::legacy::PitStub::new(pit_interrupt)));
+        self.bus_devices
+            .push(Arc::clone(&pit) as Arc<dyn BusDeviceSync>);
+        info!("Adding PIT io ports 0x40-0x43");
+        self.address_manager
+            .io_bus
+            .insert(pit, 0x40, 0x4)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let port92 = Arc::new(Mutex::new(devices::legacy::Port92::new()));
+        self.bus_devices
+            .push(Arc::clone(&port92) as Arc<dyn BusDeviceSync>);
+        info!("Adding port 0x92 system-control latch");
+        self.address_manager
+            .io_bus
+            .insert(port92, 0x92, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+
+        let apm = Arc::new(Mutex::new(devices::legacy::ApmStub::new()));
+        self.bus_devices
+            .push(Arc::clone(&apm) as Arc<dyn BusDeviceSync>);
+        info!("Adding PC APM/SMI_CMD io ports 0xb2-0xb3");
+        self.address_manager
+            .io_bus
+            .insert(apm, 0xb2, 0x2)
+            .map_err(DeviceManagerError::BusError)?;
+
         {
             // Add a CMOS emulated device
-            let mem_size = self
-                .memory_manager
-                .lock()
-                .unwrap()
-                .guest_memory()
-                .memory()
-                .last_addr()
-                .0
-                + 1;
-            let mem_below_4g = std::cmp::min(arch::layout::MEM_32BIT_RESERVED_START.0, mem_size);
-            let mem_above_4g = mem_size.saturating_sub(arch::layout::RAM_64BIT_START.0);
+            let guest_memory = self.memory_manager.lock().unwrap().guest_memory().memory();
+            let (mem_below_4g, mem_above_4g) = cmos_memory_sizes(&guest_memory);
 
             let cmos = Arc::new(Mutex::new(devices::legacy::Cmos::new(
                 mem_below_4g,
@@ -2093,6 +2404,43 @@ impl DeviceManager {
         self.address_manager
             .io_bus
             .insert(debug_port, 0x80, 0x1)
+            .map_err(DeviceManagerError::BusError)?;
+
+        // HPET MMIO at 0xfed0_0000 with 5 interrupt groups: timer 0/1/2
+        // wired to IO-APIC IRQ 2/8/11 plus PIT (IRQ2) and RTC (IRQ8)
+        // aliases for legacy replacement routing.
+        let hpet_t0 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 2 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_t1 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 8 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_t2 = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 11 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_legacy_pit = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 2 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet_legacy_rtc = interrupt_manager
+            .create_group(LegacyIrqGroupConfig { irq: 8 })
+            .map_err(DeviceManagerError::CreateInterruptGroup)?;
+        let hpet = Arc::new(Mutex::new(devices::legacy::Hpet::new(vec![
+            hpet_t0,
+            hpet_t1,
+            hpet_t2,
+            hpet_legacy_pit,
+            hpet_legacy_rtc,
+        ])));
+        self.bus_devices
+            .push(Arc::clone(&hpet) as Arc<dyn BusDeviceSync>);
+        info!(
+            "Adding HPET MMIO at {:#x} ({} bytes)",
+            devices::legacy::HPET_BASE,
+            devices::legacy::HPET_LEN
+        );
+        self.address_manager
+            .mmio_bus
+            .insert(hpet, devices::legacy::HPET_BASE, devices::legacy::HPET_LEN)
             .map_err(DeviceManagerError::BusError)?;
 
         Ok(())
@@ -3184,7 +3532,19 @@ impl DeviceManager {
 
     fn make_virtio_rng_devices(&mut self) -> DeviceManagerResult<()> {
         // Add virtio-rng if required
-        let rng_config = self.config.lock().unwrap().rng.clone();
+        let config = self.config.lock().unwrap();
+        #[cfg(all(feature = "tdx", feature = "fw_cfg", target_arch = "x86_64"))]
+        if config.is_tdx_enabled()
+            && config
+                .payload
+                .as_ref()
+                .is_some_and(|p| p.fw_cfg_config.is_some())
+        {
+            info!("Skipping default virtio-rng for TDX fw_cfg compatibility");
+            return Ok(());
+        }
+        let rng_config = config.rng.clone();
+        drop(config);
         if let Some(rng_path) = rng_config.src.to_str() {
             info!("Creating virtio-rng device: {rng_config:?}");
             let id = String::from(RNG_DEVICE_NAME);
@@ -3884,6 +4244,15 @@ impl DeviceManager {
     ) -> DeviceManagerResult<(PciBdf, String)> {
         // If the passthrough device has not been created yet, it is created
         // here and stored in the DeviceManager structure for future needs.
+        //
+        // The handle returned by `create_passthrough_device` is the
+        // `KVM_DEV_TYPE_VFIO` (or `MSHV_DEV_TYPE_VFIO`) anchor device. It is
+        // forwarded into `VfioContainer::new` / `VfioIommufd::new` below so
+        // that vfio-ioctls can automatically issue `KVM_DEV_VFIO_FILE_ADD`
+        // (group fd in legacy mode, cdev fd in iommufd mode) and the matching
+        // `KVM_DEV_VFIO_FILE_DEL` on teardown. This is what lets KVM track
+        // IOMMU pinning for VFIO ranges (correctness on stock hosts, and
+        // required for TDX private-memory bookkeeping).
         if self.passthrough_device.is_none() {
             self.passthrough_device = Some(
                 self.address_manager
@@ -4000,24 +4369,57 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::VfioCreate)?;
 
         if needs_dma_mapping {
-            // Register DMA mapping in IOMMU.
-            // Do not register virtio-mem regions, as they are handled directly by
-            // virtio-mem device itself.
-            for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
-                for region in zone.regions() {
-                    // vfio_dma_map is unsound and ought to be marked as unsafe
-                    #[allow(unused_unsafe)]
-                    // SAFETY: GuestMemoryMmap guarantees that region points
-                    // to len bytes of valid memory starting at as_ptr()
-                    // that will only be freed with munmap().
-                    unsafe {
-                        vfio_ops.vfio_dma_map(
-                            region.start_addr().raw_value(),
-                            region.len() as usize,
-                            region.as_ptr(),
-                        )
+            // TDX-only: when guest_memfd is in use, RAM starts fully
+            // private; eager DMA-mapping every region would either
+            // fail (private pages can't be IOMMU-mapped) or pin pages
+            // the host can't access. Instead, register a
+            // RamDiscardListener that maps/unmaps in lockstep with
+            // share/private transitions. Non-TDX guests keep the
+            // existing eager-mapping behavior.
+            #[cfg(feature = "tdx")]
+            let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();
+            #[cfg(not(feature = "tdx"))]
+            let tdx_enabled = false;
+
+            if !tdx_enabled {
+                // Register DMA mapping in IOMMU.
+                // Do not register virtio-mem regions, as they are handled directly by
+                // virtio-mem device itself.
+                for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
+                    for region in zone.regions() {
+                        // vfio_dma_map is unsound and ought to be marked as unsafe
+                        #[allow(unused_unsafe)]
+                        // SAFETY: GuestMemoryMmap guarantees that region points
+                        // to len bytes of valid memory starting at as_ptr()
+                        // that will only be freed with munmap().
+                        unsafe {
+                            vfio_ops.vfio_dma_map(
+                                region.start_addr().raw_value(),
+                                region.len() as usize,
+                                region.as_ptr(),
+                            )
+                        }
+                        .map_err(DeviceManagerError::VfioDmaMap)?;
                     }
-                    .map_err(DeviceManagerError::VfioDmaMap)?;
+                }
+            } else {
+                #[cfg(feature = "tdx")]
+                {
+                    let listener: Arc<dyn RamDiscardListener> = Arc::new(VfioRamDiscardListener {
+                        vfio_ops: Arc::clone(&vfio_ops),
+                    });
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .register_ram_discard_listener(listener)
+                        .map_err(|e| {
+                            DeviceManagerError::VfioDmaMap(vfio_ioctls::VfioError::IommuDmaMap(
+                                vmm_sys_util::errno::Error::new(
+                                    e.raw_os_error().unwrap_or(libc::EIO),
+                                ),
+                            ))
+                        })?;
+                    info!("TDX: registered VfioRamDiscardListener instead of eager DMA-map");
                 }
             }
 
@@ -5478,10 +5880,12 @@ impl Aml for DeviceManager {
 
         let mut pci_scan_methods = Vec::new();
         for i in 0..self.pci_segments.len() {
-            pci_scan_methods.push(aml::MethodCall::new(
-                format!("\\_SB_.PC{i:02X}.PCNT").as_str().into(),
-                vec![],
-            ));
+            let pci_name = if i == 0 {
+                "\\_SB_.PCI0.PCNT".into()
+            } else {
+                format!("\\_SB_.PC{i:02X}.PCNT").as_str().into()
+            };
+            pci_scan_methods.push(aml::MethodCall::new(pci_name, vec![]));
         }
         let mut pci_scan_inner: Vec<&dyn Aml> = Vec::new();
         for method in &pci_scan_methods {
@@ -5627,6 +6031,7 @@ impl Aml for DeviceManager {
                     ),
                     &aml::Name::new("_UID".into(), &aml::ZERO),
                     &aml::Name::new("_DDN".into(), &"COM1"),
+                    &aml::Name::new("_STA".into(), &0x0Fu8),
                     &aml::Name::new(
                         "_CRS".into(),
                         &aml::ResourceTemplate::new(vec![
@@ -5646,7 +6051,11 @@ impl Aml for DeviceManager {
             .to_aml_bytes(sink);
         }
 
-        aml::Name::new("_S5_".into(), &aml::Package::new(vec![&5u8])).to_aml_bytes(sink);
+        aml::Name::new(
+            "_S5_".into(),
+            &aml::Package::new(vec![&0u8, &0u8, &0u8, &0u8]),
+        )
+        .to_aml_bytes(sink);
 
         aml::Device::new(
             "_SB_.PWRB".into(),
@@ -5890,6 +6299,36 @@ impl Drop for DeviceManager {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cmos_memory_sizes_with_default_gap() {
+        let guest_memory = GuestMemoryMmap::from_ranges(&[(
+            GuestAddress(0),
+            arch::layout::MEM_32BIT_RESERVED_START.0 as usize,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            (arch::layout::MEM_32BIT_RESERVED_START.0, 0),
+            cmos_memory_sizes(&guest_memory)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cmos_memory_sizes_with_q35_lowmem_gap() {
+        let guest_memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), arch::layout::Q35_LOWMEM_END.0 as usize),
+            (GuestAddress(0x1_0000_0000), 0x4000_0000),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            (arch::layout::Q35_LOWMEM_END.0, 0x4000_0000),
+            cmos_memory_sizes(&guest_memory)
+        );
+    }
 
     #[test]
     fn test_hotplugged_block_devices_use_64bit_bars() {

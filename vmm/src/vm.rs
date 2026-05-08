@@ -32,7 +32,7 @@ use arch::layout::{KVM_IDENTITY_MAP_START, KVM_TSS_START};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY;
 #[cfg(feature = "tdx")]
-use arch::x86_64::tdx::TdvfSection;
+use arch::x86_64::tdx::{TdvfSection, TdvfSectionType};
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits};
 use devices::AcpiNotificationFlags;
 #[cfg(target_arch = "aarch64")]
@@ -75,7 +75,7 @@ use vm_device::Bus;
 #[cfg(feature = "tdx")]
 use vm_memory::GuestMemory;
 #[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
+use vm_memory::{ByteValued, GuestMemoryRegion, ReadVolatile};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
@@ -322,6 +322,10 @@ pub enum Error {
     TdxFirmwareMissing,
 
     #[cfg(feature = "tdx")]
+    #[error("Invalid TDX attribute: {0}")]
+    InvalidTdxAttribute(String),
+
+    #[cfg(feature = "tdx")]
     #[error("Invalid TDX payload type")]
     InvalidPayloadType,
 
@@ -441,6 +445,11 @@ struct VmOpsHandler {
     #[cfg(target_arch = "x86_64")]
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
+    /// TDX-only: weak handle to the MemoryManager so the hypervisor
+    /// can drive RamDiscardListener notifications via VmOps without
+    /// taking a strong reference cycle.
+    #[cfg(feature = "tdx")]
+    memory_manager: std::sync::Weak<Mutex<MemoryManager>>,
 }
 
 impl VmOps for VmOpsHandler {
@@ -502,6 +511,18 @@ impl VmOps for VmOpsHandler {
             _ => {}
         }
         Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn notify_memory_state_change(&self, gpa: u64, size: u64, private: bool) {
+        if let Some(mm) = self.memory_manager.upgrade() {
+            // Lock is uncontended on the vcpu thread; held briefly to
+            // dispatch into the listener registry. Listeners do their
+            // own synchronization (e.g. VFIO ioctl).
+            mm.lock()
+                .unwrap()
+                .notify_memory_state_change(gpa, size, private);
+        }
     }
 }
 
@@ -599,6 +620,8 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             io_bus: io_bus.clone(),
             mmio_bus: mmio_bus.clone(),
+            #[cfg(feature = "tdx")]
+            memory_manager: Arc::downgrade(&memory_manager),
         });
 
         // Create CPU manager
@@ -810,12 +833,77 @@ impl Vm {
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
     ) -> Result<()> {
         if config.lock().unwrap().is_tdx_enabled() {
+            #[cfg(target_arch = "x86_64")]
+            let cpuid = if vm.tdx_init_uses_boot_vcpu_cpuid() {
+                cpu_manager.lock().unwrap().tdx_init_cpuid()
+            } else {
+                cpu_manager.lock().unwrap().common_cpuid()
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let cpuid = cpu_manager.lock().unwrap().common_cpuid();
             let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
-            vm.tdx_init(&cpuid, max_vcpus)
+
+            let tdx_attrs = {
+                let cfg = config.lock().unwrap();
+                Self::build_tdx_attributes(cfg.tdx.as_ref())?
+            };
+
+            vm.tdx_init(&cpuid, max_vcpus, &tdx_attrs)
                 .map_err(Error::InitializeTdxVm)?;
         }
         Ok(())
+    }
+
+    /// Build a `hypervisor::TdxAttributes` from the optional `vmm` `TdxConfig`.
+    ///
+    /// When `cfg` is `None` this returns the defaults that match the pre-P1.2
+    /// hard-coded behaviour (sept_ve_disable on, mr* zero, xfam derived) so
+    /// the byte payload to `KVM_TDX_INIT_VM` is unchanged for callers that
+    /// only set `--platform tdx=on --firmware <path>`.
+    #[cfg(feature = "tdx")]
+    fn build_tdx_attributes(
+        cfg: Option<&crate::vm_config::TdxConfig>,
+    ) -> Result<hypervisor::TdxAttributes> {
+        use crate::vm_config::TdxConfig;
+        fn parse_seed(name: &str, hex: &str) -> Result<[u8; 48]> {
+            let stripped: String = hex
+                .chars()
+                .filter(|c| !matches!(*c, '-' | ':' | ' ' | '_'))
+                .collect();
+            if stripped.len() != 96 || !stripped.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(Error::InvalidTdxAttribute(format!(
+                    "{name}: expected 96 hex chars, got {}",
+                    stripped.len()
+                )));
+            }
+            let mut out = [0u8; 48];
+            for (i, byte) in out.iter_mut().enumerate() {
+                let hi = u8::from_str_radix(&stripped[i * 2..i * 2 + 1], 16)
+                    .map_err(|e| Error::InvalidTdxAttribute(format!("{name}: {e}")))?;
+                let lo = u8::from_str_radix(&stripped[i * 2 + 1..i * 2 + 2], 16)
+                    .map_err(|e| Error::InvalidTdxAttribute(format!("{name}: {e}")))?;
+                *byte = (hi << 4) | lo;
+            }
+            Ok(out)
+        }
+        let mut attrs = hypervisor::TdxAttributes::default();
+        let Some(cfg): Option<&TdxConfig> = cfg else {
+            return Ok(attrs);
+        };
+        attrs.sept_ve_disable = cfg.sept_ve_disable.unwrap_or(true);
+        attrs.debug = cfg.debug;
+        attrs.perfmon = cfg.perfmon;
+        if let Some(s) = cfg.mrconfigid.as_deref() {
+            attrs.mrconfigid = parse_seed("mrconfigid", s)?;
+        }
+        if let Some(s) = cfg.mrowner.as_deref() {
+            attrs.mrowner = parse_seed("mrowner", s)?;
+        }
+        if let Some(s) = cfg.mrownerconfig.as_deref() {
+            attrs.mrownerconfig = parse_seed("mrownerconfig", s)?;
+        }
+        attrs.xfam = cfg.xfam;
+        Ok(attrs)
     }
 
     /// Create and configure the device manager.
@@ -936,6 +1024,27 @@ impl Vm {
             )?;
         }
 
+        #[cfg(feature = "tdx")]
+        let tdx_enabled = config.lock().unwrap().is_tdx_enabled();
+        #[cfg(not(feature = "tdx"))]
+        let tdx_enabled = false;
+
+        if tdx_enabled {
+            let vcpus = cpu_manager
+                .lock()
+                .unwrap()
+                .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
+                .map_err(Error::CpuManager)?;
+            for vcpu in vcpus {
+                let mut vcpu = vcpu.lock().unwrap();
+                cpu_manager
+                    .lock()
+                    .unwrap()
+                    .configure_vcpu(&mut vcpu, None)
+                    .map_err(Error::CpuManager)?;
+            }
+        }
+
         // Allocate address space for non-SEV-SNP guests
         memory_manager
             .lock()
@@ -958,11 +1067,13 @@ impl Vm {
         };
 
         // Create boot vCPUs
-        cpu_manager
-            .lock()
-            .unwrap()
-            .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
-            .map_err(Error::CpuManager)?;
+        if !tdx_enabled {
+            cpu_manager
+                .lock()
+                .unwrap()
+                .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
+                .map_err(Error::CpuManager)?;
+        }
 
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
@@ -1099,6 +1210,11 @@ impl Vm {
             .create_interrupt_controller()
             .map_err(Error::DeviceManager)?;
 
+        #[cfg(target_arch = "x86_64")]
+        if let Err(e) = vm.create_pit2() {
+            warn!("Failed to create in-kernel PIT: {e}");
+        }
+
         vm.init().map_err(Error::InitializeVm)?;
 
         device_manager
@@ -1132,6 +1248,16 @@ impl Vm {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "fw_cfg")]
+    fn payload_uses_fw_cfg(payload: &PayloadConfig) -> bool {
+        payload.fw_cfg_config.is_some()
+    }
+
+    #[cfg(not(feature = "fw_cfg"))]
+    fn payload_uses_fw_cfg(_payload: &PayloadConfig) -> bool {
+        false
     }
 
     #[cfg(feature = "fw_cfg")]
@@ -1330,6 +1456,12 @@ impl Vm {
         } else {
             vm_config.lock().unwrap().is_tdx_enabled()
         };
+        #[cfg(feature = "tdx")]
+        let tdx_q35_platform = if snapshot.is_some() {
+            false
+        } else {
+            vm_config.lock().unwrap().uses_tdx_q35_platform()
+        };
 
         #[cfg(feature = "igvm")]
         let igvm_file = {
@@ -1385,6 +1517,8 @@ impl Vm {
                     phys_bits,
                     #[cfg(feature = "tdx")]
                     tdx_enabled,
+                    #[cfg(feature = "tdx")]
+                    tdx_q35_platform,
                     None,
                     Default::default(),
                 )
@@ -1451,6 +1585,64 @@ impl Vm {
             .map_err(Error::InitramfsRead)?;
 
         info!("Initramfs loaded: address = 0x{:x}", address.0);
+        Ok(arch::InitramfsConfig { address, size })
+    }
+
+    #[cfg(feature = "tdx")]
+    fn load_tdx_initramfs(
+        &mut self,
+        guest_mem: &GuestMemoryMmap,
+        sections: &[TdvfSection],
+    ) -> Result<arch::InitramfsConfig> {
+        let initramfs = self.initramfs.as_mut().unwrap();
+        let size: usize = initramfs
+            .seek(SeekFrom::End(0))
+            .map_err(Error::InitramfsLoad)?
+            .try_into()
+            .unwrap();
+        initramfs.rewind().map_err(Error::InitramfsLoad)?;
+
+        let mut sorted_sections = sections.to_vec();
+        sorted_sections.retain(|section| {
+            matches!(
+                section.r#type,
+                TdvfSectionType::TdHob | TdvfSectionType::TempMem
+            )
+        });
+
+        let max_initramfs_addr = Vm::hob_memory_resources(sorted_sections, guest_mem)
+            .into_iter()
+            .filter(|(_, _, ram)| *ram)
+            .filter_map(|(start, region_size, _)| {
+                if start >= u32::MAX as u64 + 1 {
+                    return None;
+                }
+
+                let end = start.saturating_add(region_size).min(u32::MAX as u64 + 1);
+                if end <= start {
+                    return None;
+                }
+
+                Some((start, end))
+            })
+            .rev()
+            .find_map(|(start, end)| {
+                let available = end.saturating_sub(start);
+                (available >= size as u64).then_some(end)
+            })
+            .ok_or(Error::InitramfsAddress(arch::Error::InitramfsAddress))?;
+
+        let address = max_initramfs_addr
+            .checked_sub(size as u64)
+            .map(|addr| addr & !0xfffu64)
+            .ok_or(Error::InitramfsAddress(arch::Error::InitramfsAddress))?;
+        let address = GuestAddress(address);
+
+        guest_mem
+            .read_volatile_from(address, initramfs, size)
+            .map_err(Error::InitramfsRead)?;
+
+        info!("TDX initramfs loaded: address = 0x{:x}", address.0);
         Ok(arch::InitramfsConfig { address, size })
     }
 
@@ -1660,7 +1852,9 @@ impl Vm {
             }
         }
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), None) | (Some(firmware), Some(_))
+                if Self::payload_uses_fw_cfg(payload) =>
+            {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_kernel(firmware, None, memory_manager)
             }
@@ -1682,7 +1876,9 @@ impl Vm {
         memory_manager: Arc<Mutex<MemoryManager>>,
     ) -> Result<EntryPoint> {
         match (&payload.firmware, &payload.kernel) {
-            (Some(firmware), None) => {
+            (Some(firmware), None) | (Some(firmware), Some(_))
+                if Self::payload_uses_fw_cfg(payload) =>
+            {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
                 Self::load_firmware(&firmware, memory_manager)
             }
@@ -2458,20 +2654,38 @@ impl Vm {
             .as_ref()
             .unwrap()
             .boot_guest_memory();
+        // Collect TDVF sections that need allocation and merge overlapping ranges
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
         for section in sections {
-            // No need to allocate if the section falls within guest RAM ranges
-            if boot_guest_memory.address_in_range(GuestAddress(section.address)) {
+            if !boot_guest_memory.address_in_range(GuestAddress(section.address)) {
+                ranges.push((section.address, section.address + section.size as u64));
+            } else {
                 info!(
                     "Not allocating TDVF Section: {section:x?} since it is already part of guest RAM"
                 );
-                continue;
             }
-
-            info!("Allocating TDVF Section: {section:x?}");
+        }
+        // Sort by start address and merge overlapping ranges
+        ranges.sort_by_key(|r| r.0);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                } else {
+                    merged.push((start, end));
+                }
+            } else {
+                merged.push((start, end));
+            }
+        }
+        for (start, end) in merged {
+            let size = (end - start) as usize;
+            info!("Allocating merged TDVF range: {start:#x} - {end:#x}, size={size:#x}");
             self.memory_manager
                 .lock()
                 .unwrap()
-                .add_ram_region(GuestAddress(section.address), section.size as usize)
+                .add_ram_region(GuestAddress(start), size)
                 .map_err(Error::AllocatingTdvfMemory)?;
         }
 
@@ -2493,7 +2707,18 @@ impl Vm {
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
         let mut payload_info = None;
+        let mut initramfs_info = None;
         let mut hob_offset = None;
+        #[cfg(feature = "fw_cfg")]
+        let fw_cfg_enabled = self
+            .config
+            .lock()
+            .unwrap()
+            .payload
+            .as_ref()
+            .is_some_and(|p| p.fw_cfg_config.is_some());
+        #[cfg(not(feature = "fw_cfg"))]
+        let fw_cfg_enabled = false;
         for section in sections {
             info!("Populating TDVF Section: {section:x?}");
             match section.r#type {
@@ -2550,6 +2775,7 @@ impl Vm {
                         // the HOB.
                         payload_info = Some(PayloadInfo {
                             image_type: PayloadImageType::BzImage,
+                            reserved: 0,
                             entry_point: section.address,
                         });
                     }
@@ -2569,11 +2795,24 @@ impl Vm {
             }
         }
 
+        if self.initramfs.is_some() && !fw_cfg_enabled {
+            let initramfs_config = self.load_tdx_initramfs(&boot_guest_memory, sections)?;
+            initramfs_info = Some(InitramfsInfo {
+                address: initramfs_config.address.0,
+                size: initramfs_config.size as u64,
+            });
+        }
+
         // Generate HOB
         let mut hob = TdHob::start(hob_offset.unwrap());
 
         let mut sorted_sections = sections.to_vec();
-        sorted_sections.retain(|section| matches!(section.r#type, TdvfSectionType::TempMem));
+        sorted_sections.retain(|section| {
+            matches!(
+                section.r#type,
+                TdvfSectionType::TdHob | TdvfSectionType::TempMem
+            )
+        });
 
         sorted_sections.sort_by_key(|section| section.address);
         sorted_sections.reverse();
@@ -2583,49 +2822,28 @@ impl Vm {
                 .map_err(Error::PopulateHob)?;
         }
 
-        // MMIO regions
-        hob.add_mmio_resource(
-            &mem,
-            arch::layout::MEM_32BIT_DEVICES_START.raw_value(),
-            arch::layout::APIC_START.raw_value()
-                - arch::layout::MEM_32BIT_DEVICES_START.raw_value(),
-        )
-        .map_err(Error::PopulateHob)?;
-        let start_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .start_of_device_area()
-            .raw_value();
-        let end_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .end_of_device_area()
-            .raw_value();
-        hob.add_mmio_resource(
-            &mem,
-            start_of_device_area,
-            end_of_device_area - start_of_device_area,
-        )
-        .map_err(Error::PopulateHob)?;
+        if !fw_cfg_enabled {
+            // Loop over the ACPI tables and copy them to the HOB.
+            for acpi_table in crate::acpi::create_acpi_tables_tdx(
+                &self.device_manager.lock().unwrap(),
+                &self.cpu_manager.lock().unwrap(),
+                &self.memory_manager.lock().unwrap(),
+                &self.numa_nodes,
+            ) {
+                hob.add_acpi_table(&mem, acpi_table.as_slice())
+                    .map_err(Error::PopulateHob)?;
+            }
 
-        // Loop over the ACPI tables and copy them to the HOB.
+            // If a payload info has been created, let's insert it into the HOB.
+            if let Some(payload_info) = payload_info {
+                hob.add_payload(&mem, payload_info)
+                    .map_err(Error::PopulateHob)?;
+            }
 
-        for acpi_table in crate::acpi::create_acpi_tables_tdx(
-            &self.device_manager.lock().unwrap(),
-            &self.cpu_manager.lock().unwrap(),
-            &self.memory_manager.lock().unwrap(),
-            &self.numa_nodes,
-        ) {
-            hob.add_acpi_table(&mem, acpi_table.as_slice())
-                .map_err(Error::PopulateHob)?;
-        }
-
-        // If a payload info has been created, let's insert it into the HOB.
-        if let Some(payload_info) = payload_info {
-            hob.add_payload(&mem, payload_info)
-                .map_err(Error::PopulateHob)?;
+            if let Some(initramfs_info) = initramfs_info {
+                hob.add_initramfs(&mem, initramfs_info)
+                    .map_err(Error::PopulateHob)?;
+            }
         }
 
         hob.finish(&mem).map_err(Error::PopulateHob)?;
@@ -2639,23 +2857,54 @@ impl Vm {
         let mem = guest_memory.memory();
 
         for section in sections {
-            let size = section.size.try_into().unwrap();
+            let section_type = section.r#type;
+            let section_address = section.address;
+            let section_size = section.size;
+            let section_attributes = section.attributes;
+            let size = section_size.try_into().unwrap();
+
+            let host_ptr = if matches!(
+                section_type,
+                TdvfSectionType::TdHob | TdvfSectionType::TempMem
+            ) {
+                // Allocate page-aligned host buffer for INIT_MEM_REGION
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                        -1,
+                        0,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(Error::AllocatingTdvfMemory(
+                        crate::memory_manager::Error::MemoryRangeAllocation,
+                    ));
+                }
+                if matches!(section_type, TdvfSectionType::TdHob) {
+                    let slice = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, size) };
+                    mem.read_slice(slice, GuestAddress(section_address))
+                        .map_err(Error::FirmwareLoad)?;
+                }
+                ptr as *mut u8
+            } else {
+                virtio_devices::get_host_address_range(&*mem, GuestAddress(section_address), size)
+                    .unwrap()
+            };
+
             // SAFETY: get_host_address_range does proper bounds checking
             unsafe {
-                self.vm.tdx_init_memory_region(
-                    virtio_devices::get_host_address_range(
-                        &*mem,
-                        GuestAddress(section.address),
-                        size,
-                    )
-                    .unwrap(),
-                    section.address,
+                self.cpu_manager.lock().unwrap().tdx_init_memory_region(
+                    host_ptr,
+                    section_address,
                     size,
                     /* TDVF_SECTION_ATTRIBUTES_EXTENDMR */
-                    section.attributes == 1,
+                    section_attributes == 1,
                 )
             }
-            .map_err(Error::InitializeTdxMemoryRegion)?;
+            .map_err(Error::CpuManager)?;
         }
 
         Ok(())
@@ -2795,6 +3044,11 @@ impl Vm {
         // Configure the vcpus that have been created
         let vcpus = self.cpu_manager.lock().unwrap().vcpus();
         for vcpu in vcpus {
+            #[cfg(feature = "tdx")]
+            if tdx_enabled {
+                continue;
+            }
+
             let guest_memory = &self.memory_manager.lock().as_ref().unwrap().guest_memory();
             let boot_setup = entry_point.map(|e| (e, guest_memory));
             let mut vcpu = vcpu.lock().unwrap();
