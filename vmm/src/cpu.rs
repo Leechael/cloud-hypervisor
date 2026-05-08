@@ -1130,19 +1130,42 @@ impl CpuManager {
         let cpu_vendor = hypervisor.get_cpu_vendor();
 
         #[cfg(target_arch = "x86_64")]
-        if config.features.amx || {
-            #[cfg(feature = "tdx")]
-            {
-                tdx_enabled
+        {
+            let amx_explicit = config.features.amx;
+            let amx_implicit_for_tdx = {
+                #[cfg(feature = "tdx")]
+                {
+                    tdx_enabled && !amx_explicit
+                }
+                #[cfg(not(feature = "tdx"))]
+                {
+                    false
+                }
+            };
+            if amx_explicit || amx_implicit_for_tdx {
+                match hypervisor.enable_amx_state_components() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Fail-loud only when the user explicitly opted into
+                        // AMX. The TDX path implicitly requests AMX even on
+                        // CPUs that do not expose it (e.g. Sierra Forest /
+                        // Crestmont E-core SKUs); on such hosts the TDX
+                        // module will not advertise AMX in guest CPUID, so
+                        // the AMX request is harmless to skip — fall back
+                        // gracefully rather than refusing to boot the VM.
+                        if amx_explicit {
+                            return Err(Error::AmxEnable(e.into()));
+                        }
+                        warn!(
+                            "TDX implicit AMX enable failed; host CPU likely \
+                             does not advertise AMX (e.g. Sierra Forest \
+                             E-core). Continuing without guest AMX — TDX \
+                             module will not expose AMX in guest CPUID. \
+                             err={e:#}"
+                        );
+                    }
+                }
             }
-            #[cfg(not(feature = "tdx"))]
-            {
-                false
-            }
-        } {
-            hypervisor
-                .enable_amx_state_components()
-                .map_err(|e| Error::AmxEnable(e.into()))?;
         }
 
         let proximity_domain_per_cpu: BTreeMap<u32, u32> = {
@@ -1242,6 +1265,23 @@ impl CpuManager {
 
     #[cfg(all(target_arch = "x86_64", feature = "tdx"))]
     fn tdx_shared_gpa_mask(&self) -> u64 {
+        // On legacy TDX uapi hosts, the guest physical-address width KVM
+        // commits is constrained by `caps.supported_gpaw`: bit 1 set means
+        // 5-level (52-bit GPA, shared bit = 51); otherwise 4-level (48-bit
+        // GPA, shared bit = 47). Sierra Forest E-core SKUs report
+        // `supported_gpaw = 0x1` even though host CPUID 0x80000008 advertises
+        // 52 phys bits — so reading host CPUID directly here gives the wrong
+        // shared bit, causing TDG.VP.VMCALL<MapGPA> from the guest to be
+        // misclassified as private.
+        const TDX_CAP_GPAW_52: u32 = 1 << 1;
+        if let Ok(Some(gpaw)) = self.hypervisor.tdx_legacy_caps_supported_gpaw() {
+            return if (gpaw & TDX_CAP_GPAW_52) != 0 {
+                1u64 << 51
+            } else {
+                1u64 << 47
+            };
+        }
+
         let guest_phys_bits = self
             .cpuid
             .iter()

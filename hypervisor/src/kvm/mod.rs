@@ -616,6 +616,33 @@ fn tdx_legacy_cpuid_entry_allowed(entry: &kvm_bindings::kvm_cpuid_entry2) -> boo
     }
 }
 
+/// AMX-related CPUID leaves (0x1d AMX_TILE info, 0x1e AMX_TMUL info) must
+/// only be exposed to a TDX guest when the host's TDX module advertises AMX
+/// in `xfam_fixed0` (bits 17 = TILECFG, 18 = TILEDATA). Sierra Forest
+/// E-core SKUs support TDX but do not advertise AMX; KVM rejects
+/// `KVM_TDX_INIT_VM` with `EINVAL` if these leaves are present anyway.
+#[cfg(feature = "tdx")]
+fn tdx_legacy_caps_supports_amx(caps: &TdxCapabilitiesLegacy) -> bool {
+    const XFAM_AMX_TILECFG: u64 = 1 << 17;
+    const XFAM_AMX_TILEDATA: u64 = 1 << 18;
+    const XFAM_AMX_MASK: u64 = XFAM_AMX_TILECFG | XFAM_AMX_TILEDATA;
+    (caps.xfam_fixed0 & XFAM_AMX_MASK) == XFAM_AMX_MASK
+}
+
+#[cfg(feature = "tdx")]
+fn tdx_legacy_cpuid_entry_allowed_with_caps(
+    caps: &TdxCapabilitiesLegacy,
+    entry: &kvm_bindings::kvm_cpuid_entry2,
+) -> bool {
+    if !tdx_legacy_cpuid_entry_allowed(entry) {
+        return false;
+    }
+    match entry.function {
+        0x0000_001d | 0x0000_001e => tdx_legacy_caps_supports_amx(caps),
+        _ => true,
+    }
+}
+
 #[cfg(feature = "tdx")]
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum TdxCpuidReg {
@@ -914,6 +941,33 @@ fn tdx_legacy_filter_cpuid_entry(
         0x4000_0000 => {
             entry.eax = 0x4000_0001;
         }
+        // Kernel TDX module's setup_tdparams_eptp_controls() validates the
+        // guest physical-address-bits field (CPUID 0x80000008.eax[23:16]):
+        // it must equal 48 (4-level EPT) or 52 (5-level EPT), and 52 is
+        // only accepted when the host supports 5-level EPT. The TDX module
+        // exposes this via caps.supported_gpaw — bit 0 = 4-level allowed,
+        // bit 1 = 5-level allowed. Force the field down to 48 when the
+        // host (e.g. Sierra Forest 6710E) reports `supported_gpaw == 0x1`,
+        // otherwise KVM_TDX_INIT_VM returns EINVAL.
+        0x8000_0008 => {
+            // TDX_CAP_GPAW_48 = bit 0, TDX_CAP_GPAW_52 = bit 1 — see
+            // arch/x86/include/uapi/asm/kvm.h in the kernel TDX uapi.
+            const GPAW_4_LEVEL: u32 = 1 << 0;
+            const GPAW_5_LEVEL: u32 = 1 << 1;
+            let host_supports_5lvl = (caps.supported_gpaw & GPAW_5_LEVEL) != 0;
+            let host_supports_4lvl = (caps.supported_gpaw & GPAW_4_LEVEL) != 0;
+            let guest_pa = (entry.eax >> 16) & 0xff;
+            let target_guest_pa: u32 = if host_supports_5lvl && guest_pa >= 52 {
+                52
+            } else if host_supports_4lvl {
+                48
+            } else {
+                // Neither bit set in caps; preserve host value and let KVM
+                // surface the error explicitly.
+                guest_pa
+            };
+            entry.eax = (entry.eax & 0xff00_ffff) | ((target_guest_pa & 0xff) << 16);
+        }
         _ => {}
     }
 }
@@ -926,7 +980,7 @@ fn tdx_legacy_cpuid_entries(
     cpuid
         .iter()
         .map(|entry| (*entry).into())
-        .filter(tdx_legacy_cpuid_entry_allowed)
+        .filter(|entry| tdx_legacy_cpuid_entry_allowed_with_caps(caps, entry))
         .map(|mut entry| {
             tdx_legacy_filter_cpuid_entry(caps, &mut entry);
             entry
@@ -3010,6 +3064,26 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
 
         Ok(data)
+    }
+
+    fn tdx_legacy_caps_supported_gpaw(&self) -> hypervisor::Result<Option<u32>> {
+        let vm_type = self.tdx_vm_type();
+        if vm_type != KVM_X86_TDX_VM_LEGACY {
+            return Ok(None);
+        }
+        let vm_fd = self
+            .kvm
+            .create_vm_with_type(vm_type)
+            .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
+        let mut caps = TdxCapabilitiesLegacy::default();
+        tdx_command(
+            &vm_fd.as_raw_fd(),
+            TdxCommand::Capabilities,
+            0,
+            &mut caps as *mut _ as *const _,
+        )
+        .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
+        Ok(Some(caps.supported_gpaw))
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
