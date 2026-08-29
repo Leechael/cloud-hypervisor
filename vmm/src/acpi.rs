@@ -1262,8 +1262,11 @@ pub fn create_acpi_tables_tdx(
     // MCFG
     tables.push(create_mcfg_table(device_manager.pci_segments()));
 
-    // HPET
-    tables.push(create_hpet_table(devices::legacy::hpet_block_id()));
+    // HPET - only for q35 platform (required by IntelTdx OVMF)
+    let tdx_q35_platform = device_manager.config.lock().unwrap().uses_tdx_q35_platform();
+    if tdx_q35_platform {
+        tables.push(create_hpet_table(devices::legacy::hpet_block_id()));
+    }
 
     // SRAT and SLIT
     // Only created if the NUMA nodes list is not empty.

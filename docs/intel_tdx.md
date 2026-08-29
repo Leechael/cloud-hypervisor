@@ -1,11 +1,17 @@
-# Intel TDX on q35
+# Intel TDX Support
 
 Intel Trust Domain Extensions (TDX) isolate a guest VM from the VMM,
 hypervisor, and any other software on the host platform. This fork of
-Cloud Hypervisor adds TDX-on-q35 support: a TDX guest can be launched
-on Cloud Hypervisor's q35 machine type with the same SMBIOS, fw_cfg,
-ACPI, and PCIe topology that QEMU emits, while still going through KVM's
-TDX ioctls for measurement and entry/exit.
+Cloud Hypervisor supports TDX with two distinct firmware/platform paths:
+
+1. **q35 + IntelTdx OVMF** — Full QEMU q35-compatible platform with
+   SMBIOS, fw_cfg, ACPI tables, ICH9 LPC, and HPET. Required by
+   IntelTdx OVMF firmware (the QEMU-derived TDVF).
+2. **Non-q35 + td-shim** — Minimal platform without q35-specific
+   devices (no ICH9 LPC, no HPET). Uses td-shim firmware with TD HOB
+   for ACPI tables and direct kernel boot via Linux boot protocol.
+
+Both paths use the same KVM TDX ioctls for measurement and TD launch.
 
 ## 1. Overview
 
@@ -18,35 +24,95 @@ TDX ioctls for measurement and entry/exit.
 - Only `x86_64` + `kvm` is maintained in this fork. The `mshv` and
   `aarch64` paths are not validated for TDX here.
 
+### KVM TDX Requirements
+
+Linux KVM TDX implementation (mainline `arch/x86/kvm/vmx/tdx.c` and
+`Documentation/virt/kvm/x86/intel-tdx.rst`) does **not** require q35
+platform devices:
+
+- TDX VM creation: `KVM_TDX_INIT_VM` with `attributes` and `xfam`
+- Memory initialization: `KVM_TDX_INIT_MEM_REGION` and page faults
+  trigger `tdh_mem_page_aug` (4 KiB SEPT operations)
+- VCPU setup: requires X2APIC + split irqchip; no ICH9/HPET dependency
+- TD finalization: `KVM_TDX_FINALIZE_VM`
+
+Reference: [torvalds/linux arch/x86/kvm/vmx/tdx.c](https://github.com/torvalds/linux/blob/master/arch/x86/kvm/vmx/tdx.c)
+
+### Why IntelTdx OVMF Requires q35
+
+IntelTdx OVMF (`OvmfPkg/IntelTdx/IntelTdxX64.dsc`) is derived from QEMU
+OVMF and expects QEMU's q35 platform contract:
+
+- **fw_cfg device**: `QemuFwCfgLib` reads SMBIOS and ACPI tables from
+  fw_cfg I/O port (`0x510`/`0x511`)
+- **PCI topology**: `DxePciLibI440FxQ35` expects either i440FX or Q35
+  PCI host bridge
+- **ACPI HPET table**: OVMF's ACPI initialization looks for HPET at
+  `0xfed00000`
+- **ICH9 PM/SMBus**: Power management and SMBus device emulation
+- **Measurement**: SMBIOS and ACPI tables from fw_cfg are measured into
+  RTMR0
+
+Without these devices, IntelTdx OVMF will hang during boot (as observed
+empirically by Leechael).
+
+### Why td-shim Does Not Require q35
+
+td-shim (`confidential-containers/td-shim`) implements the [tdshim_spec](https://github.com/confidential-containers/td-shim/blob/main/doc/tdshim_spec.md)
+firmware contract:
+
+- **No UEFI/ACPI ASL**: td-shim does not synthesize or expect ACPI ASL
+  tables from fw_cfg
+- **TD HOB**: VMM supplies ACPI tables, memory map, and payload info via
+  TD Hand-Off Blocks (HOB) in guest memory
+- **Direct kernel boot**: td-shim jumps directly to the Linux kernel
+  via the Linux boot protocol (setup_header + cmdline)
+- **Minimal devices**: Only requires MMIO/PIO for virtio/PCI devices;
+  no ICH9/HPET emulation needed
+
+This makes td-shim suitable for containerized workloads where the full
+UEFI/ACPI firmware stack is unnecessary overhead.
+
 Useful upstream references:
 
 - [TDX homepage](https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html)
 - [KVM TDX tree](https://github.com/intel/tdx/tree/kvm)
 - [Guest TDX tree](https://github.com/intel/tdx/tree/guest)
-- [EDK2](https://github.com/tianocore/edk2) — TDVF firmware
-- [td-shim](https://github.com/confidential-containers/td-shim) — minimal TDVF for direct kernel boot
+- [EDK2](https://github.com/tianocore/edk2) — IntelTdx OVMF (TDVF)
+- [td-shim](https://github.com/confidential-containers/td-shim) — minimal firmware for direct kernel boot
 - [tdx-linux](https://github.com/intel/tdx-linux) — host/guest setup helpers
 
 ## 2. Building
 
+### For q35 + IntelTdx OVMF
+
 Build with the `tdx` and `fw_cfg` features (the latter is required for
-the SMBIOS / ACPI tables that TDVF measures into RTMR0):
+the SMBIOS / ACPI tables that OVMF measures into RTMR0):
 
 ```bash
 cargo build --release --features tdx,fw_cfg
+```
+
+### For non-q35 + td-shim
+
+Build with only the `tdx` feature (no fw_cfg needed):
+
+```bash
+cargo build --release --features tdx
 ```
 
 For explicit clarity (the default backend on Linux x86_64 is `kvm`
 already, but spelling it out helps when cross-targeting):
 
 ```bash
-cargo build --release --features 'tdx,fw_cfg,kvm'
+cargo build --release --features 'tdx,fw_cfg,kvm'  # q35 + OVMF
+cargo build --release --features 'tdx,kvm'         # non-q35 + td-shim
 ```
 
 The `tdx` feature pulls in the TDX-specific KVM bindings and CPU
 init paths. The `fw_cfg` feature is what makes Cloud Hypervisor expose
-the QEMU-compatible `fw_cfg` IO port that TDVF queries for SMBIOS,
-ACPI, and option ROM blobs.
+the QEMU-compatible `fw_cfg` IO port that IntelTdx OVMF queries for
+SMBIOS, ACPI, and option ROM blobs.
 
 ### TDVF
 
@@ -70,10 +136,10 @@ build -p OvmfPkg/IntelTdx/IntelTdxX64.dsc -a X64 -t GCC5 -b RELEASE
 For verbose firmware logs over serial, build with
 `-D DEBUG_ON_SERIAL_PORT=TRUE` instead.
 
-### td-shim (optional)
+### td-shim
 
 For containerized direct-kernel-boot scenarios, td-shim is a smaller
-Rust-based alternative to TDVF. Latest tested is
+Rust-based alternative to IntelTdx OVMF. Latest tested is
 [`v0.8.0`](https://github.com/confidential-containers/td-shim/releases/tag/v0.8.0).
 
 ```bash
@@ -92,11 +158,13 @@ cargo image --release
 The resulting `target/release/final.bin` is a drop-in for
 `--tdx firmware=...`.
 
-## 3. Minimal launch (single-vCPU TDX guest)
+## 3. Launch Commands: q35 vs Non-q35
+
+### Path 1: q35 + IntelTdx OVMF (Legacy, Full QEMU Compat)
 
 ```bash
 cloud-hypervisor \
-  --tdx firmware=/path/ovmf.fd \
+  --tdx firmware=/path/to/OVMF.fd \
   --kernel /path/bzImage \
   --initramfs /path/initramfs.cpio.gz \
   --cmdline "console=ttyS0 init=/init panic=1 random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock" \
@@ -108,39 +176,37 @@ cloud-hypervisor \
   --console off
 ```
 
-Flag-by-flag:
+Key flags:
+- `--platform num_pci_segments=1,tdx=on` — **Enables q35 platform with
+  ICH9 LPC, HPET, and q35 PCI MMCONFIG**
+- `--fw-cfg-config ''` — **Required**: enables fw_cfg I/O port for
+  SMBIOS/ACPI delivery to OVMF
+- OVMF firmware **will not boot** without these q35 devices
 
-- `--tdx firmware=...` — enables the TDX path and supplies the TDVF
-  binary that TDX module measures into MRTD.
-- `--kernel` / `--initramfs` / `--cmdline` — direct kernel boot. TDVF
-  will jump to the supplied bzImage.
-  - `random.trust_cpu=y` lets RDRAND seed the CRNG (required for TDX
-    where there is no host-trusted virtio-rng path).
-  - `random.trust_bootloader=n` keeps the firmware out of the trust
-    chain for entropy.
-  - `tsc=reliable no-kvmclock` keeps timekeeping inside the TD.
-- `--memory size=512M` — total guest memory; TDX private memory is
-  carved out of this.
-- `--cpus boot=1,max=1` — TDX does not currently support vCPU hotplug,
-  so `boot == max`.
-- `--platform num_pci_segments=1,tdx=on` — legacy q35-compatible TDX
-  platform with a single PCI segment. Omit this option to use the
-  non-q35/i440fx-compatible TDX PC platform.
-- `--fw-cfg-config ''` — enables the fw_cfg IO port with no extra
-  user-supplied entries (required for SMBIOS / ACPI delivery to TDVF).
-- `--serial tty --console off` — route the guest's `ttyS0` to the
-  controlling terminal and disable the virtio-console device.
-
-The preferred style declares the TD object and keeps the non-q35/i440fx
-platform:
+### Path 2: Non-q35 + td-shim (Minimal, No q35 Devices)
 
 ```bash
-# Preferred (this fork)
---tdx firmware=/path/ovmf.fd
-
-# Legacy, still supported
---platform tdx=on --firmware /path/ovmf.fd
+cloud-hypervisor \
+  --tdx firmware=/path/to/td-shim/final.bin \
+  --kernel /path/bzImage \
+  --initramfs /path/initramfs.cpio.gz \
+  --cmdline "console=ttyS0 init=/init panic=1 random.trust_cpu=y random.trust_bootloader=n tsc=reliable no-kvmclock" \
+  --memory size=512M \
+  --cpus boot=1,max=1 \
+  --serial tty \
+  --console off
 ```
+
+Key differences:
+- **No** `--platform num_pci_segments=1,tdx=on` — uses default PC
+  platform (no ICH9 LPC, no HPET)
+- **No** `--fw-cfg-config` — td-shim receives ACPI tables via TD HOB
+  instead of fw_cfg
+- Lighter platform, faster boot for containerized workloads
+
+**Important**: Do NOT mix firmware and platform. IntelTdx OVMF **requires**
+`--platform tdx=on` and `--fw-cfg-config`. td-shim works **without**
+these flags.
 
 ## 4. `--tdx` configuration
 
